@@ -14,6 +14,7 @@ const CYAN = '\u001B[36m';
 const DIM = '\u001B[2m';
 const RESET = '\u001B[0m';
 const LOADING_FRAMES = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
+const STARTUP_FRAME_COUNT = 7;
 const MAX_MENU_ITEMS = 7;
 const DEFAULT_PROMPT_LABEL = 'claudex';
 const PROMPT_SUFFIX = ' \u203a ';
@@ -48,6 +49,7 @@ class InteractivePrompt {
     setAnimationTimer = setInterval,
     clearAnimationTimer = clearInterval,
     animationIntervalMs = 90,
+    reducedMotion = reducedMotionRequested(process.env),
   } = {}) {
     this.input = input;
     this.output = output;
@@ -61,6 +63,7 @@ class InteractivePrompt {
     this.setAnimationTimer = setAnimationTimer;
     this.clearAnimationTimer = clearAnimationTimer;
     this.animationIntervalMs = animationIntervalMs;
+    this.reducedMotion = Boolean(reducedMotion);
     this.buffer = '';
     this.cursor = 0;
     this.history = [];
@@ -107,8 +110,8 @@ class InteractivePrompt {
     this.input.setRawMode(true);
     this.input.resume?.();
     this.started = true;
-    this.show();
     this.beginStartupReveal();
+    this.show();
     return true;
   }
 
@@ -140,7 +143,10 @@ class InteractivePrompt {
     if (!this.visible) return;
     this.clearFrame();
 
-    const columns = Math.max(40, Number(this.output.columns) || 80);
+    const reportedColumns = Number(this.output.columns);
+    const columns = Number.isFinite(reportedColumns) && reportedColumns > 0
+      ? Math.max(8, Math.floor(reportedColumns))
+      : 80;
     const context = this.getContext?.() ?? {};
     const active = this.isActiveState();
     const palette = this.currentPalette();
@@ -151,9 +157,12 @@ class InteractivePrompt {
       this.selectedIndex = 0;
     }
 
+    const startupLines = this.startupVisible
+      ? formatStartupGraphic(this.startupFrame, columns, this.color)
+      : [];
     const promptText = buildPromptText(context, columns);
     const prompt = this.color ? `${CYAN}${promptText}${RESET}` : promptText;
-    const lines = [prompt];
+    const lines = [...startupLines, prompt];
     const loadingLine = this.startupVisible
       ? formatLoadingLine(startupLoadingMessage(this.startupFrame), this.startupFrame, columns, this.color)
       : active
@@ -178,22 +187,18 @@ class InteractivePrompt {
     for (const line of menuLines) {
       lines.push(line);
     }
-    this.output.write(lines.join('\n'));
+    this.output.write(lines.join('\r\n'));
     if (menuLines.length > 0) moveCursor(this.output, 0, -menuLines.length);
     cursorTo(this.output, Math.max(0, cursorColumn));
     this.renderedRows = menuLines.length;
-    this.rowsAboveInput = 2;
+    this.rowsAboveInput = startupLines.length + 2;
     this.syncAnimationTimer();
   }
 
   async handleKeypress(text, key = {}) {
     if (this.exiting) return;
 
-    if (this.startupVisible) {
-      this.startupVisible = false;
-      this.startupFrame = 0;
-      if (!this.isActiveState()) this.stopAnimationTimer();
-    }
+    if (this.startupVisible) this.dismissStartupReveal();
 
     if (key.ctrl && key.name === 'c') {
       await this.handleCancel();
@@ -514,20 +519,28 @@ class InteractivePrompt {
   beginStartupReveal() {
     if (!this.started || this.startupVisible) return;
     this.startupVisible = true;
+    this.startupFrame = this.reducedMotion ? STARTUP_FRAME_COUNT - 1 : 0;
+    if (!this.reducedMotion) this.startAnimationTimer();
+    this.render();
+  }
+
+  dismissStartupReveal() {
+    if (!this.startupVisible) return;
+    this.startupVisible = false;
     this.startupFrame = 0;
-    this.startAnimationTimer();
+    if (!this.isActiveState()) this.stopAnimationTimer();
     this.render();
   }
 
   startAnimationTimer() {
-    if (this.animationTimer || (!this.startupVisible && !this.isActiveState())) {
+    if (this.reducedMotion || this.animationTimer || (!this.startupVisible && !this.isActiveState())) {
       return;
     }
 
     this.animationTimer = this.setAnimationTimer(() => {
       if (this.startupVisible) {
         this.startupFrame += 1;
-        if (this.startupFrame >= 3) {
+        if (this.startupFrame >= STARTUP_FRAME_COUNT) {
           this.startupVisible = false;
           this.startupFrame = 0;
         }
@@ -547,6 +560,11 @@ class InteractivePrompt {
   }
 
   syncAnimationTimer() {
+    if (this.reducedMotion) {
+      this.stopAnimationTimer();
+      return;
+    }
+
     if (this.startupVisible || this.isActiveState()) {
       this.startAnimationTimer();
       return;
@@ -577,7 +595,6 @@ class InteractivePrompt {
       moveCursor(this.output, 0, -1);
       clearLine(this.output, 0);
     }
-    if (this.rowsAboveInput > 0) moveCursor(this.output, 0, this.rowsAboveInput);
     cursorTo(this.output, 0);
     this.renderedRows = 0;
     this.rowsAboveInput = 0;
@@ -761,8 +778,36 @@ function formatLoadingLine(message, frame, columns, color) {
   return color ? `${CYAN}${text}${RESET}` : text;
 }
 
+function formatStartupGraphic(frame, columns, color) {
+  if (columns < 20) return [];
+  const width = Math.min(44, columns);
+  const innerWidth = width - 2;
+  const railWidth = Math.max(1, innerWidth - 'CODEX  CLAUDE'.length);
+  const progress = Math.min(1, Math.max(0, frame) / (STARTUP_FRAME_COUNT - 1));
+  const markerIndex = Math.min(railWidth - 1, Math.round(progress * (railWidth - 1)));
+  const rail = Array.from(
+    { length: railWidth },
+    (_, index) => index === markerIndex ? '\u25c6' : '\u2501',
+  ).join('');
+  const top = startupBorder('\u256d', '\u256e', '\u2500', ' CLAUDEX ', innerWidth);
+  const middle = `\u2502CODEX ${rail} CLAUDE\u2502`;
+  const bottom = startupBorder('\u2570', '\u256f', '\u2500', ' one room \u00b7 two models ', innerWidth);
+
+  if (!color) return [top, middle, bottom];
+  return [`${DIM}${top}${RESET}`, `${CYAN}${middle}${RESET}`, `${DIM}${bottom}${RESET}`];
+}
+
+function startupBorder(left, right, fill, label, innerWidth) {
+  const visibleLabel = clip(label, innerWidth);
+  return `${left}${visibleLabel}${fill.repeat(Math.max(0, innerWidth - visibleLabel.length))}${right}`;
+}
+
 function startupLoadingMessage(frame) {
-  return ['reading room context', 'checking provider selection', 'warming prompt'][frame % 3];
+  return ['linking CODEX and CLAUDE', 'sharing room context', 'ready for delegation'][frame % 3];
+}
+
+function reducedMotionRequested(env = {}) {
+  return /^(?:1|true|yes|on)$/iu.test(String(env.CLAUDEX_REDUCED_MOTION ?? '').trim());
 }
 
 function busyLoadingMessage(context) {

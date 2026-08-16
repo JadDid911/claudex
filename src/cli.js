@@ -142,6 +142,7 @@ export async function runCli(options = {}) {
         modelCatalog,
         interactivePromptFactory,
         color: !Object.hasOwn(env, 'NO_COLOR'),
+        reducedMotion: reducedMotionRequested(env),
       });
     } else {
       await runReadlineLoop({ app, renderer, stdin, stdout, stderr, readlineFactory });
@@ -374,6 +375,7 @@ async function runInteractivePromptLoop({
   modelCatalog,
   interactivePromptFactory,
   color,
+  reducedMotion,
 }) {
   let resolveExit;
   const exited = new Promise((resolve) => {
@@ -394,6 +396,7 @@ async function runInteractivePromptLoop({
     input: stdin,
     output: stdout,
     color,
+    reducedMotion,
     isBusy: () => Boolean(app.isBusy?.()),
     getContext: () => {
       let status = {};
@@ -428,6 +431,10 @@ async function runInteractivePromptLoop({
     restoreRendererOutput();
     await prompt.stop?.();
   }
+}
+
+function reducedMotionRequested(env = {}) {
+  return /^(?:1|true|yes|on)$/iu.test(String(env.CLAUDEX_REDUCED_MOTION ?? '').trim());
 }
 
 function createSubmissionQueue({ app, renderer, stdout, stderr }) {

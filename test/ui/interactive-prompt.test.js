@@ -30,10 +30,12 @@ class FakeOutput extends EventEmitter {
     this.isTTY = true;
     this.columns = 100;
     this.text = '';
+    this.writes = [];
   }
 
   write(chunk) {
     this.text += chunk;
+    this.writes.push(String(chunk));
     return true;
   }
 }
@@ -57,6 +59,39 @@ async function settle() {
 
 function visibleText(output) {
   return sanitizeVisibleText(output.text);
+}
+
+function cursorRow(output) {
+  let row = 0;
+  const controls = /\u001B\[(\d*)([AB])|\r\n|\r|\n/gu;
+
+  for (const match of output.matchAll(controls)) {
+    if (match[0] === '\r\n' || match[0] === '\n') {
+      row += 1;
+    } else if (match[2] === 'A') {
+      row = Math.max(0, row - Number(match[1] || 1));
+    } else if (match[2] === 'B') {
+      row += Number(match[1] || 1);
+    }
+  }
+
+  return row;
+}
+
+function latestPromptFrame(output) {
+  return output.writes.findLast((chunk) => chunk.includes('  › ')) ?? '';
+}
+
+function startupGraphicFacts(output) {
+  const frame = sanitizeVisibleText(latestPromptFrame(output));
+  const inputIndex = frame.indexOf('  › ');
+  const beforeInput = inputIndex < 0 ? '' : frame.slice(0, inputIndex);
+  return {
+    hasProduct: /CLAUDEX/u.test(beforeInput),
+    hasProviders: /CODEX/u.test(beforeInput) && /CLAUDE/u.test(beforeInput),
+    hasRail: /[│┃║┆┊]/u.test(beforeInput),
+    hasThreeLineGraphic: beforeInput.split(/\r?\n/u).filter(Boolean).length >= 4,
+  };
 }
 
 test('interactive prompt opens a slash palette and supports arrow plus Tab completion', async () => {
@@ -276,8 +311,7 @@ test('busy animation follows provider activity through completion and clears its
   });
 
   await prompt.start();
-  timerCallback();
-  timerCallback();
+  for (let frame = 0; frame < 7; frame += 1) timerCallback();
   output.text = '';
   timerCallback();
   assert.match(visibleText(output), /waiting for CLAUDE execute output/u);
@@ -305,10 +339,12 @@ test('interactive prompt shows current provider models and the shared context ca
 
   await prompt.start();
 
-  const firstLine = visibleText(output).split('\n')[0] ?? '';
-  assert.match(firstLine, /CODEX default/u);
-  assert.match(firstLine, /CLAUDE sonnet/u);
-  assert.match(firstLine, /ctx 64 KiB/u);
+  const promptLine = sanitizeVisibleText(latestPromptFrame(output))
+    .split(/\r?\n/u)
+    .find((line) => /CODEX default/u.test(line)) ?? '';
+  assert.match(promptLine, /CODEX default/u);
+  assert.match(promptLine, /CLAUDE sonnet/u);
+  assert.match(promptLine, /ctx 64 KiB/u);
 
   await prompt.stop();
 });
@@ -467,16 +503,141 @@ test('interactive prompt requires a raw-capable TTY input and TTY output', () =>
   assert.equal(canUseInteractivePrompt({ input: { isTTY: false }, output: new FakeOutput() }), false);
 });
 
+test('ordinary raw TTY characters repaint in place without line-feed scrolling', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  let animationTick;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    setAnimationTimer(callback) {
+      animationTick = callback;
+      return { unref() {} };
+    },
+    clearAnimationTimer() {},
+  });
+
+  try {
+    await prompt.start();
+    for (let frame = 0; frame < 7; frame += 1) animationTick();
+    const initialRow = cursorRow(output.text);
+
+    for (const character of 'abc') {
+      input.emit('keypress', character, { name: undefined });
+    }
+
+    assert.equal(prompt.value, 'abc');
+    assert.deepEqual({
+      cursorRow: cursorRow(output.text),
+      hasBareLineFeed: /(?<!\r)\n/u.test(output.text),
+    }, {
+      cursorRow: initialRow,
+      hasBareLineFeed: false,
+    });
+  } finally {
+    await prompt.stop();
+  }
+});
+
+test('startup reveal stays within a narrow pane without wrapped graphic rows', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 18;
+  let animationTick;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    setAnimationTimer(callback) {
+      animationTick = callback;
+      return { unref() {} };
+    },
+    clearAnimationTimer() {},
+  });
+
+  try {
+    await prompt.start();
+    const startupFrame = sanitizeVisibleText(latestPromptFrame(output));
+    assert.doesNotMatch(startupFrame, /[\u256d\u256e\u2570\u256f]/u);
+    assert.ok(startupFrame.split(/\r?\n/u).every((line) => line.length <= output.columns));
+
+    for (let frame = 0; frame < 7; frame += 1) animationTick();
+    const initialRow = cursorRow(output.text);
+    input.emit('keypress', 'a', { name: undefined });
+
+    assert.equal(cursorRow(output.text), initialRow);
+  } finally {
+    await prompt.stop();
+  }
+});
+
+test('empty Enter and Escape dismiss the startup reveal with an immediate repaint', async () => {
+  for (const name of ['enter', 'escape']) {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const prompt = createInteractivePrompt({ input, output, color: false });
+
+    try {
+      await prompt.start();
+      const writesBeforeDismissal = output.writes.length;
+      input.emit('keypress', undefined, { name });
+      await settle();
+
+      assert.ok(output.writes.length > writesBeforeDismissal, `${name} should repaint`);
+      assert.doesNotMatch(
+        sanitizeVisibleText(latestPromptFrame(output)),
+        /CLAUDEX|one room \u00b7 two models/u,
+      );
+    } finally {
+      await prompt.stop();
+    }
+  }
+});
+
+test('reduced-motion startup renders the static final branded graphic without a timer', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  let timerStarts = 0;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    reducedMotion: true,
+    setAnimationTimer() {
+      timerStarts += 1;
+      return { unref() {} };
+    },
+    clearAnimationTimer() {},
+  });
+
+  try {
+    await prompt.start();
+
+    assert.deepEqual({
+      timerStarts,
+      ...startupGraphicFacts(output),
+    }, {
+      timerStarts: 0,
+      hasProduct: true,
+      hasProviders: true,
+      hasRail: true,
+      hasThreeLineGraphic: true,
+    });
+  } finally {
+    await prompt.stop();
+  }
+});
+
 test('interactive prompt defaults to the claudex product label without room context', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const prompt = createInteractivePrompt({ input, output, color: false });
 
   await prompt.start();
-  const lines = visibleText(output).split('\n');
-  assert.match(lines[0] ?? '', /^claudex$/u);
-  assert.equal(lines[1] ?? null, '');
-  assert.match(lines[2] ?? '', /^\s+›\s+claudex/u);
+  const lines = sanitizeVisibleText(latestPromptFrame(output)).split(/\r?\n/u);
+  assert.ok(lines.includes('claudex'));
+  assert.match(lines.at(-1) ?? '', /^\s+›\s*$/u);
   await prompt.stop();
 });
 
@@ -497,10 +658,12 @@ test('interactive prompt shows compact current workflow context in the live room
   });
 
   await prompt.start();
-  const firstLine = visibleText(output).split('\n')[0] ?? '';
-  assert.match(firstLine, /b197b276…378Z/u);
-  assert.match(firstLine, /\bux→CLAUDE\b/u);
-  assert.ok(firstLine.length <= output.columns);
+  const promptLine = sanitizeVisibleText(latestPromptFrame(output))
+    .split(/\r?\n/u)
+    .find((line) => /b197b276…378Z/u.test(line)) ?? '';
+  assert.match(promptLine, /b197b276…378Z/u);
+  assert.match(promptLine, /\bux→CLAUDE\b/u);
+  assert.ok(promptLine.length <= output.columns);
   await prompt.stop();
 });
 

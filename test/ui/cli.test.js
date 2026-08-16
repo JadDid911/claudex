@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { handleLine, parseArgv, runCli } from '../../src/cli.js';
+import { createInteractivePrompt } from '../../src/ui/interactive-prompt.js';
+import { sanitizeVisibleText } from '../../src/ui/renderer.js';
 
 function createOutput(isTTY = false) {
   let text = '';
@@ -64,16 +66,34 @@ class FakeTtyOutput extends EventEmitter {
     this.isTTY = true;
     this.columns = 100;
     this.text = '';
+    this.writes = [];
   }
 
   write(chunk) {
     this.text += chunk;
+    this.writes.push(String(chunk));
     return true;
   }
 
   read() {
     return this.text;
   }
+}
+
+function latestPromptFrame(output) {
+  return output.writes.findLast((chunk) => chunk.includes('  › ')) ?? '';
+}
+
+function startupGraphicFacts(output) {
+  const frame = sanitizeVisibleText(latestPromptFrame(output));
+  const inputIndex = frame.indexOf('  › ');
+  const beforeInput = inputIndex < 0 ? '' : frame.slice(0, inputIndex);
+  return {
+    hasProduct: /CLAUDEX/u.test(beforeInput),
+    hasProviders: /CODEX/u.test(beforeInput) && /CLAUDE/u.test(beforeInput),
+    hasRail: /[│┃║┆┊]/u.test(beforeInput),
+    hasThreeLineGraphic: beforeInput.split(/\r?\n/u).filter(Boolean).length >= 4,
+  };
 }
 
 test('parseArgv defaults workspace to cwd and handles resume', () => {
@@ -405,6 +425,80 @@ test('runCli uses the TTY command picker and restores raw mode on exit', async (
   assert.deepEqual(stdin.rawModes, [true, false]);
   assert.equal(stderr.read(), '');
   assert.doesNotMatch(stdout.read(), /\u001B\[(?:3[0-7]|90)m/u);
+});
+
+test('real TTY startup renders a branded reveal before the live input prompt', async () => {
+  const stdin = new FakeTtyInput();
+  const stdout = new FakeTtyOutput();
+  const stderr = createOutput(false);
+  let animationTick;
+
+  const runPromise = runCli({
+    argv: ['--workspace', 'C:/repo'],
+    cwd: 'C:/repo',
+    stdin,
+    stdout,
+    stderr,
+    env: { NO_COLOR: '1' },
+    packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
+    interactivePromptFactory(options) {
+      return createInteractivePrompt({
+        ...options,
+        setAnimationTimer(callback) {
+          animationTick = callback;
+          return { unref() {} };
+        },
+        clearAnimationTimer() {},
+      });
+    },
+    createRoomApplication() {
+      return {
+        start() {
+          return {
+            roomId: 'room-tty-brand',
+            providers: [{ name: 'codex', status: 'available' }],
+            routingMode: 'auto',
+            safetyMode: 'single-writer',
+          };
+        },
+        getStatus() {
+          return {
+            roomId: 'room-tty-brand',
+            providers: [{ name: 'codex', model: 'default', weight: 1 }],
+          };
+        },
+        isBusy() { return false; },
+        async cancel() { return false; },
+        async close() {},
+      };
+    },
+  });
+
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    const initialFrame = sanitizeVisibleText(latestPromptFrame(stdout));
+    const initialFacts = startupGraphicFacts(stdout);
+
+    stdout.writes = [];
+    animationTick();
+    const nextFrame = sanitizeVisibleText(latestPromptFrame(stdout));
+
+    assert.deepEqual(initialFacts, {
+      hasProduct: true,
+      hasProviders: true,
+      hasRail: true,
+      hasThreeLineGraphic: true,
+    });
+    assert.notEqual(nextFrame, initialFrame, 'expected the startup graphic to advance a frame');
+    assert.deepEqual(startupGraphicFacts(stdout), initialFacts);
+  } finally {
+    stdin.emit('keypress', '/exit', { name: undefined });
+    stdin.emit('keypress', undefined, { name: 'enter' });
+    await runPromise;
+  }
+
+  assert.equal(stderr.read(), '');
 });
 
 for (const cancellationKey of [

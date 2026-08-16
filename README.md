@@ -64,6 +64,8 @@ Non-TTY output stays deterministic for logs and automation.
 
 The interactive terminal keeps normal scrollback while compressing transient work into one animated activity line. Durable provider responses remain in distinct Codex and Claude colors, routine tool lifecycle events stay compact, and a second plain-text turn entered while work is active is queued until the current writer lease is released. `/cancel`, `Esc` on an empty busy prompt, and the first `Ctrl+C` stop active work; `/exit` discards queued turns and exits.
 
+Claudex opens with a short, interruptible terminal-native reveal. Set `CLAUDEX_REDUCED_MOTION=1` to keep the final branded frame static and disable prompt animation.
+
 ## Commands
 
 | Command | What it does |
