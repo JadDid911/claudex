@@ -332,6 +332,34 @@ export function acquireWriteLease(state, request) {
 }
 
 /**
+ * Transfer an active logical lease between writer stages while retaining the
+ * same process-level workspace lock and generation.
+ */
+export function transferWriteLease(state, transfer = {}) {
+  if (!state.current) {
+    return { ok: false, state, error: { code: 'WRITE_LEASE_MISSING' } };
+  }
+  if (!transfer.provider) {
+    throw new TypeError('transferWriteLease requires a provider');
+  }
+  if (transfer.generation != null && transfer.generation !== state.current.generation) {
+    return {
+      ok: false,
+      state,
+      error: { code: 'WRITE_LEASE_GENERATION_MISMATCH', lease: { ...state.current } },
+    };
+  }
+
+  state.current = {
+    ...state.current,
+    ownerProvider: transfer.provider,
+    taskId: transfer.taskId ?? state.current.taskId,
+    transferredAt: toIsoString(transfer.now),
+  };
+  return { ok: true, state, lease: { ...state.current } };
+}
+
+/**
  * Release a previously acquired writer lease.
  *
  * @param {ReturnType<typeof createWriteLeaseState>} state
@@ -443,6 +471,10 @@ export class WriteLease {
     const result = acquireWriteLease(this.state, request);
     if (!result.ok) this.processLock.release();
     return result;
+  }
+
+  transfer(transfer = {}) {
+    return transferWriteLease(this.state, transfer);
   }
 
   /**

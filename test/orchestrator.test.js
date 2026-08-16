@@ -149,8 +149,9 @@ function traceAccess(entry) {
   return entry.input.access ?? entry.input.context?.extra?.access ?? null;
 }
 
-test('supermode runs saved plan, execute, and review profiles sequentially before executor synthesis', async (context) => {
+test('supermode runs saved plan, code, execute, and final review profiles sequentially', async (context) => {
   const planText = 'PLAN_HANDOFF: update the parser boundary and its regression coverage.';
+  const codeText = 'CODE_HANDOFF: parser changes implemented.';
   const executeText = 'EXECUTE_HANDOFF: parser and regression coverage updated.';
   const reviewText = 'REVIEW_HANDOFF: focused verification passed.';
   const harness = await createHarness(context, {
@@ -158,10 +159,11 @@ test('supermode runs saved plan, execute, and review profiles sequentially befor
       results: [{ text: planText }, { text: reviewText }],
     },
     claude: {
-      results: [{ text: executeText }, { text: 'Final synthesized answer.' }],
+      results: [{ text: codeText }, { text: executeText }],
     },
   });
   setStageProfile(harness, 'plan', 'codex', 'gpt-plan', 'xhigh');
+  setStageProfile(harness, 'code', 'claude', 'claude-code', 'high');
   setStageProfile(harness, 'execute', 'claude', 'claude-execute', 'max');
   setStageProfile(harness, 'review', 'codex', 'gpt-review', 'high');
 
@@ -176,15 +178,19 @@ test('supermode runs saved plan, execute, and review profiles sequentially befor
     harness.trace.map((entry) => [traceStage(entry), entry.provider, traceAccess(entry)]),
     [
       ['plan', 'codex', 'read'],
+      ['code', 'claude', 'write'],
       ['execute', 'claude', 'write'],
       ['review', 'codex', 'read'],
-      ['synthesis', 'claude', 'write'],
     ],
   );
-  const [plan, execute, review, synthesis] = harness.trace;
+  const [plan, code, execute, review] = harness.trace;
   assert.deepEqual(
     [plan.input.modelOverride, plan.input.effortOverride],
     ['gpt-plan', 'xhigh'],
+  );
+  assert.deepEqual(
+    [code.input.modelOverride, code.input.effortOverride],
+    ['claude-code', 'high'],
   );
   assert.deepEqual(
     [execute.input.modelOverride, execute.input.effortOverride],
@@ -195,18 +201,79 @@ test('supermode runs saved plan, execute, and review profiles sequentially befor
     ['gpt-review', 'high'],
   );
   assert.equal(review.input.sessionId, null);
-  assert.deepEqual(
-    [synthesis.input.modelOverride, synthesis.input.effortOverride],
-    ['claude-execute', 'max'],
-  );
-  assert.match(JSON.stringify(execute.input.context), /PLAN_HANDOFF/u);
+  assert.match(JSON.stringify(code.input.context), /PLAN_HANDOFF/u);
+  assert.match(JSON.stringify(execute.input.context), /CODE_HANDOFF/u);
   assert.match(JSON.stringify(review.input.context), /EXECUTE_HANDOFF/u);
-  assert.match(JSON.stringify(synthesis.input.context), /REVIEW_HANDOFF/u);
+});
+
+test('supermode keeps saved lane profiles and ends with the configured reviewer', async (context) => {
+  const harness = await createHarness(context, {}, {
+    persistConfig: true,
+    requirePlanApproval: false,
+  });
+
+  for (const [stage, provider, model, effort] of [
+    ['plan', 'claude', 'fable', 'xhigh'],
+    ['code', 'codex', 'gpt-5.6-sol', 'max'],
+    ['execute', 'codex', 'gpt-5.6-sol', 'max'],
+    ['ux', 'claude', 'fable', 'high'],
+    ['review', 'claude', 'opus', 'high'],
+  ]) {
+    await harness.app.dispatch({
+      kind: 'command',
+      name: 'profile',
+      stage,
+      provider,
+      model,
+      effort,
+    });
+  }
+  await harness.app.dispatch({ kind: 'command', name: 'mode', mode: 'plan' });
+  await harness.app.dispatch({ kind: 'command', name: 'mode', mode: 'auto' });
+
+  await harness.app.dispatch(parseInputLine(
+    '/supermode Build and polish a touch-first mobile game interface.',
+  ));
+
+  assert.deepEqual(
+    harness.trace.map((entry) => [traceStage(entry), entry.provider, traceAccess(entry)]),
+    [
+      ['plan', 'claude', 'read'],
+      ['ux', 'claude', 'read'],
+      ['code', 'codex', 'write'],
+      ['execute', 'codex', 'write'],
+      ['review', 'claude', 'read'],
+    ],
+  );
+  const route = harness.emitted.find((event) => event.metadata?.code === 'supermode-route');
+  assert.match(route.content, /CLAUDE plans/u);
+  assert.match(route.content, /CLAUDE guides UI/u);
+  assert.match(route.content, /CODEX codes/u);
+  assert.match(route.content, /CODEX executes/u);
+  assert.match(route.content, /CLAUDE reviews last/u);
+  assert.doesNotMatch(route.content, /analyzes|synthesizes/u);
+  assert.equal(harness.codex.synthesisCalls.length, 0);
+  assert.equal(harness.claude.synthesisCalls.length, 0);
+
+  const loaded = await loadConfig({ storageRoot: harness.config.storageRoot });
+  assert.deepEqual(loaded.modeProviders, {
+    plan: 'claude',
+    code: 'codex',
+    execute: 'codex',
+    ux: 'claude',
+    review: 'claude',
+  });
+  assert.equal(loaded.stageProfiles.plan.claude.model, 'fable');
+  assert.equal(loaded.stageProfiles.code.codex.model, 'gpt-5.6-sol');
+  assert.equal(loaded.stageProfiles.execute.codex.effort, 'max');
+  assert.equal(loaded.stageProfiles.ux.claude.effort, 'high');
+  assert.equal(loaded.stageProfiles.review.claude.model, 'opus');
 });
 
 test('supermode never resumes a read-stage Claude session into write access', async (context) => {
   const harness = await createHarness(context);
   setStageProfile(harness, 'plan', 'claude');
+  setStageProfile(harness, 'code', 'claude');
   setStageProfile(harness, 'execute', 'claude');
   setStageProfile(harness, 'review', 'codex');
 
@@ -217,13 +284,13 @@ test('supermode never resumes a read-stage Claude session into write access', as
     supermode: true,
   });
 
-  const [plan, execute, synthesis] = harness.claude.calls;
+  const [plan, code, execute] = harness.claude.calls;
   assert.equal(plan.access, 'read');
   assert.equal(plan.sessionId, null);
+  assert.equal(code.access, 'write');
+  assert.equal(code.sessionId, null);
   assert.equal(execute.access, 'write');
-  assert.equal(execute.sessionId, null);
-  assert.equal(synthesis.access, 'write');
-  assert.equal(synthesis.sessionId, 'claude-session');
+  assert.equal(execute.sessionId, 'claude-session');
 });
 
 test('a disposable same-provider review cannot replace the executor resume session', async (context) => {
@@ -231,12 +298,14 @@ test('a disposable same-provider review cannot replace the executor resume sessi
   const harness = await createHarness(context, {
     claude: {
       results: [
+        { text: 'Code complete.', sessionId: 'claude-code-session' },
         { text: 'Execution complete.', sessionId: 'claude-executor-session' },
         { text: question, sessionId: 'claude-review-session' },
       ],
     },
   });
   setStageProfile(harness, 'plan', 'codex');
+  setStageProfile(harness, 'code', 'claude');
   setStageProfile(harness, 'execute', 'claude');
   setStageProfile(harness, 'review', 'claude');
 
@@ -248,8 +317,8 @@ test('a disposable same-provider review cannot replace the executor resume sessi
   });
   await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
 
-  assert.equal(harness.claude.calls[1].access, 'read');
-  assert.equal(harness.claude.calls[1].sessionId, null);
+  assert.equal(harness.claude.calls[2].access, 'read');
+  assert.equal(harness.claude.calls[2].sessionId, null);
   assert.deepEqual(harness.app.store.state.providerSessions.claude, {
     sessionId: 'claude-executor-session',
     access: 'write',
@@ -260,7 +329,7 @@ test('a disposable same-provider review cannot replace the executor resume sessi
   await dispatch;
 });
 
-test('supermode auto-delegates every unconfigured stage and returns synthesis to the executor', async (context) => {
+test('supermode auto-delegates unconfigured stages and ends with an independent reviewer', async (context) => {
   const harness = await createHarness(context);
   harness.app.config.modeProviders.plan = 'auto';
   harness.app.config.modeProviders.execute = 'auto';
@@ -273,13 +342,14 @@ test('supermode auto-delegates every unconfigured stage and returns synthesis to
     supermode: true,
   });
 
-  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute', 'review', 'synthesis']);
-  const execute = harness.trace[1];
-  const review = harness.trace[2];
-  const synthesis = harness.trace[3];
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code', 'execute', 'review']);
+  const code = harness.trace[1];
+  const execute = harness.trace[2];
+  const review = harness.trace[3];
+  assert.equal(code.provider, execute.provider);
   assert.ok(['codex', 'claude'].includes(execute.provider));
   assert.notEqual(review.provider, execute.provider);
-  assert.equal(synthesis.provider, execute.provider);
+  assert.equal(traceAccess(code), 'write');
   assert.equal(traceAccess(execute), 'write');
   assert.equal(traceAccess(review), 'read');
 });
@@ -296,7 +366,7 @@ test('default affinities keep Codex writing and Claude reviewing across observed
   assert.equal(harness.claude.synthesisCalls.length, 0);
 });
 
-test('read-only supermode keeps execute and synthesis read-only and never acquires the writer lease', async (context) => {
+test('read-only supermode pauses after planning, then stays read-only after approval', { timeout: 1_000 }, async (context) => {
   const harness = await createHarness(context, {}, { requirePlanApproval: true });
   let acquisitions = 0;
   const acquire = harness.app.lease.acquire.bind(harness.app.lease);
@@ -305,14 +375,25 @@ test('read-only supermode keeps execute and synthesis read-only and never acquir
     return acquire(...args);
   };
 
-  await harness.app.dispatch({
+  const dispatch = harness.app.dispatch({
     kind: 'turn',
     route: 'auto',
     prompt: 'Explain how the scheduler routes this request.',
     supermode: true,
   });
+  await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
 
-  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute', 'review', 'synthesis']);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan']);
+  assert.equal(acquisitions, 0);
+  assert.deepEqual(
+    harness.app.getStatus().pendingClarifications.map(({ role }) => role),
+    ['plan-approval'],
+  );
+
+  await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'Execute this plan' });
+  await dispatch;
+
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code', 'execute', 'review']);
   assert.deepEqual(harness.trace.map(traceAccess), ['read', 'read', 'read', 'read']);
   assert.equal(acquisitions, 0);
   assert.equal(harness.app.lease.snapshot().current, null);
@@ -338,12 +419,73 @@ test('writable supermode pauses after planning until the user approves execution
     }],
   );
 
+  await assert.rejects(
+    harness.app.dispatch(parseInputLine('/codex Execute this plan')),
+    /plain text/iu,
+  );
+  assert.equal(harness.app.isAwaitingInput(), true);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan']);
+
   await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'Execute this plan' });
   await dispatch;
 
-  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute', 'review', 'synthesis']);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code', 'execute', 'review']);
   assert.equal(traceAccess(harness.trace[1]), 'write');
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'completed');
+});
+
+test('/context feeds the next Supermode stage without answering plan approval', { timeout: 1_000 }, async (context) => {
+  const harness = await createHarness(context, {}, { requirePlanApproval: true });
+  setStageProfile(harness, 'plan', 'claude');
+  setStageProfile(harness, 'execute', 'codex');
+  setStageProfile(harness, 'review', 'claude');
+
+  const dispatch = harness.app.dispatch(parseInputLine(
+    '/supermode Implement the parser fix and verify it.',
+  ));
+  await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
+
+  await harness.app.dispatch(parseInputLine(
+    '/context Preserve the public parser API and do not rename exported functions.',
+  ));
+
+  assert.equal(harness.app.isAwaitingInput(), true);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan']);
+  assert.equal(harness.app.getStatus().pendingSupermodeContext, 1);
+
+  await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'Execute this plan' });
+  await dispatch;
+
+  const code = harness.trace.find((entry) => traceStage(entry) === 'code');
+  const review = harness.trace.find((entry) => traceStage(entry) === 'review');
+  assert.deepEqual(code.input.context.extra.supermodeContext, [{
+    text: 'Preserve the public parser API and do not rename exported functions.',
+    receivedAtStage: 'plan',
+  }]);
+  assert.equal(review.input.context.extra.supermodeContext, undefined);
+
+  const replay = await harness.app.store.replayEvents();
+  const originalTurn = replay.events.find(
+    (event) => event.actor === 'YOU' && event.content === 'Implement the parser fix and verify it.',
+  );
+  const displayedTurn = harness.emitted.find(
+    (event) => event.actor === 'YOU' && event.content === 'Implement the parser fix and verify it.',
+  );
+  const addedContext = replay.events.find((event) => event.metadata?.code === 'supermode-context');
+  assert.equal(originalTurn.metadata?.route, 'supermode');
+  assert.equal(originalTurn.metadata?.label, 'supermode');
+  assert.equal(displayedTurn.label, 'supermode');
+  assert.equal(addedContext.content, 'Preserve the public parser API and do not rename exported functions.');
+  assert.equal(addedContext.metadata?.stage, 'plan');
+});
+
+test('/context is rejected when no resumable Supermode stage is active', async (context) => {
+  const harness = await createHarness(context);
+
+  await assert.rejects(
+    harness.app.dispatch(parseInputLine('/context Keep the API stable.')),
+    /active Supermode/iu,
+  );
 });
 
 test('read-only assignment prompts keep the user objective in the provider-visible prompt', async (context) => {
@@ -392,12 +534,12 @@ test('a plan-stage clarification pauses supermode before execute', async (contex
     prompt: 'src/orchestrator.js',
   });
   await dispatch;
-  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'plan', 'execute', 'review', 'synthesis']);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'plan', 'code', 'execute', 'review']);
   assert.equal(harness.claude.calls[1].sessionId, 'claude-plan-session');
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'completed');
 });
 
-test('a supermode execute-stage pre-work requirement question waits for the user and skips review plus synthesis', async (context) => {
+test('a supermode code-stage pre-work requirement question waits for the user and skips later stages', async (context) => {
   const planText = 'PLAN_HANDOFF: build the requested game in one bounded pass.';
   const question = 'I have not started implementation yet because the brief is still underspecified.\n\nWhat visual personality, genre, target player, and style should I use for this game?';
   const harness = await createHarness(context, {
@@ -421,11 +563,11 @@ test('a supermode execute-stage pre-work requirement question waits for the user
   });
   await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
 
-  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute']);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code']);
   assert.equal(harness.codex.calls.length, 1);
   assert.equal(harness.codex.synthesisCalls.length, 0);
   assert.equal(harness.claude.calls.length, 1);
-  assert.match(harness.claude.calls[0].prompt, /Choose reasonable defaults.+and proceed/iu);
+  assert.match(harness.claude.calls[0].prompt, /Implement the approved plan.+Choose reasonable defaults/isu);
 
   const replay = await harness.app.store.replayEvents();
   assert.ok(replay.events.some((event) => event.actor === 'CLAUDE' && event.content === question));
@@ -433,20 +575,20 @@ test('a supermode execute-stage pre-work requirement question waits for the user
     (event) => event.actor === 'SYSTEM' &&
       event.metadata?.code === 'waiting-for-user' &&
       event.metadata?.workflow === 'supermode' &&
-      event.metadata?.stage === 'execute',
+      event.metadata?.stage === 'code',
   ));
   assert.equal(replay.events.some((event) => /handed findings/iu.test(event.content ?? '')), false);
 
   const turn = Object.values(harness.app.store.state.activeTurns)[0];
   assert.equal(turn.status, 'waiting-for-user');
-  assert.equal(turn.pipelineStage, 'execute');
+  assert.equal(turn.pipelineStage, 'code');
   assert.equal(Object.hasOwn(turn, 'completedAt'), false);
   assert.equal(harness.app.lease.snapshot().current?.ownerProvider, 'claude');
   await harness.app.cancel({ source: 'test' });
   await dispatch;
 });
 
-test('a supermode execute-stage clarification sentinel still blocks when preceded by a short preamble', async (context) => {
+test('a supermode code-stage clarification sentinel still blocks when preceded by a short preamble', async (context) => {
   const planText = 'PLAN_HANDOFF: build the requested game in one bounded pass.';
   const question = 'I have not started implementation yet. Question for you: Should I edit src/app.js or src/main.js?';
   const harness = await createHarness(context, {
@@ -469,14 +611,14 @@ test('a supermode execute-stage clarification sentinel still blocks when precede
   });
   await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
 
-  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute']);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code']);
   assert.equal(harness.codex.synthesisCalls.length, 0);
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'waiting-for-user');
   await harness.app.cancel({ source: 'test' });
   await dispatch;
 });
 
-test('a failed supermode writer skips review, synthesis, and provider replay', async (context) => {
+test('a failed supermode code writer skips execute, review, and provider replay', async (context) => {
   const harness = await createHarness(context, {
     claude: { result: { text: 'PLAN_HANDOFF: make the bounded change.' } },
     codex: {
@@ -499,13 +641,13 @@ test('a failed supermode writer skips review, synthesis, and provider replay', a
     supermode: true,
   });
 
-  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute']);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code']);
   assert.equal(harness.codex.calls.length, 1);
   assert.equal(harness.codex.synthesisCalls.length, 0);
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'failed');
 });
 
-test('cancelling supermode during execute skips later stages and releases its one writer lease', { timeout: 1_000 }, async (context) => {
+test('cancelling supermode during code skips later stages and releases its one writer lease', { timeout: 1_000 }, async (context) => {
   const harness = await createHarness(context, {
     codex: { waitForAbort: true },
   });
@@ -535,7 +677,7 @@ test('cancelling supermode during execute skips later stages and releases its on
   assert.equal(await harness.app.cancel({ source: 'test' }), true);
   await dispatch;
 
-  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute']);
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code']);
   assert.equal(acquisitions, 1);
   assert.equal(releases, 1);
   assert.equal(harness.app.lease.snapshot().current, null);
@@ -570,7 +712,7 @@ test('persisted room modes cannot broaden or suppress supermode mutation access'
     supermode: true,
   });
 
-  assert.deepEqual(harness.trace.slice(0, 4).map(traceAccess), ['read', 'write', 'read', 'write']);
+  assert.deepEqual(harness.trace.slice(0, 4).map(traceAccess), ['read', 'write', 'write', 'read']);
   assert.deepEqual(harness.trace.slice(4).map(traceAccess), ['read', 'read', 'read', 'read']);
 });
 
@@ -592,9 +734,9 @@ test('supermode preflights its configured writer and swaps to a write-capable pr
     harness.trace.map((entry) => [traceStage(entry), entry.provider, traceAccess(entry)]),
     [
       ['plan', 'codex', 'read'],
+      ['code', 'claude', 'write'],
       ['execute', 'claude', 'write'],
       ['review', 'codex', 'read'],
-      ['synthesis', 'claude', 'write'],
     ],
   );
 });
@@ -613,10 +755,12 @@ test('supermode writer capability failure is rejected before any provider starts
   });
 
   assert.equal(harness.trace.length, 0);
-  assert.ok(harness.emitted.some((event) => /no write-capable supermode executor was started/iu.test(event.content)));
+  assert.ok(harness.emitted.some(
+    (event) => /no write-capable Supermode (?:code|execute) provider was started/iu.test(event.content),
+  ));
 });
 
-test('supermode retries an executor capacity failure only when side effects are impossible', async (context) => {
+test('supermode retries a code-stage capacity failure only when side effects are impossible', async (context) => {
   const safe = await createHarness(context, {
     codex: {
       result: {
@@ -638,11 +782,11 @@ test('supermode retries an executor capacity failure only when side effects are 
     supermode: true,
   });
 
-  assert.deepEqual(safe.trace.slice(0, 3).map(traceStage), ['plan', 'execute', 'execute']);
+  assert.deepEqual(safe.trace.slice(0, 3).map(traceStage), ['plan', 'code', 'code']);
   assert.deepEqual(safe.trace.slice(0, 3).map((entry) => entry.provider), ['claude', 'codex', 'claude']);
   assert.ok(safe.emitted.some((event) => event.metadata?.code === 'supermode-safe-fallback'));
   const safeTurn = Object.values(safe.app.store.state.activeTurns)[0];
-  assert.equal(safeTurn.executorProvider, 'claude');
+  assert.equal(safeTurn.coderProvider, 'claude');
   assert.equal(safeTurn.leadProvider, 'claude');
 
   const uncertain = await createHarness(context, {
@@ -666,7 +810,7 @@ test('supermode retries an executor capacity failure only when side effects are 
     supermode: true,
   });
 
-  assert.deepEqual(uncertain.trace.map(traceStage), ['plan', 'execute']);
+  assert.deepEqual(uncertain.trace.map(traceStage), ['plan', 'code']);
   assert.equal(uncertain.codex.calls.length, 1);
   assert.equal(uncertain.claude.calls.length, 1);
   assert.equal(Object.values(uncertain.app.store.state.activeTurns)[0].status, 'failed');

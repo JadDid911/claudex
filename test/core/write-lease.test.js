@@ -170,6 +170,30 @@ test('failed process-lock interrupt preserves the in-memory lease', async (conte
   assert.equal(lease.interrupt({ reason: 'cancelled' }).ok, true);
 });
 
+test('writer lease transfers stage ownership without releasing the workspace lock', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claudex-lock-transfer-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const lockPath = path.join(root, 'workspace-write.lock');
+  const lease = new WriteLease(undefined, { lockPath });
+  const acquired = lease.acquire({
+    provider: 'codex',
+    turnId: 'turn-1',
+    taskId: 'turn-1-code',
+  });
+
+  const transferred = lease.transfer({
+    generation: acquired.lease.generation,
+    provider: 'claude',
+    taskId: 'turn-1-execute',
+  });
+
+  assert.equal(transferred.ok, true);
+  assert.equal(lease.snapshot().current?.ownerProvider, 'claude');
+  assert.equal(lease.snapshot().current?.taskId, 'turn-1-execute');
+  assert.equal((await fs.stat(lockPath)).isFile(), true);
+  assert.equal(lease.release({ generation: acquired.lease.generation }).ok, true);
+});
+
 test('stale reclamation does not delete a replacement lock while a claim is active', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claudex-lock-race-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

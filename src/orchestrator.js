@@ -32,6 +32,7 @@ import { WriteLease } from './core/write-lease.js';
 import { createClaudeProvider } from './providers/claude.js';
 import { createCodexProvider } from './providers/codex.js';
 import { ROOM_CLARIFICATION_PREFIX } from './providers/base.js';
+import { isPlainTextTurn } from './ui/commands.js';
 
 const PROVIDER_NAMES = ['codex', 'claude'];
 const TERMINAL_SUCCESS = 'completed';
@@ -110,9 +111,9 @@ function readOnlyAssignmentPrompt(assignment, objective) {
 
   if (assignment.label === 'review') {
     return [
-      `${header} Independently review the completed execute-stage work against the original objective and plan.`,
+      `${header} Perform the final independent review after plan, UX guidance, code, and execute stages.`,
       objectiveLine,
-      'Inspect the current workspace and verification evidence. Report only concrete correctness, regression, safety, or completeness findings; do not modify files.',
+      'Inspect the current workspace and verification evidence. Return the final user-facing verdict with concrete correctness, regression, safety, or completeness findings; do not modify files.',
     ].join('\n\n');
   }
 
@@ -171,14 +172,23 @@ function readOnlyAssignmentPrompt(assignment, objective) {
 }
 
 function writeAssignmentPrompt(assignment, objective) {
+  if (assignment.label === 'code') {
+    return [
+      'Implement the approved plan now. Do not stop after planning or describing intended edits.',
+      `Objective: ${objective}`,
+      'Use the supplied plan and UX guidance, modify the workspace, and complete the requested code and UI work.',
+      `Choose reasonable defaults for nonessential preferences. Only ask a blocking question when safe progress is impossible, prefixed with "${ROOM_CLARIFICATION_PREFIX}".`,
+    ].join('\n\n');
+  }
+
   if (assignment.label !== 'execute') {
     return objective;
   }
 
   return [
-    'Execute the objective now. Do not stop after planning, surveying the workspace, or announcing what you intend to do.',
+    'Execute and verify the implemented work now. Do not restart planning or merely describe intended checks.',
     `Objective: ${objective}`,
-    'Use the supplied plan as guidance, inspect the actual workspace, make the requested changes, and run focused verification.',
+    'Inspect the code-stage result, run focused verification, and fix any remaining correctness or completeness problems.',
     `Choose reasonable defaults for missing nonessential product or design preferences and proceed. Only when a required decision makes safe progress impossible, ask exactly one direct question prefixed with "${ROOM_CLARIFICATION_PREFIX}".`,
   ].join('\n\n');
 }
@@ -194,6 +204,12 @@ function canonicalPathForComparison(value) {
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function userTurnRoute(command) {
+  if (command.supermode) return 'supermode';
+  if (command.route && command.route !== 'auto') return command.route;
+  return normalizeDelegationMode(command.delegationMode, 'auto');
 }
 
 function usageTokens(usage) {
@@ -795,8 +811,13 @@ export class RoomApplication {
       (command.name === 'profile' && !command.stage && !command.provider) ||
       (command.name === 'mode' && !command.mode && !command.lane && !command.provider)
     );
-    const clarificationAnswer = command.kind === 'turn' && this.isAwaitingInput();
-    if (this.isBusy() && !observableWhileBusy && !clarificationAnswer) {
+    const awaitingInput = this.isAwaitingInput();
+    const clarificationAnswer = awaitingInput && isPlainTextTurn(command);
+    const supermodeContext = command.kind === 'command' && command.name === 'context';
+    if (awaitingInput && command.kind === 'turn' && !clarificationAnswer) {
+      throw new Error('Answer the pending question with plain text, or use /cancel to stop the turn.');
+    }
+    if (this.isBusy() && !observableWhileBusy && !clarificationAnswer && !supermodeContext) {
       throw new Error('A provider turn is already active. Use /cancel before starting another.');
     }
 
@@ -818,7 +839,9 @@ export class RoomApplication {
       return;
     }
 
-    if (command.name === 'status') {
+    if (command.name === 'context') {
+      await this.addSupermodeContext(command.text);
+    } else if (command.name === 'status') {
       this.emitStatus(this.getStatus());
     } else if (command.name === 'model') {
       if (command.provider) {
@@ -874,6 +897,9 @@ export class RoomApplication {
       providers: new Set(),
       clarifications: null,
       clarificationRound: 0,
+      workflow: command.supermode ? 'supermode' : null,
+      stage: command.supermode ? 'starting' : null,
+      pendingSupermodeContext: [],
     };
 
     try {
@@ -912,6 +938,52 @@ export class RoomApplication {
     if (queue.items.length === 0) {
       queue.resolve(queue.answers);
     }
+  }
+
+  async addSupermodeContext(text) {
+    const active = this.active;
+    if (
+      !active ||
+      active.workflow !== 'supermode' ||
+      !['starting', 'plan', 'ux', 'code', 'execute', 'review'].includes(active.stage)
+    ) {
+      throw new Error('No active Supermode stage can accept context. Start one with /supermode <prompt>.');
+    }
+
+    const entry = {
+      text: String(text ?? '').trim(),
+      receivedAtStage: active.stage,
+    };
+    if (!entry.text) {
+      throw new Error('/context requires text for the active Supermode workflow.');
+    }
+
+    active.pendingSupermodeContext.push(entry);
+    await this.appendEvent({
+      actor: 'YOU',
+      type: 'message',
+      turnId: active.turnId,
+      content: entry.text,
+      metadata: {
+        code: 'supermode-context',
+        workflow: 'supermode',
+        stage: entry.receivedAtStage,
+        route: 'context',
+        label: 'context',
+      },
+    });
+  }
+
+  takeSupermodeContext(turnId) {
+    if (this.active?.turnId !== turnId || this.active.workflow !== 'supermode') {
+      return {};
+    }
+    const pending = this.active.pendingSupermodeContext;
+    if (!Array.isArray(pending) || pending.length === 0) {
+      return {};
+    }
+    this.active.pendingSupermodeContext = [];
+    return { supermodeContext: structuredClone(pending) };
   }
 
   async requestClarificationAnswers(turnId, requests, signal, workflow = null, stage = null) {
@@ -1008,7 +1080,19 @@ export class RoomApplication {
       writerSideEffectsPossible: false,
       startedAt: isoNow(this.now),
     });
-    await this.appendEvent({ actor: 'YOU', type: 'message', turnId, content: prompt });
+    const route = userTurnRoute(command);
+    await this.appendEvent({
+      actor: 'YOU',
+      type: 'message',
+      turnId,
+      content: prompt,
+      metadata: {
+        code: 'user-turn',
+        route,
+        label: route,
+        ...(command.supermode ? { workflow: 'supermode' } : {}),
+      },
+    });
     const roomQuery = detectRoomQuery(prompt);
     if (roomQuery) {
       await this.markTurn(turnId, {
@@ -1397,6 +1481,10 @@ export class RoomApplication {
     pipeline = {
       ...pipeline,
       planner: decorate(pipeline.planner),
+      designer: pipeline.designer
+        ? decorate(pipeline.designer, { freshSession: true, persistSession: false })
+        : null,
+      coder: decorate(pipeline.coder),
       executor: decorate(pipeline.executor),
       reviewer: decorate(pipeline.reviewer, {
         freshSession: true,
@@ -1411,6 +1499,8 @@ export class RoomApplication {
       route: command.route,
       taskLane,
       plannerProvider: pipeline.planner.provider,
+      designerProvider: pipeline.designer?.provider ?? null,
+      coderProvider: pipeline.coder.provider,
       executorProvider: pipeline.executor.provider,
       reviewerProvider: pipeline.reviewer.provider,
       leadProvider: pipeline.executor.provider,
@@ -1435,7 +1525,10 @@ export class RoomApplication {
         turnId,
         `${turnId}-plan`,
         controller.signal,
-        { pipelineStage: 'plan' },
+        {
+          pipelineStage: 'plan',
+          ...this.takeSupermodeContext(turnId),
+        },
       );
       pipeline.planner = planning.assignment;
       let outcome = await this.settleSupermodeStage({
@@ -1449,34 +1542,60 @@ export class RoomApplication {
       if (outcome !== 'continue') return;
       if (controller.signal.aborted) throw new Error('Supermode cancelled between stages.');
 
-      if (pipeline.requiresWriteLease) {
-        const approval = await this.approveSupermodePlan(
-          planning,
+      const approval = await this.approveSupermodePlan(
+        planning,
+        providerObjective,
+        turnId,
+        controller.signal,
+      );
+      planning = approval.planning;
+      pipeline.planner = planning.assignment;
+      if (approval.outcome === 'cancelled') return;
+      if (approval.outcome !== 'approved') {
+        outcome = await this.settleSupermodeStage({
+          turnId,
+          stage: 'plan',
+          assignment: planning.assignment,
+          result: planning.result,
+          signal: controller.signal,
+          writerSideEffectsPossible,
+        });
+        if (outcome !== 'continue') return;
+      }
+
+      let design = null;
+      if (pipeline.designer) {
+        if (controller.signal.aborted) throw new Error('Supermode cancelled before UX guidance.');
+        await this.beginSupermodeStage(turnId, 'ux', pipeline.designer);
+        design = await this.runSupermodeStage(
+          pipeline.designer,
           providerObjective,
           turnId,
+          `${turnId}-ux`,
           controller.signal,
+          {
+            pipelineStage: 'ux',
+            leadResult: planning.result.text,
+            ...this.takeSupermodeContext(turnId),
+          },
         );
-        planning = approval.planning;
-        pipeline.planner = planning.assignment;
-        if (approval.outcome === 'cancelled') return;
-        if (approval.outcome !== 'approved') {
-          outcome = await this.settleSupermodeStage({
-            turnId,
-            stage: 'plan',
-            assignment: planning.assignment,
-            result: planning.result,
-            signal: controller.signal,
-            writerSideEffectsPossible,
-          });
-          if (outcome !== 'continue') return;
-        }
+        pipeline.designer = design.assignment;
+        outcome = await this.settleSupermodeStage({
+          turnId,
+          stage: 'ux',
+          assignment: design.assignment,
+          result: design.result,
+          signal: controller.signal,
+          writerSideEffectsPossible,
+        });
+        if (outcome !== 'continue') return;
       }
 
       if (pipeline.requiresWriteLease) {
         const acquisition = this.lease.acquire({
-          provider: pipeline.executor.provider,
+          provider: pipeline.coder.provider,
           turnId,
-          taskId: `${turnId}-execute`,
+          taskId: `${turnId}-code`,
           now: this.now(),
         });
         if (!acquisition.ok) {
@@ -1485,7 +1604,51 @@ export class RoomApplication {
         acquired = acquisition.lease;
         await this.persistRuntimeState();
       }
+
+      const transferWriterLease = async (provider, taskId) => {
+        if (!acquired || acquired.ownerProvider === provider) return;
+        const transferred = this.lease.transfer({
+          generation: acquired.generation,
+          provider,
+          taskId,
+          now: this.now(),
+        });
+        if (!transferred.ok) {
+          throw new Error('Unable to transfer the workspace writer lease between Supermode stages.');
+        }
+        acquired = transferred.lease;
+        await this.persistRuntimeState();
+      };
+
+      if (controller.signal.aborted) throw new Error('Supermode cancelled before code.');
+      await this.beginSupermodeStage(turnId, 'code', pipeline.coder);
+      const coding = await this.runSupermodeStage(
+        pipeline.coder,
+        providerObjective,
+        turnId,
+        `${turnId}-code`,
+        controller.signal,
+        {
+          pipelineStage: 'code',
+          planResult: planning.result.text,
+          helperFindings: design?.result?.text ?? '',
+          ...this.takeSupermodeContext(turnId),
+        },
+        (fallback) => transferWriterLease(fallback.provider, `${turnId}-code-fallback`),
+      );
+      pipeline.coder = coding.assignment;
+      writerSideEffectsPossible ||= Boolean(coding.result.sideEffectsPossible);
+      outcome = await this.settleSupermodeStage({
+        turnId,
+        stage: 'code',
+        assignment: coding.assignment,
+        result: coding.result,
+        signal: controller.signal,
+        writerSideEffectsPossible,
+      });
+      if (outcome !== 'continue') return;
       if (controller.signal.aborted) throw new Error('Supermode cancelled before execute.');
+      await transferWriterLease(pipeline.executor.provider, `${turnId}-execute`);
 
       await this.beginSupermodeStage(turnId, 'execute', pipeline.executor);
       const execution = await this.runSupermodeStage(
@@ -1496,29 +1659,12 @@ export class RoomApplication {
         controller.signal,
         {
           pipelineStage: 'execute',
-          leadResult: planning.result.text,
+          planResult: planning.result.text,
+          leadResult: coding.result.text,
+          helperFindings: design?.result?.text ?? '',
+          ...this.takeSupermodeContext(turnId),
         },
-        async (fallback) => {
-          if (!acquired || fallback.provider === acquired.ownerProvider) return;
-          this.lease.release({
-            generation: acquired.generation,
-            now: this.now(),
-            outcome: 'safe-fallback',
-          });
-          acquired = null;
-          await this.persistRuntimeState();
-          const fallbackAcquisition = this.lease.acquire({
-            provider: fallback.provider,
-            turnId,
-            taskId: `${turnId}-execute-fallback`,
-            now: this.now(),
-          });
-          if (!fallbackAcquisition.ok) {
-            throw new Error('Unable to transfer the workspace write lease for safe fallback.');
-          }
-          acquired = fallbackAcquisition.lease;
-          await this.persistRuntimeState();
-        },
+        (fallback) => transferWriterLease(fallback.provider, `${turnId}-execute-fallback`),
       );
       pipeline.executor = execution.assignment;
       writerSideEffectsPossible ||= Boolean(execution.result.sideEffectsPossible);
@@ -1542,8 +1688,13 @@ export class RoomApplication {
         controller.signal,
         {
           pipelineStage: 'review',
+          planResult: planning.result.text,
           leadResult: execution.result.text,
-          helperFindings: planning.result.text,
+          helperFindings: [
+            coding.result.text,
+            design?.result?.text,
+          ].filter(Boolean).join('\n\n'),
+          ...this.takeSupermodeContext(turnId),
         },
       );
       pipeline.reviewer = review.assignment;
@@ -1552,58 +1703,6 @@ export class RoomApplication {
         stage: 'review',
         assignment: review.assignment,
         result: review.result,
-        signal: controller.signal,
-        writerSideEffectsPossible,
-      });
-      if (outcome !== 'continue') return;
-      if (controller.signal.aborted) throw new Error('Supermode cancelled before synthesis.');
-
-      await this.beginSupermodeStage(turnId, 'synthesis', pipeline.executor);
-      const finalResult = await this.runSynthesis(
-        {
-          lead: pipeline.executor,
-          helper: pipeline.reviewer,
-          classification: { ...pipeline.classification, delegationMode: 'auto' },
-        },
-        providerObjective,
-        execution.result,
-        review.result,
-        turnId,
-        `${turnId}-synthesis`,
-        controller.signal,
-        {
-          workflow: 'supermode',
-          pipelineStage: 'synthesis',
-          planResult: planning.result.text,
-          sessionIdOverride: execution.result.sessionId ?? null,
-        },
-      );
-      const [clarifiedSynthesis] = await this.resolveClarificationResults(
-        [{
-          assignment: { ...pipeline.executor, role: 'synthesis' },
-          result: finalResult,
-          taskId: `${turnId}-synthesis`,
-          role: 'synthesis',
-          handoffExtra: {
-            workflow: 'supermode',
-            pipelineStage: 'synthesis',
-            planResult: planning.result.text,
-            leadResult: execution.result.text,
-            helperFindings: review.result.text,
-          },
-        }],
-        providerObjective,
-        turnId,
-        controller.signal,
-        { workflow: 'supermode', stage: 'synthesis' },
-      );
-      const settledFinalResult = clarifiedSynthesis.result;
-      writerSideEffectsPossible ||= Boolean(settledFinalResult.sideEffectsPossible);
-      outcome = await this.settleSupermodeStage({
-        turnId,
-        stage: 'synthesis',
-        assignment: pipeline.executor,
-        result: settledFinalResult,
         signal: controller.signal,
         writerSideEffectsPossible,
       });
@@ -1617,20 +1716,21 @@ export class RoomApplication {
         writerSideEffectsPossible,
       });
       this.setActiveWorkflowStage(turnId, 'complete', null);
-      const tokenTotal = [planning.result, execution.result, review.result, settledFinalResult]
+      const tokenTotal = [planning.result, design?.result, coding.result, execution.result, review.result]
         .reduce((total, result) => total + usageTokens(result?.usage), 0);
       await this.appendEvent({
         actor: 'SYSTEM',
         type: 'message',
         turnId,
-        content: `Complete · Supermode · ${actorFor(pipeline.executor.provider)} executed · ` +
-          `${actorFor(pipeline.reviewer.provider)} reviewed · ${tokenTotal} observed tokens`,
+        content: `Complete · Supermode · ${actorFor(pipeline.coder.provider)} coded · ` +
+          `${actorFor(pipeline.executor.provider)} executed · ` +
+          `${actorFor(pipeline.reviewer.provider)} reviewed last · ${tokenTotal} observed tokens`,
         metadata: { code: 'turn-summary', status: 'completed', workflow: 'supermode' },
       });
     } catch (error) {
       const status = controller.signal.aborted ? 'cancelled' : 'failed';
       const activeWriter = Boolean(
-        acquired && ['execute', 'synthesis'].includes(this.active?.stage),
+        acquired && ['code', 'execute'].includes(this.active?.stage),
       );
       writerSideEffectsPossible ||= activeWriter;
       await this.markTurn(turnId, {
@@ -1862,7 +1962,7 @@ export class RoomApplication {
       activeProvider: assignment.provider,
       ...this.supermodeProviderPatch(stage, assignment.provider),
       ...(
-        ['execute', 'synthesis'].includes(stage) && assignment.mode === 'workspace-write'
+        ['code', 'execute'].includes(stage) && assignment.mode === 'workspace-write'
           ? { writerSideEffectsPossible: true }
           : {}
       ),
@@ -1881,6 +1981,12 @@ export class RoomApplication {
   supermodeProviderPatch(stage, provider) {
     if (stage === 'plan') {
       return { plannerProvider: provider };
+    }
+    if (stage === 'ux') {
+      return { designerProvider: provider };
+    }
+    if (stage === 'code') {
+      return { coderProvider: provider, leadProvider: provider };
     }
     if (stage === 'execute') {
       return { executorProvider: provider, leadProvider: provider };
@@ -2467,47 +2573,57 @@ export class RoomApplication {
   }
 
   describeSupermode(pipeline) {
-    return [
+    const stages = [
       `supermode · ${actorFor(pipeline.planner.provider)} plans`,
-      `${actorFor(pipeline.executor.provider)} ${pipeline.requiresWriteLease ? 'executes' : 'analyzes'}`,
-      `${actorFor(pipeline.reviewer.provider)} reviews`,
-      `${actorFor(pipeline.executor.provider)} synthesizes`,
-    ].join(' → ');
+    ];
+    if (pipeline.designer) {
+      stages.push(`${actorFor(pipeline.designer.provider)} guides UI`);
+    }
+    stages.push(
+      `${actorFor(pipeline.coder.provider)} ${pipeline.requiresWriteLease ? 'codes' : 'checks code'}`,
+      `${actorFor(pipeline.executor.provider)} ${pipeline.requiresWriteLease ? 'executes' : 'validates'}`,
+      `${actorFor(pipeline.reviewer.provider)} reviews last`,
+    );
+    return stages.join(' → ');
   }
 
   ensureSupermodeWriterCapability(pipeline) {
-    if (
-      !pipeline.requiresWriteLease ||
-      this.providerStatus[pipeline.executor.provider]?.canWrite !== false
-    ) {
-      return pipeline;
+    if (!pipeline.requiresWriteLease) return pipeline;
+
+    const next = { ...pipeline };
+    for (const key of ['coder', 'executor']) {
+      const assignment = next[key];
+      if (this.providerStatus[assignment.provider]?.canWrite !== false) continue;
+      const fallback = this.createSupermodeFallbackAssignment(assignment);
+      if (!fallback) {
+        return {
+          ok: false,
+          reason: `${actorFor(assignment.provider)} writer mode is unavailable; ` +
+            `no write-capable Supermode ${assignment.label} provider was started.`,
+        };
+      }
+
+      const previousProvider = assignment.provider;
+      const previousCanRead = this.providerStatus[previousProvider]?.canRead !== false;
+      next[key] = fallback;
+      for (const [readKey, stage] of [
+        ['planner', 'plan'],
+        ['designer', 'ux'],
+        ['reviewer', 'review'],
+      ]) {
+        const readAssignment = next[readKey];
+        const automatic = normalizeModeProvider(this.config.modeProviders?.[stage], 'auto') === 'auto';
+        if (
+          readAssignment &&
+          previousCanRead &&
+          automatic &&
+          readAssignment.provider === fallback.provider
+        ) {
+          next[readKey] = { ...readAssignment, provider: previousProvider };
+        }
+      }
     }
-
-    const fallback = this.createSupermodeFallbackAssignment(pipeline.executor);
-    if (!fallback) {
-      return {
-        ok: false,
-        reason: `${actorFor(pipeline.executor.provider)} writer mode is unavailable; no write-capable supermode executor was started.`,
-      };
-    }
-
-    const previousExecutor = pipeline.executor.provider;
-    const previousCanRead = this.providerStatus[previousExecutor]?.canRead !== false;
-    const planIsAutomatic = normalizeModeProvider(this.config.modeProviders?.plan, 'auto') === 'auto';
-    const reviewIsAutomatic = normalizeModeProvider(this.config.modeProviders?.review, 'auto') === 'auto';
-    const planner = previousCanRead && planIsAutomatic && pipeline.planner.provider === fallback.provider
-      ? { ...pipeline.planner, provider: previousExecutor }
-      : pipeline.planner;
-    const reviewer = previousCanRead && reviewIsAutomatic && pipeline.reviewer.provider === fallback.provider
-      ? { ...pipeline.reviewer, provider: previousExecutor }
-      : pipeline.reviewer;
-
-    return {
-      ...pipeline,
-      planner,
-      executor: fallback,
-      reviewer,
-    };
+    return next;
   }
 
   ensureWriterCapability(plan, route) {
@@ -2649,6 +2765,7 @@ export class RoomApplication {
           `${this.active.stage ? ` ${this.active.stage}` : ''} (${this.active.turnId})`
         : null,
       pendingClarifications: structuredClone(this.active?.clarifications?.items ?? []),
+      pendingSupermodeContext: this.active?.pendingSupermodeContext?.length ?? 0,
       lease: this.lease.snapshot().current
         ? `${this.lease.snapshot().current.ownerProvider} write`
         : 'free',

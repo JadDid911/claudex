@@ -518,8 +518,9 @@ function chooseConfiguredStageProvider(snapshot, modeProviders, stage) {
 /**
  * Build the sequential assignments for an explicit supermode turn.
  *
- * The executor is selected first because both automatic planning and review
- * prefer an independent provider relative to the actor that owns execution.
+ * The code and execute writers are selected first because automatic planning,
+ * UX guidance, and final review prefer an independent provider relative to the
+ * actors that own workspace changes.
  * Configured stage providers are affinities: unavailable or cooling providers
  * fall back to the normal capacity-aware selection path.
  */
@@ -552,14 +553,20 @@ export function createSupermodePlan(input = {}, ledger, options = {}) {
       }
       : initialClassification;
   const snapshot = getCapacitySnapshot(ledger, { now: options.now });
+  const configuredCoder = chooseConfiguredStageProvider(
+    snapshot,
+    input.modeProviders,
+    'code',
+  );
   const configuredExecutor = chooseConfiguredStageProvider(
     snapshot,
     input.modeProviders,
     'execute',
   );
-  const executorProvider = configuredExecutor ?? chooseLead(snapshot);
+  const coderProvider = configuredCoder ?? configuredExecutor ?? chooseLead(snapshot);
+  const executorProvider = configuredExecutor ?? coderProvider;
 
-  if (!executorProvider) {
+  if (!coderProvider || !executorProvider) {
     return {
       ok: false,
       classification,
@@ -574,8 +581,17 @@ export function createSupermodePlan(input = {}, ledger, options = {}) {
     'plan',
   );
   const plannerProvider = configuredPlanner
-    ?? chooseHelper(snapshot, executorProvider)
-    ?? executorProvider;
+    ?? chooseHelper(snapshot, coderProvider)
+    ?? coderProvider;
+  const configuredDesigner = chooseConfiguredStageProvider(
+    snapshot,
+    input.modeProviders,
+    'ux',
+  );
+  const includeDesigner = classification.taskLane === 'ux' || Boolean(configuredDesigner);
+  const designerProvider = includeDesigner
+    ? configuredDesigner ?? chooseHelper(snapshot, coderProvider) ?? coderProvider
+    : null;
   const configuredReviewer = chooseConfiguredStageProvider(
     snapshot,
     input.modeProviders,
@@ -584,7 +600,7 @@ export function createSupermodePlan(input = {}, ledger, options = {}) {
   const reviewerProvider = configuredReviewer
     ?? chooseHelper(snapshot, executorProvider)
     ?? executorProvider;
-  const executorMode = classification.writerRequired ? 'workspace-write' : 'read-only';
+  const writerMode = classification.writerRequired ? 'workspace-write' : 'read-only';
 
   return {
     ok: true,
@@ -596,10 +612,27 @@ export function createSupermodePlan(input = {}, ledger, options = {}) {
       profileStage: 'plan',
       label: 'plan',
     },
+    designer: designerProvider
+      ? {
+          provider: designerProvider,
+          role: 'ux-reviewer',
+          mode: 'read-only',
+          profileStage: 'ux',
+          label: 'ux',
+          reviewFocus: 'ux',
+        }
+      : null,
+    coder: {
+      provider: coderProvider,
+      role: classification.writerRequired ? 'coding-lead' : 'independent-analyst',
+      mode: writerMode,
+      profileStage: 'code',
+      label: 'code',
+    },
     executor: {
       provider: executorProvider,
       role: classification.writerRequired ? 'execution-lead' : 'analysis-lead',
-      mode: executorMode,
+      mode: writerMode,
       profileStage: 'execute',
       label: 'execute',
     },
@@ -610,7 +643,7 @@ export function createSupermodePlan(input = {}, ledger, options = {}) {
       profileStage: 'review',
       label: 'review',
     },
-    requiresWriteLease: classification.writerRequired && executorMode === 'workspace-write',
+    requiresWriteLease: classification.writerRequired && writerMode === 'workspace-write',
     snapshot,
   };
 }

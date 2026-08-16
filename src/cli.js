@@ -6,7 +6,7 @@ import { createInterface, moveCursor } from 'node:readline';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { getHelpText, parseInputLine } from './ui/commands.js';
+import { getHelpText, isPlainTextTurn, parseInputLine } from './ui/commands.js';
 import {
   canUseInteractivePrompt,
   createInteractivePrompt,
@@ -514,7 +514,9 @@ function createSubmissionQueue({ app, renderer, stdout, stderr }) {
       const command = parseInputLine(line);
 
       if (command.kind === 'turn') {
-        const answersClarification = app.isAwaitingInput?.() === true;
+        const answersClarification = (
+          app.isAwaitingInput?.() === true && isPlainTextTurn(command)
+        );
         const alreadyBusy = (
           app.isBusy?.() && !answersClarification
         ) || queuedLines.length > 0 || draining != null;

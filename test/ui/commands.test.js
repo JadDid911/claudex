@@ -38,6 +38,17 @@ test('supermode parses as an explicit automatic pipeline turn', () => {
   });
 });
 
+test('context parses as live Supermode context and requires content', () => {
+  assert.deepEqual(parseInputLine('/context preserve the existing API contract'), {
+    kind: 'command',
+    name: 'context',
+    text: 'preserve the existing API contract',
+    raw: '/context preserve the existing API contract',
+  });
+
+  assert.equal(parseInputLine('/context').kind, 'error');
+});
+
 test('canonical lane turn commands set one-turn delegation mode and preserve the prompt', () => {
   assert.deepEqual(parseInputLine('/plan map the migration'), {
     kind: 'turn',
@@ -296,4 +307,5 @@ test('help text documents ctrl+c behavior', () => {
   assert.match(getHelpText(), /\/model \[provider\] \[model\]/u);
   assert.match(getHelpText(), /\/effort \[provider\] \[effort\]/u);
   assert.match(getHelpText(), /\/mode \[auto\|plan\|code\|execute\|ux\]/u);
+  assert.match(getHelpText(), /\/context <text>/u);
 });

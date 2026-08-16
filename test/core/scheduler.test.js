@@ -632,6 +632,46 @@ test('createSupermodePlan honors independently swapped stage providers, includin
   assert.equal(pipeline.requiresWriteLease, true);
 });
 
+test('createSupermodePlan exposes plan, optional ux, code, execute, and final review assignments', () => {
+  const pipeline = createSupermodePlan(
+    {
+      prompt: 'Build and polish a touch-first mobile game interface.',
+      modeProviders: {
+        plan: 'claude',
+        code: 'codex',
+        execute: 'codex',
+        ux: 'claude',
+        review: 'claude',
+      },
+    },
+    createCapacityLedger(),
+  );
+
+  assert.equal(pipeline.ok, true);
+  assert.deepEqual(
+    [
+      pipeline.planner?.provider,
+      pipeline.designer?.provider,
+      pipeline.coder?.provider,
+      pipeline.executor?.provider,
+      pipeline.reviewer?.provider,
+    ],
+    ['claude', 'claude', 'codex', 'codex', 'claude'],
+  );
+  assert.deepEqual(
+    [
+      pipeline.planner?.profileStage,
+      pipeline.designer?.profileStage,
+      pipeline.coder?.profileStage,
+      pipeline.executor?.profileStage,
+      pipeline.reviewer?.profileStage,
+    ],
+    ['plan', 'ux', 'code', 'execute', 'review'],
+  );
+  assert.equal(pipeline.coder?.mode, 'workspace-write');
+  assert.equal(pipeline.executor?.mode, 'workspace-write');
+});
+
 test('createSupermodePlan treats a plan-shaped build request as writable execution', () => {
   const pipeline = createSupermodePlan(
     { prompt: 'Plan a mobile MOBA game.' },

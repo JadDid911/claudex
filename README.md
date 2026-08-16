@@ -62,7 +62,7 @@ Non-TTY output stays deterministic for logs and automation.
 
 `Ctrl+C` cancels the active turn first. Press it again to exit.
 
-The interactive terminal keeps normal scrollback while compressing transient work into one animated activity line. Durable provider responses remain in distinct Codex and Claude colors, routine tool lifecycle events stay compact, and a second plain-text turn entered while work is active is queued until the current writer lease is released. `/cancel`, `Esc` on an empty busy prompt, and the first `Ctrl+C` stop active work; `/exit` discards queued turns and exits.
+The interactive terminal keeps normal scrollback while compressing transient work into one animated activity line. Durable provider responses remain in distinct Codex and Claude colors, routine tool lifecycle events stay compact, and a second plain-text turn entered while work is active is queued until the current writer lease is released. During Supermode, `/context <text>` instead attaches new information to the next stage without cancelling the workflow. `/cancel`, `Esc` on an empty busy prompt, and the first `Ctrl+C` stop active work; `/exit` discards queued turns and exits.
 
 Claudex opens with one durable, outlined identity card showing the Claudex version, both provider models and effort levels, availability, workspace, routing, context, safety policy, author, and repository. The card caps itself at 88 columns and reflows instead of dropping details in narrower panes. The live composer places the editable input between full-pane rules and keeps its room, active mode, provider models, and context footer below the input; that footer wraps into additional rows when needed. A pending clarification adds its provider ownership line without replacing those room details. Pane resizes redraw only this ephemeral composer region, leaving normal scrollback intact. Startup is static; set `CLAUDEX_REDUCED_MOTION=1` to disable the live prompt's transient working animation as well.
 
@@ -78,7 +78,8 @@ Claudex opens with one durable, outlined identity card showing the Claudex versi
 | `/code [prompt]` | Run one coding turn with a reviewer. |
 | `/execute [prompt]` | Run one execution turn with a verifier. |
 | `/ux [prompt]` | Run one UX turn with a reviewer. `/ui` is accepted as a compatibility alias. |
-| `/supermode [prompt]` | Run plan -> execute -> review -> synthesis for one task. |
+| `/supermode [prompt]` | Run plan -> optional UX guidance -> code -> execute -> final review. |
+| `/context <text>` | Attach context to the next stage of the active Supermode workflow. |
 | `/mode [auto|plan|code|execute|ux]` | Show or change the room workflow for later plain-text turns. |
 | `/mode <plan|code|execute|ux|review> <auto|codex|claude>` | Set the provider affinity for a stage. `review` controls review/checker work independently. |
 | `/profile` | Show saved stage profiles. |
@@ -138,26 +139,28 @@ Stage profiles make the workflow fully swappable. For example:
 
 ```text
 /profile plan claude claude-opus-5 max
+/profile code codex gpt-5.6-sol max
 /profile execute codex gpt-5.6-sol max
+/profile ux claude claude-sonnet-5 high
 /profile review claude claude-opus-4-5 high
 /supermode Build the settings screen and verify it.
 ```
 
-This makes Opus 5 plan, GPT-5.6 Sol execute, Opus 4.5 review, and GPT-5.6 Sol synthesize. Synthesis always returns to the provider that actually executed and reuses that provider's execute-stage model and effort. Use `/profile <stage> auto` to restore weighted routing for a stage. Use `/model claude claude-sonnet-5` when you want a provider-wide default instead of a stage-specific override.
+This makes Opus 5 plan, Sonnet 5 provide read-only UX guidance, GPT-5.6 Sol code and execute, and Opus 4.5 perform the final review. Saved profiles survive mode changes, cancellation, new rooms, and restart; only `/profile <stage> auto` clears a stage. Use `/model claude claude-sonnet-5` when you want a provider-wide default instead of a stage-specific override.
 
 ## Supermode
 
 `/supermode <prompt>` runs the full sequential workflow:
 
 ```text
-plan -> execute -> review -> synthesis
+plan -> optional UX guidance -> code -> execute -> final review
 ```
 
-For a mutating task, planning is read-only. Claudex then shows the proposed plan and waits for `Execute this plan`, cancellation, or free-text revision feedback. Only after approval does execution get the single writer lease; review runs fresh and read-only after execution, and synthesis returns to the executor. The lease remains held through review and synthesis so another writer cannot enter between implementation and post-review fixes. For a read-only task, every stage stays read-only and no execution approval is needed.
+Planning is always read-only. Claudex then shows the proposed plan and waits for `Execute this plan`, cancellation, or free-text revision feedback. A configured UX lane—or a task classified as UX—adds fresh read-only guidance before workspace changes. For a mutating task, code and execute use their independently saved writer profiles under one continuous workspace lease. The final review runs fresh and read-only, and no provider stage follows it. Read-only Supermode stages never acquire the writer lease, but they use the same plan-approval pause.
 
-Each stage receives a bounded, sanitized handoff. Unconfigured stages use capacity-aware routing and automatic review prefers the provider other than the executor. A configured provider that is unavailable or cooling can fall back safely. The same provider reviews its own work only when explicitly configured or when no independent provider is eligible.
+Each stage receives a bounded, sanitized handoff. Unconfigured stages use capacity-aware routing and automatic review prefers a provider other than the writers. A configured provider that is unavailable or cooling can fall back safely. When code and execute use different providers, logical lease ownership transfers without releasing the cross-process workspace lock. The same provider reviews its own work only when explicitly configured or when no independent provider is eligible.
 
-A clarification pauses the current stage without ending the workflow. Claudex labels the asking provider, offers any numbered choices it supplied, accepts a custom answer, resumes the same provider session and access level, then continues downstream. A failure or `/cancel` stops later stages. Claudex does not replay a writer after uncertain workspace changes.
+A clarification pauses the current stage without ending the workflow. Claudex labels the asking provider, offers any numbered choices it supplied, accepts a plain-text custom answer, resumes the same provider session and access level, then continues downstream. Routed turn commands are not consumed as answers. While a plan, UX, code, execute, or review stage is active, `/context <text>` records the text on that turn and includes it once in the next stage handoff. A failure or `/cancel` stops later stages. Claudex does not replay a writer after uncertain workspace changes.
 
 ## Workspace, trust, and storage
 

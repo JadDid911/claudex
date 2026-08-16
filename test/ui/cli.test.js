@@ -1011,6 +1011,98 @@ test('runCli immediately delivers input submitted while clarification is already
   }
 });
 
+test('runCli keeps routed turns queued while a plain-text clarification answer resumes active work', async () => {
+  const stdin = new FakeTtyInput();
+  const stdout = new FakeTtyOutput();
+  const stderr = createOutput(false);
+  const dispatches = [];
+  let active = false;
+  let awaitingInput = false;
+  let releaseTurn;
+  let promptDriver;
+
+  const runPromise = runCli({
+    argv: ['--workspace', 'C:/repo'],
+    cwd: 'C:/repo',
+    stdin,
+    stdout,
+    stderr,
+    env: { NO_COLOR: '1' },
+    packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
+    interactivePromptFactory({ onSubmit, onExit }) {
+      promptDriver = { submit: onSubmit, exit: onExit };
+      return {
+        async start() { return true; },
+        async stop() {},
+      };
+    },
+    createRoomApplication() {
+      return {
+        start() {
+          return {
+            roomId: 'room-routed-during-clarification',
+            providers: [{ name: 'codex', status: 'available' }],
+            routingMode: 'auto',
+            safetyMode: 'single-writer',
+          };
+        },
+        async dispatch(command) {
+          dispatches.push(command);
+          if (awaitingInput) {
+            awaitingInput = false;
+            return;
+          }
+          if (active) throw new Error('concurrent dispatch');
+          if (dispatches.length > 2) return;
+          active = true;
+          await new Promise((resolve) => {
+            releaseTurn = () => {
+              active = false;
+              resolve();
+            };
+          });
+        },
+        isBusy() { return active; },
+        isAwaitingInput() { return awaitingInput; },
+        async cancel() { return active; },
+        async close() {},
+      };
+    },
+  });
+
+  const waitForDispatches = async (count) => {
+    const deadline = Date.now() + 500;
+    while (dispatches.length < count && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    await promptDriver.submit('Inspect the parser.');
+    await waitForDispatches(1);
+    awaitingInput = true;
+
+    await promptDriver.submit('/codex Start a separate follow-up.');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(dispatches.length, 1);
+
+    await promptDriver.submit('Execute this plan');
+    await waitForDispatches(2);
+    assert.equal(dispatches[1].prompt, 'Execute this plan');
+
+    releaseTurn();
+    await waitForDispatches(3);
+    assert.equal(dispatches[2].route, 'codex');
+    assert.equal(dispatches[2].prompt, 'Start a separate follow-up.');
+  } finally {
+    releaseTurn?.();
+    await promptDriver?.exit?.();
+    await runPromise;
+  }
+});
+
 test('runCli drops a queued plain TTY reply after /cancel instead of dispatching it later', async () => {
   const stdin = new FakeTtyInput();
   const stdout = new FakeTtyOutput();

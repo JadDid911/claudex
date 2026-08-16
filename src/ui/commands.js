@@ -18,6 +18,7 @@ export const COMMAND_DEFINITIONS = Object.freeze([
   { name: 'execute', usage: '/execute [prompt]', summary: 'Run one execution turn with a verifier.', completion: '/execute ' },
   { name: 'ux', usage: '/ux [prompt]', summary: 'Run one UX turn with a reviewer.', completion: '/ux ' },
   { name: 'supermode', usage: '/supermode [prompt]', summary: 'Plan, execute, review, and synthesize one task.', completion: '/supermode ' },
+  { name: 'context', usage: '/context <text>', summary: 'Add context to the next active Supermode stage.', completion: '/context ' },
   { name: 'mode', usage: '/mode [auto|plan|code|execute|ux]', summary: 'Choose the room workflow.', completion: '/mode ' },
   { name: 'profile', usage: '/profile [stage provider model effort]', summary: 'Delegate a stage to a provider, model, and effort.', completion: '/profile ' },
   { name: 'model', usage: '/model [provider] [model]', summary: 'Show or select a provider-wide model.', completion: '/model ' },
@@ -42,6 +43,7 @@ const HELP_LINES = [
   '  /execute [prompt]  force one execution turn',
   '  /ux [prompt]       force one UX turn',
   '  /supermode [prompt] run plan, execute, review, and synthesis stages',
+  '  /context <text>    add context to the next active Supermode stage',
   '',
   'Tune',
   '  /mode [auto|plan|code|execute|ux] choose the room workflow',
@@ -78,6 +80,14 @@ const PROFILE_USAGE =
 
 export function getHelpText() {
   return HELP_LINES.join('\n');
+}
+
+export function isPlainTextTurn(command) {
+  return command?.kind === 'turn' &&
+    command.route === 'auto' &&
+    !command.supermode &&
+    command.delegationMode == null &&
+    !String(command.raw ?? '').trimStart().startsWith('/');
 }
 
 export function parseInputLine(input) {
@@ -135,6 +145,18 @@ export function parseInputLine(input) {
       prompt: remainder,
       raw: input,
       supermode: true,
+    };
+  }
+
+  if (name === 'context') {
+    if (!remainder) {
+      return commandError('/context requires text for the active Supermode workflow.');
+    }
+    return {
+      kind: 'command',
+      name,
+      text: remainder,
+      raw: input,
     };
   }
 
