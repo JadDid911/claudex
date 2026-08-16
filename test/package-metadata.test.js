@@ -132,6 +132,7 @@ test('ci workflow verifies, packs, and smoke-installs the published tarball acro
   assert.match(workflow, /node-version:\s*24/mu);
   assert.match(workflow, /npm run verify/mu);
   assert.match(workflow, /['"]pack['"],\s*['"]--json['"]/mu);
+  assert.match(workflow, /['"]--ignore-scripts['"]/mu);
   assert.match(workflow, /['"]--version['"]/mu);
   assert.match(workflow, /['"]--help['"]/mu);
   assert.match(workflow, /['"]--demo['"]/mu);

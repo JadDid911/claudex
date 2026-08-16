@@ -30,7 +30,9 @@ jobs:
           import { spawnSync } from 'node:child_process';
 
           const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-          const result = spawnSync(npmCommand, ['pack', '--json'], {
+          // Verification already ran in the preceding step. Skipping lifecycle
+          // scripts here keeps stdout as machine-readable JSON on every OS.
+          const result = spawnSync(npmCommand, ['pack', '--json', '--ignore-scripts'], {
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'pipe'],
           });
