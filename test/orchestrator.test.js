@@ -106,6 +106,7 @@ async function createHarness(context, providerOptions = {}, applicationOptions =
     protectWorkspaceAsHome = false,
     homeDirectory,
     requirePlanApproval = false,
+    requireStageApproval = false,
     ...roomOptions
   } = applicationOptions;
   const app = createRoomApplication({
@@ -117,6 +118,7 @@ async function createHarness(context, providerOptions = {}, applicationOptions =
     now,
     persistConfig: false,
     requirePlanApproval,
+    requireStageApproval,
     homeDirectory: protectWorkspaceAsHome ? workspace : homeDirectory,
     ...roomOptions,
   });
@@ -399,8 +401,11 @@ test('read-only supermode pauses after planning, then stays read-only after appr
   assert.equal(harness.app.lease.snapshot().current, null);
 });
 
-test('writable supermode pauses after planning until the user approves execution', { timeout: 1_000 }, async (context) => {
-  const harness = await createHarness(context, {}, { requirePlanApproval: true });
+test('writable supermode guides the user through every handoff without slash commands', { timeout: 1_000 }, async (context) => {
+  const harness = await createHarness(context, {}, {
+    requirePlanApproval: true,
+    requireStageApproval: true,
+  });
 
   const dispatch = harness.app.dispatch({
     kind: 'turn',
@@ -415,23 +420,106 @@ test('writable supermode pauses after planning until the user approves execution
     harness.app.getStatus().pendingClarifications.map(({ role, options }) => ({ role, options })),
     [{
       role: 'plan-approval',
-      options: ['Execute this plan', 'Cancel Supermode'],
+      options: ['Continue to Code', 'Cancel Supermode'],
     }],
   );
 
   await assert.rejects(
-    harness.app.dispatch(parseInputLine('/codex Execute this plan')),
+    harness.app.dispatch(parseInputLine('/execute Fix the provider parser.')),
     /plain text/iu,
   );
   assert.equal(harness.app.isAwaitingInput(), true);
   assert.deepEqual(harness.trace.map(traceStage), ['plan']);
+  assert.match(
+    harness.trace[0].input.prompt,
+    /Do not tell the user to run \/execute.+next-stage controls separately/isu,
+  );
 
-  await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'Execute this plan' });
+  await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'Continue to Code' });
+  await waitUntil(
+    () => harness.app.isAwaitingInput() &&
+      harness.app.getStatus().pendingClarifications[0]?.role === 'code-approval',
+    500,
+  );
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code']);
+  assert.deepEqual(harness.app.getStatus().pendingClarifications[0].options, [
+    'Continue to Execute & verify',
+    'Cancel Supermode',
+  ]);
+
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'auto',
+    prompt: 'Run the provider parser regression before moving on.',
+  });
+  await waitUntil(
+    () => harness.app.isAwaitingInput() &&
+      harness.app.getStatus().pendingClarifications[0]?.role === 'execute-approval',
+    500,
+  );
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code', 'execute']);
+  assert.deepEqual(
+    harness.trace[2].input.context.extra.supermodeContext,
+    [{
+      text: 'Run the provider parser regression before moving on.',
+      receivedAtStage: 'code',
+    }],
+  );
+  assert.deepEqual(harness.app.getStatus().pendingClarifications[0].options, [
+    'Continue to Final review',
+    'Cancel Supermode',
+  ]);
+
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'auto',
+    prompt: 'Continue to Final review',
+  });
   await dispatch;
 
   assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code', 'execute', 'review']);
   assert.equal(traceAccess(harness.trace[1]), 'write');
+  assert.equal(harness.app.isAwaitingInput(), false);
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'completed');
+});
+
+test('configured UX guidance gets its own visible Supermode handoff', { timeout: 1_000 }, async (context) => {
+  const harness = await createHarness(context, {}, {
+    requirePlanApproval: true,
+    requireStageApproval: true,
+  });
+  setStageProfile(harness, 'ux', 'claude', 'fable', 'high');
+
+  const dispatch = harness.app.dispatch(parseInputLine(
+    '/supermode Build the responsive game interface.',
+  ));
+  await waitUntil(() => harness.app.isAwaitingInput(), 500);
+
+  assert.deepEqual(harness.app.getStatus().pendingClarifications[0].options, [
+    'Continue to UX guidance',
+    'Cancel Supermode',
+  ]);
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'auto',
+    prompt: 'Continue to UX guidance',
+  });
+  await waitUntil(
+    () => harness.app.isAwaitingInput() &&
+      harness.app.getStatus().pendingClarifications[0]?.role === 'ux-approval',
+    500,
+  );
+
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'ux']);
+  assert.deepEqual(harness.app.getStatus().pendingClarifications[0].options, [
+    'Continue to Code',
+    'Cancel Supermode',
+  ]);
+  await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'Cancel Supermode' });
+  await dispatch;
+
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'ux']);
+  assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'cancelled');
 });
 
 test('/context feeds the next Supermode stage without answering plan approval', { timeout: 1_000 }, async (context) => {

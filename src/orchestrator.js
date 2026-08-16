@@ -39,6 +39,13 @@ const TERMINAL_SUCCESS = 'completed';
 const MAX_CONTEXT_EVENTS = 512;
 const MAX_CLARIFICATION_ROUNDS = 4;
 const MAX_PLAN_APPROVAL_ROUNDS = 4;
+const SUPERMODE_STAGE_LABELS = Object.freeze({
+  plan: 'Plan',
+  ux: 'UX guidance',
+  code: 'Code',
+  execute: 'Execute & verify',
+  review: 'Final review',
+});
 
 function isoNow(now) {
   const value = now();
@@ -102,9 +109,10 @@ function readOnlyAssignmentPrompt(assignment, objective) {
 
   if (assignment.role === 'planning-lead' && assignment.label === 'plan') {
     return [
-      `${header} Produce a concrete, implementation-ready plan for the execute stage.`,
+      `${header} Produce a concrete, implementation-ready plan for the remaining Supermode stages.`,
       objectiveLine,
       'Inspect the workspace as needed, identify the smallest safe change, name verification steps, and surface material risks.',
+      'Return the plan itself. Do not tell the user to run /execute or any other Claudex command; Claudex presents the next-stage controls separately.',
       `If a required user decision truly blocks progress, ask exactly one direct question prefixed with "${ROOM_CLARIFICATION_PREFIX}". Otherwise return the plan without asking optional questions.`,
     ].join('\n\n');
   }
@@ -1547,6 +1555,7 @@ export class RoomApplication {
         providerObjective,
         turnId,
         controller.signal,
+        pipeline.designer ? 'ux' : 'code',
       );
       planning = approval.planning;
       pipeline.planner = planning.assignment;
@@ -1589,6 +1598,16 @@ export class RoomApplication {
           writerSideEffectsPossible,
         });
         if (outcome !== 'continue') return;
+
+        const designAdvance = await this.approveSupermodeAdvance({
+          assignment: pipeline.designer,
+          fromStage: 'ux',
+          toStage: 'code',
+          turnId,
+          signal: controller.signal,
+          writerSideEffectsPossible,
+        });
+        if (designAdvance !== 'approved') return;
       }
 
       if (pipeline.requiresWriteLease) {
@@ -1647,6 +1666,16 @@ export class RoomApplication {
         writerSideEffectsPossible,
       });
       if (outcome !== 'continue') return;
+
+      const codeAdvance = await this.approveSupermodeAdvance({
+        assignment: pipeline.coder,
+        fromStage: 'code',
+        toStage: 'execute',
+        turnId,
+        signal: controller.signal,
+        writerSideEffectsPossible,
+      });
+      if (codeAdvance !== 'approved') return;
       if (controller.signal.aborted) throw new Error('Supermode cancelled before execute.');
       await transferWriterLease(pipeline.executor.provider, `${turnId}-execute`);
 
@@ -1677,6 +1706,16 @@ export class RoomApplication {
         writerSideEffectsPossible,
       });
       if (outcome !== 'continue') return;
+
+      const executeAdvance = await this.approveSupermodeAdvance({
+        assignment: pipeline.executor,
+        fromStage: 'execute',
+        toStage: 'review',
+        turnId,
+        signal: controller.signal,
+        writerSideEffectsPossible,
+      });
+      if (executeAdvance !== 'approved') return;
       if (controller.signal.aborted) throw new Error('Supermode cancelled before review.');
 
       await this.beginSupermodeStage(turnId, 'review', pipeline.reviewer);
@@ -1764,11 +1803,12 @@ export class RoomApplication {
     }
   }
 
-  async approveSupermodePlan(planning, objective, turnId, signal) {
+  async approveSupermodePlan(planning, objective, turnId, signal, nextStage) {
     if (this.options.requirePlanApproval === false) {
       return { outcome: 'approved', planning };
     }
 
+    const nextLabel = SUPERMODE_STAGE_LABELS[nextStage] ?? 'the next stage';
     let current = planning;
     for (let round = 1; round <= MAX_PLAN_APPROVAL_ROUNDS; round += 1) {
       const answers = await this.requestClarificationAnswers(
@@ -1777,8 +1817,8 @@ export class RoomApplication {
           assignment: current.assignment,
           role: 'plan-approval',
           clarification: {
-            question: 'Plan ready. Execute it, or type revision feedback?',
-            options: ['Execute this plan', 'Cancel Supermode'],
+            question: `Plan ready. Continue to ${nextLabel}, or type revision feedback?`,
+            options: [`Continue to ${nextLabel}`, 'Cancel Supermode'],
           },
         }],
         signal,
@@ -1790,12 +1830,15 @@ export class RoomApplication {
       }
 
       const answer = String(answers.values().next().value ?? '').trim();
-      if (/^(?:execute this plan|approve|approved|yes|y|go|proceed|continue|looks good|build it|start)$/iu.test(answer)) {
+      if (
+        answer.localeCompare(`Continue to ${nextLabel}`, undefined, { sensitivity: 'accent' }) === 0 ||
+        /^(?:execute this plan|approve|approved|yes|y|go|proceed|continue|looks good|build it|start)$/iu.test(answer)
+      ) {
         await this.appendEvent({
           actor: 'SYSTEM',
           type: 'message',
           turnId,
-          content: 'Plan approved · starting execute.',
+          content: `Plan approved · continuing to ${nextLabel}.`,
           metadata: { code: 'supermode-plan-approved', workflow: 'supermode', stage: 'plan' },
         });
         return { outcome: 'approved', planning: current };
@@ -1813,7 +1856,7 @@ export class RoomApplication {
           actor: 'SYSTEM',
           type: 'message',
           turnId,
-          content: 'Plan declined · Supermode stopped before execute.',
+          content: `Plan declined · Supermode stopped before ${nextLabel}.`,
           metadata: { code: 'supermode-plan-declined', workflow: 'supermode', stage: 'plan' },
         });
         return { outcome: 'cancelled', planning: current };
@@ -1852,6 +1895,88 @@ export class RoomApplication {
         },
       },
     };
+  }
+
+  async approveSupermodeAdvance({
+    assignment,
+    fromStage,
+    toStage,
+    turnId,
+    signal,
+    writerSideEffectsPossible,
+  }) {
+    const requireStageApproval = this.options.requireStageApproval ??
+      this.options.requirePlanApproval !== false;
+    if (!requireStageApproval) return 'approved';
+
+    const fromLabel = SUPERMODE_STAGE_LABELS[fromStage] ?? fromStage;
+    const toLabel = SUPERMODE_STAGE_LABELS[toStage] ?? toStage;
+    const continueAnswer = `Continue to ${toLabel}`;
+    const answers = await this.requestClarificationAnswers(
+      turnId,
+      [{
+        assignment,
+        role: `${fromStage}-approval`,
+        clarification: {
+          question: `${fromLabel} complete. Continue to ${toLabel}, or type guidance for it?`,
+          options: [continueAnswer, 'Cancel Supermode'],
+        },
+      }],
+      signal,
+      'supermode',
+      fromStage,
+    );
+    if (!answers || signal.aborted) return 'cancelled';
+
+    const answer = String(answers.values().next().value ?? '').trim();
+    if (/^(?:cancel supermode|cancel|no|n|stop|decline)$/iu.test(answer)) {
+      await this.markTurn(turnId, {
+        status: 'cancelled',
+        workflow: 'supermode',
+        pipelineStage: fromStage,
+        completedAt: isoNow(this.now),
+        writerSideEffectsPossible,
+      });
+      await this.appendEvent({
+        actor: 'SYSTEM',
+        type: 'message',
+        turnId,
+        content: `${fromLabel} accepted · Supermode stopped before ${toLabel}.`,
+        metadata: {
+          code: 'supermode-stage-declined',
+          workflow: 'supermode',
+          stage: fromStage,
+          nextStage: toStage,
+        },
+      });
+      return 'cancelled';
+    }
+
+    const isContinue = answer.localeCompare(
+      continueAnswer,
+      undefined,
+      { sensitivity: 'accent' },
+    ) === 0 || /^(?:approve|approved|yes|y|go|proceed|continue|looks good|next)$/iu.test(answer);
+    if (!isContinue && answer) {
+      this.active?.pendingSupermodeContext.push({
+        text: answer,
+        receivedAtStage: fromStage,
+      });
+    }
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      turnId,
+      content: `${fromLabel} accepted · continuing to ${toLabel}.`,
+      metadata: {
+        code: 'supermode-stage-approved',
+        workflow: 'supermode',
+        stage: fromStage,
+        nextStage: toStage,
+        guidanceAdded: !isContinue,
+      },
+    });
+    return 'approved';
   }
 
   async runSupermodeStage(
