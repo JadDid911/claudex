@@ -1,0 +1,5 @@
+{"type":"item.started","item":{"id":"fixture-command-0001","type":"command_execution","command":"node --test","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"fixture-command-0001","type":"command_execution","command":"node --test","aggregated_output":"synthetic ok","exit_code":0,"status":"completed"}}
+{"type":"approval_required","message":"Synthetic approval request."}
+{"type":"future.codex.event","payload":{"synthetic":true}}
+not-json-synthetic-codex

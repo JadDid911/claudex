@@ -1,0 +1,6 @@
+{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"fixture-tool-0001","name":"Read"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"path\":\"X:\\\\fixture\\\\workspace\\\\file.js\"}"}}}
+{"type":"stream_event","event":{"type":"content_block_stop"}}
+{"type":"rate_limit_event","rate_limit_info":{"scope":"synthetic","retry_after_seconds":60}}
+{"type":"future.claude.event","payload":{"synthetic":true}}
+not-json-synthetic-claude

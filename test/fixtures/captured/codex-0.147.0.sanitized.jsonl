@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"fixture-codex-session-0001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"fixture-message-0001","type":"agent_message","text":"Sanitized Codex fixture response."}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":4,"reasoning_output_tokens":1}}

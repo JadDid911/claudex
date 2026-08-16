@@ -1,0 +1,37 @@
+{
+  "name": "claudex",
+  "version": "0.3.0",
+  "description": "One visible, delegation-first terminal room for Codex and Claude.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JadDid911/claudex.git"
+  },
+  "homepage": "https://github.com/JadDid911/claudex#readme",
+  "bugs": {
+    "url": "https://github.com/JadDid911/claudex/issues"
+  },
+  "type": "module",
+  "bin": {
+    "claudex": "./bin/claudex.js"
+  },
+  "scripts": {
+    "start": "node ./bin/claudex.js",
+    "demo": "node ./bin/claudex.js --demo",
+    "check": "node ./scripts/check.js",
+    "test": "node --test --test-reporter spec \"test/**/*.test.js\"",
+    "verify": "npm run check && npm test"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "keywords": [
+    "claudex",
+    "codex",
+    "claude",
+    "terminal",
+    "delegation",
+    "tui"
+  ],
+  "license": "MIT",
+  "private": true
+}

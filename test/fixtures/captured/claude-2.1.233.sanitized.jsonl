@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"fixture-claude-session-0001","cwd":"X:\\fixture\\workspace","tools":[]}
+{"type":"stream_event","session_id":"fixture-claude-session-0001","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Sanitized Claude "}}}
+{"type":"stream_event","session_id":"fixture-claude-session-0001","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"fixture response."}}}
+{"type":"assistant","session_id":"fixture-claude-session-0001","message":{"content":[{"type":"text","text":"Sanitized Claude fixture response."}]}}
+{"type":"result","subtype":"success","session_id":"fixture-claude-session-0001","result":"Sanitized Claude fixture response.","usage":{"input_tokens":5,"output_tokens":9}}
