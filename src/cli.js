@@ -67,6 +67,7 @@ export async function runCli(options = {}) {
       : await readPackageMetadata()
   );
   const packageVersion = options.packageVersion ?? packageMetadata.version;
+  const packageName = options.packageName ?? packageMetadata.name ?? '@jaddid911/claudex';
   const args = parseArgv(argv, cwd);
 
   if (args.error) {
@@ -98,11 +99,13 @@ export async function runCli(options = {}) {
 
   const createRoomApplication =
     options.createRoomApplication ?? (await loadCreateRoomApplication());
-  const modelCatalog = await loadModelCatalog({ env });
+  let modelCatalog = { codex: [], claude: [], catalogSource: {} };
 
   const app = await createRoomApplication({
     workspace: args.workspace,
     resumeRoomId: args.resumeRoomId,
+    packageVersion,
+    packageName,
     emitEvent: (event) => renderer.renderEvent(event),
     emitStatus: (status) => renderer.renderStatus(
       enrichStatusWithModelCatalog(status, modelCatalog),
@@ -112,6 +115,10 @@ export async function runCli(options = {}) {
   });
 
   const startup = (await app.start?.()) ?? {};
+  modelCatalog = await loadModelCatalog({
+    env,
+    globalConfig: startup.modelCatalogConfig,
+  });
   const enrichedStartup = enrichStatusWithModelCatalog({
     ...startup,
     contextCapBytes: startup.contextCapBytes ?? null,
@@ -128,6 +135,11 @@ export async function runCli(options = {}) {
   });
 
   try {
+    if (args.command) {
+      await app.dispatch?.({ kind: 'command', name: args.command, raw: `/${args.command}` });
+      return 0;
+    }
+
     const useInteractivePrompt =
       !options.readlineFactory && canUseInteractivePrompt({ input: stdin, output: stdout });
 
@@ -160,6 +172,7 @@ export function parseArgv(argv, cwd = process.cwd()) {
     help: false,
     version: false,
     demo: false,
+    command: null,
     resumeRoomId: null,
     workspace: cwd,
   };
@@ -179,6 +192,14 @@ export function parseArgv(argv, cwd = process.cwd()) {
 
     if (value === '--demo') {
       args.demo = true;
+      continue;
+    }
+
+    if (['--doctor', '--update', '--diagnostics', '--changes', '--recover', '--memory', '--project'].includes(value)) {
+      if (args.command) {
+        return { error: 'Choose only one maintenance command.' };
+      }
+      args.command = value.slice(2);
       continue;
     }
 
@@ -272,6 +293,7 @@ export async function readPackageMetadata() {
   const packagePath = new URL('../package.json', import.meta.url);
   const packageJson = JSON.parse(await readFile(packagePath, 'utf8'));
   return {
+    name: packageJson.name,
     version: packageJson.version,
     author: packageJson.author ?? null,
     repository: String(packageJson.repository?.url ?? packageJson.repository ?? '')
@@ -302,7 +324,7 @@ async function runDemo(renderer, { workspace, version }) {
     import('./providers/mock.js'),
   ]);
   const storageRoot = await mkdtemp(path.join(os.tmpdir(), 'claudex-demo-'));
-  const fixturePath = fileURLToPath(new URL('../test/fixtures/mock-provider.js', import.meta.url));
+  const fixturePath = fileURLToPath(new URL('./providers/demo-child.js', import.meta.url));
   const providers = {
     codex: createMockProvider({ name: 'codex', fixturePath, scenario: 'demo' }),
     claude: createMockProvider({ name: 'claude', fixturePath, scenario: 'demo' }),
@@ -540,7 +562,7 @@ function createSubmissionQueue({ app, renderer, stdout, stderr }) {
   };
 }
 
-function installPromptOutputCoordinator({ renderer, prompt }) {
+export function installPromptOutputCoordinator({ renderer, prompt }) {
   const output = renderer?.output;
   if (!output || typeof output.write !== 'function') {
     return () => {};
@@ -567,6 +589,8 @@ function installPromptOutputCoordinator({ renderer, prompt }) {
       if (renderer.activityVisible) {
         originalWrite('\n');
         activityRowAbovePrompt = true;
+      } else if (!renderer.atLineStart) {
+        return;
       }
       prompt.show?.();
     });

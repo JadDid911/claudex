@@ -10,12 +10,85 @@ permissions:
 jobs:
   verify:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 24
       - run: npm run verify
+      - name: Pack tarball
+        id: pack
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { resolve } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+
+          const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+          const result = spawnSync(npmCommand, ['pack', '--json'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+
+          if (result.status !== 0) {
+            process.stderr.write(result.stderr || result.stdout);
+            process.exit(result.status ?? 1);
+          }
+
+          const packResult = JSON.parse(result.stdout).at(-1);
+          if (!packResult?.filename) {
+            throw new Error('npm pack did not return a tarball filename.');
+          }
+
+          appendFileSync(process.env.GITHUB_OUTPUT, `filename=${packResult.filename}\n`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `path=${resolve(packResult.filename)}\n`);
+          NODE
+      - name: Smoke install packed tarball outside the repository
+        env:
+          PACKAGE_PATH: ${{ steps.pack.outputs.path }}
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { mkdtempSync } from 'node:fs';
+          import { tmpdir } from 'node:os';
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+
+          function run(command, args, options = {}) {
+            const result = spawnSync(command, args, {
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'pipe'],
+              shell: process.platform === 'win32' && command.toLowerCase().endsWith('.cmd'),
+              ...options,
+            });
+
+            if (result.status !== 0) {
+              process.stderr.write(result.stderr || result.stdout);
+              process.exit(result.status ?? 1);
+            }
+
+            return result;
+          }
+
+          const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+          const installRoot = mkdtempSync(path.join(tmpdir(), 'claudex-pack-smoke-'));
+          const binPath = path.join(
+            installRoot,
+            'node_modules',
+            '.bin',
+            process.platform === 'win32' ? 'claudex.cmd' : 'claudex',
+          );
+
+          run(npmCommand, ['init', '-y'], { cwd: installRoot });
+          run(npmCommand, ['install', '--no-package-lock', process.env.PACKAGE_PATH], {
+            cwd: installRoot,
+          });
+          run(binPath, ['--version'], { cwd: installRoot });
+          run(binPath, ['--help'], { cwd: installRoot });
+          run(binPath, ['--demo'], { cwd: installRoot });
+          NODE

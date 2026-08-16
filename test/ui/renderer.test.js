@@ -286,7 +286,7 @@ test('renderer suppresses routine tty lifecycle records and clears activity on t
   );
 });
 
-test('renderer keeps tty helper prose behind one background activity line', () => {
+test('renderer keeps live tty helper prose quiet but shows its complete fallback snapshot', () => {
   const output = createOutput(true);
   const timers = createTimerHarness();
   const renderer = createTranscriptRenderer({
@@ -297,12 +297,101 @@ test('renderer keeps tty helper prose behind one background activity line', () =
   });
 
   renderer.renderEvent({ actor: 'CLAUDE', label: 'helper', type: 'delta', text: 'Long private review' });
-  renderer.renderEvent({ actor: 'CLAUDE', label: 'helper', type: 'message', text: 'Long private review complete' });
+  renderer.renderEvent({
+    actor: 'CLAUDE',
+    label: 'helper',
+    type: 'message',
+    text: 'Long private review complete',
+    metadata: { providerEventType: 'result.snapshot', ttyFallback: true },
+  });
   renderer.finish();
 
-  assert.doesNotMatch(output.read(), /Long private review/u);
+  assert.match(output.read(), /Long private review complete/u);
   assert.match(output.read(), /CLAUDE · helper/u);
-  assert.match(output.read(), /Reviewing in background/u);
+});
+
+test('renderer shows one synthesis answer while ordinary lead and review prose remain intermediate', () => {
+  const output = createOutput(true);
+  const renderer = createTranscriptRenderer({ output, color: false });
+
+  renderer.renderEvent({
+    actor: 'CODEX',
+    label: 'lead',
+    type: 'message',
+    text: 'LEAD_DUPLICATE_FINAL',
+    metadata: { providerEventType: 'text.message', intermediate: true },
+  });
+  renderer.renderEvent({
+    actor: 'CLAUDE',
+    label: 'helper',
+    type: 'message',
+    text: 'HELPER_DUPLICATE_FINAL',
+    metadata: { providerEventType: 'result.snapshot', intermediate: true },
+  });
+  renderer.renderEvent({
+    actor: 'CODEX',
+    label: 'synthesis',
+    type: 'message',
+    text: 'ONE_VISIBLE_FINAL',
+    metadata: { providerEventType: 'text.message' },
+  });
+  renderer.finish();
+
+  const visible = sanitizeVisibleText(output.read());
+  assert.doesNotMatch(visible, /LEAD_DUPLICATE_FINAL|HELPER_DUPLICATE_FINAL/u);
+  assert.match(visible, /ONE_VISIBLE_FINAL/u);
+});
+
+test('fallback replay shows the completed lead exactly once in tty and plain output', () => {
+  for (const isTTY of [true, false]) {
+    const output = createOutput(isTTY);
+    const renderer = createTranscriptRenderer({ output, color: false });
+    renderer.renderEvent({
+      actor: 'CODEX',
+      label: 'lead',
+      type: 'message',
+      text: 'DURABLE_FALLBACK_ANSWER',
+      metadata: {
+        code: 'provider-result-snapshot',
+        providerEventType: 'result.snapshot',
+        intermediate: true,
+      },
+    });
+    renderer.renderEvent({
+      actor: 'CODEX',
+      label: 'lead',
+      type: 'message',
+      text: 'DURABLE_FALLBACK_ANSWER',
+      metadata: {
+        code: 'provider-result-fallback',
+        providerEventType: 'result.snapshot',
+        intermediate: true,
+        ttyFallback: true,
+      },
+    });
+    renderer.finish();
+
+    const visible = sanitizeVisibleText(output.read());
+    assert.equal(visible.match(/DURABLE_FALLBACK_ANSWER/gu)?.length, 1);
+  }
+});
+
+test('tty activity updates do not split an open streamed body line', () => {
+  const output = createOutput(true);
+  const timers = createTimerHarness();
+  const renderer = createTranscriptRenderer({
+    output,
+    color: false,
+    setActivityTimer: timers.setActivityTimer,
+    clearActivityTimer: timers.clearActivityTimer,
+  });
+
+  renderer.renderEvent({ actor: 'CODEX', label: 'lead', type: 'delta', text: 'Hello ' });
+  renderer.renderEvent({ actor: 'CLAUDE', label: 'helper', type: 'activity', text: 'Reviewing...' });
+  renderer.renderEvent({ actor: 'CODEX', label: 'lead', type: 'delta', text: 'world\n' });
+  renderer.finish();
+
+  assert.match(sanitizeVisibleText(output.read()), /Hello world/u);
 });
 
 test('renderer clears tty activity timers and lines on finish', () => {
@@ -444,11 +533,17 @@ test('tty startup renders one outlined Claudex identity card with provider and r
       status: 'available',
       model: 'gpt-5.6-sol',
       effort: 'ultra',
+      providerVersion: '0.104.0',
+      authStatus: 'available',
+      trustStatus: 'trusted',
     }, {
       name: 'claude',
       status: 'limited',
       model: 'fable-5',
       effort: 'max',
+      providerVersion: '2.1.233',
+      authStatus: 'not-verified',
+      trustStatus: 'unknown',
     }],
     routingMode: 'supermode',
     safetyMode: 'single-writer lease; helpers read-only',
@@ -465,6 +560,8 @@ test('tty startup renders one outlined Claudex identity card with provider and r
   assert.match(lines.join('\n'), /CLAUDEX\s+1\.2\.3/u);
   assert.match(lines.join('\n'), /CODEX.*gpt-5\.6-sol.*ultra.*available/iu);
   assert.match(lines.join('\n'), /CLAUDE.*fable-5.*max.*limited/iu);
+  assert.match(lines.join('\n'), /cli 0\.104\.0.*auth available.*trust trusted/iu);
+  assert.match(lines.join('\n'), /cli 2\.1\.233.*auth not-verified.*trust unknown/iu);
   assert.match(lines.join('\n'), /C:\\repo/u);
   assert.match(lines.join('\n'), /supermode/iu);
   assert.match(lines.join('\n'), /64 KiB/u);

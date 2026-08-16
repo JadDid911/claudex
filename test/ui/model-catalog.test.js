@@ -42,6 +42,8 @@ test('local model catalog reads visible Codex cache entries and adds versioned C
   assert.equal(catalog.codex[1].defaultEffort, 'medium');
   assert.equal(catalog.codex[1].contextWindow, 272000);
   assert.equal(catalog.codex[1].effectiveContextPercent, 95);
+  assert.equal(catalog.catalogSource.codex, 'cache');
+  assert.equal(catalog.catalogSource.claude, 'static');
   assert.deepEqual(catalog.claude.map((model) => model.id), [
     'default',
     'fable',
@@ -79,6 +81,55 @@ test('local model catalog falls back safely when the Codex cache is unavailable'
   });
 
   assert.deepEqual(catalog.codex.map((model) => model.id), ['default']);
+  assert.equal(catalog.catalogSource.codex, 'default');
+  assert.equal(catalog.catalogSource.claude, 'static');
+});
+
+test('local model catalog merges configured and cached Claude model ids without reading secrets', async () => {
+  const codexCachePath = path.join(path.resolve('C:/fixture-codex'), 'models_cache.json');
+  const claudeCachePath = path.join(path.resolve('C:/fixture-claude'), 'models.json');
+  const catalog = await loadLocalModelCatalog({
+    env: { CODEX_HOME: 'C:/fixture-codex' },
+    globalConfig: {
+      claude: { model: 'claude-local-global' },
+      stageProfiles: {
+        plan: { claude: { model: 'claude-local-plan' } },
+      },
+    },
+    projectConfig: {
+      claude: { model: 'claude-local-project' },
+      stageProfiles: {
+        review: { claude: { model: 'claude-local-review' } },
+      },
+    },
+    claudeCachePaths: [claudeCachePath],
+    readText: async (filePath) => {
+      if (filePath === codexCachePath) {
+        return JSON.stringify({ models: [] });
+      }
+      if (filePath === claudeCachePath) {
+        return JSON.stringify({
+          models: [
+            'claude-cache-string',
+            { id: 'claude-cache-object' },
+            { id: 'not a valid model id with spaces' },
+          ],
+          authToken: 'secret-should-not-leak',
+        });
+      }
+      throw new Error(`Unexpected path: ${filePath}`);
+    },
+  });
+
+  assert.equal(catalog.catalogSource.claude, 'static+config+cache');
+  assert.ok(catalog.claude.some((model) => model.id === 'claude-local-global'));
+  assert.ok(catalog.claude.some((model) => model.id === 'claude-local-plan'));
+  assert.ok(catalog.claude.some((model) => model.id === 'claude-local-project'));
+  assert.ok(catalog.claude.some((model) => model.id === 'claude-local-review'));
+  assert.ok(catalog.claude.some((model) => model.id === 'claude-cache-string'));
+  assert.ok(catalog.claude.some((model) => model.id === 'claude-cache-object'));
+  assert.equal(catalog.claude.some((model) => model.id === 'not a valid model id with spaces'), false);
+  assert.doesNotMatch(JSON.stringify(catalog), /secret-should-not-leak/u);
 });
 
 test('status enrichment reports selected model context without inventing unknown limits', () => {

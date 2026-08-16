@@ -17,7 +17,7 @@ export const COMMAND_DEFINITIONS = Object.freeze([
   { name: 'code', usage: '/code [prompt]', summary: 'Run one coding turn with a reviewer.', completion: '/code ' },
   { name: 'execute', usage: '/execute [prompt]', summary: 'Run one execution turn with a verifier.', completion: '/execute ' },
   { name: 'ux', usage: '/ux [prompt]', summary: 'Run one UX turn with a reviewer.', completion: '/ux ' },
-  { name: 'supermode', usage: '/supermode [prompt]', summary: 'Plan, execute, review, and synthesize one task.', completion: '/supermode ' },
+  { name: 'supermode', usage: '/supermode [prompt]', summary: 'Plan, guide UX, code, execute, and review one task.', completion: '/supermode ' },
   { name: 'context', usage: '/context <text>', summary: 'Add context to the next active Supermode stage.', completion: '/context ' },
   { name: 'mode', usage: '/mode [auto|plan|code|execute|ux]', summary: 'Choose the room workflow.', completion: '/mode ' },
   { name: 'profile', usage: '/profile [stage provider model effort]', summary: 'Delegate a stage to a provider, model, and effort.', completion: '/profile ' },
@@ -25,6 +25,13 @@ export const COMMAND_DEFINITIONS = Object.freeze([
   { name: 'effort', usage: '/effort [provider] [effort]', summary: 'Show or set a provider reasoning effort.', completion: '/effort ' },
   { name: 'weight', usage: '/weight <provider> <number>', summary: 'Change a provider scheduling weight.', completion: '/weight ' },
   { name: 'status', usage: '/status', summary: 'Show provider, capacity, and lease status.', completion: '/status' },
+  { name: 'doctor', usage: '/doctor', summary: 'Check providers, authentication, trust, Git, and configuration.', completion: '/doctor' },
+  { name: 'changes', usage: '/changes', summary: 'Inspect workspace changes without modifying them.', completion: '/changes' },
+  { name: 'recover', usage: '/recover', summary: 'Inspect an interrupted or uncertain writer turn.', completion: '/recover' },
+  { name: 'diagnostics', usage: '/diagnostics', summary: 'Export a bounded sanitized support bundle.', completion: '/diagnostics' },
+  { name: 'update', usage: '/update', summary: 'Check the public package registry for a newer Claudex.', completion: '/update' },
+  { name: 'memory', usage: '/memory', summary: 'Show rolling room and project memory health.', completion: '/memory' },
+  { name: 'project', usage: '/project', summary: 'Show project-scoped .claudex.json configuration.', completion: '/project' },
   { name: 'cancel', usage: '/cancel', summary: 'Cancel the active provider turn.', completion: '/cancel' },
   { name: 'new', usage: '/new', summary: 'Start a fresh room in this workspace.', completion: '/new' },
   { name: 'resume', usage: '/resume [room-id]', summary: 'Resume the latest or a selected room.', completion: '/resume ' },
@@ -42,7 +49,7 @@ const HELP_LINES = [
   '  /code [prompt]     force one coding turn',
   '  /execute [prompt]  force one execution turn',
   '  /ux [prompt]       force one UX turn',
-  '  /supermode [prompt] run plan, execute, review, and synthesis stages',
+  '  /supermode [prompt] run plan, optional UX, code, execute, and final review',
   '  /context <text>    add context to the next active Supermode stage',
   '',
   'Tune',
@@ -57,6 +64,13 @@ const HELP_LINES = [
   '',
   'Session',
   '  /status   provider and writer state',
+  '  /doctor   provider, auth, trust, Git, and config checks',
+  '  /changes  inspect Git changes without modifying them',
+  '  /recover  inspect interrupted or uncertain writer work',
+  '  /memory   rolling room and project memory health',
+  '  /project  active project-scoped configuration',
+  '  /diagnostics  export a sanitized support bundle',
+  '  /update   check for a newer public package',
   '  /new      start a new room',
   '  /resume [room-id]  resume a room',
   '  /cancel   stop active work',
@@ -71,7 +85,20 @@ const HELP_LINES = [
 
 const TURN_COMMANDS = new Set(['auto', 'codex', 'claude', 'both']);
 const LANE_TURN_COMMANDS = new Set(['plan', 'code', 'execute', 'ux', 'ui']);
-const SIMPLE_COMMANDS = new Set(['status', 'cancel', 'new', 'help', 'exit']);
+const SIMPLE_COMMANDS = new Set([
+  'status',
+  'doctor',
+  'changes',
+  'recover',
+  'diagnostics',
+  'update',
+  'memory',
+  'project',
+  'cancel',
+  'new',
+  'help',
+  'exit',
+]);
 const PROVIDER_TARGETS = new Set(['codex', 'claude']);
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/u;
 const PROFILE_USAGE =

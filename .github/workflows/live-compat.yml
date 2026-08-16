@@ -1,0 +1,125 @@
+name: Live compatibility
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-smoke:
+    if: ${{ vars.CLAUDEX_ENABLE_LIVE_COMPAT == 'true' }}
+    runs-on: [self-hosted, claudex-live-compat]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm run verify
+      - name: Pack tarball
+        id: pack
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { resolve } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+
+          const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+          const result = spawnSync(npmCommand, ['pack', '--json'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+
+          if (result.status !== 0) {
+            process.stderr.write(result.stderr || result.stdout);
+            process.exit(result.status ?? 1);
+          }
+
+          const packResult = JSON.parse(result.stdout).at(-1);
+          if (!packResult?.filename) {
+            throw new Error('npm pack did not return a tarball filename.');
+          }
+
+          appendFileSync(process.env.GITHUB_OUTPUT, `path=${resolve(packResult.filename)}\n`);
+          NODE
+      - name: Install tarball outside the repository
+        id: install
+        env:
+          PACKAGE_PATH: ${{ steps.pack.outputs.path }}
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, mkdtempSync } from 'node:fs';
+          import { tmpdir } from 'node:os';
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+
+          const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+          const installRoot = mkdtempSync(path.join(tmpdir(), 'claudex-live-install-'));
+          let result = spawnSync(npmCommand, ['init', '-y'], {
+            cwd: installRoot,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+
+          if (result.status !== 0) {
+            process.stderr.write(result.stderr || result.stdout);
+            process.exit(result.status ?? 1);
+          }
+
+          result = spawnSync(npmCommand, ['install', '--no-package-lock', process.env.PACKAGE_PATH], {
+            cwd: installRoot,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+
+          if (result.status !== 0) {
+            process.stderr.write(result.stderr || result.stdout);
+            process.exit(result.status ?? 1);
+          }
+
+          appendFileSync(process.env.GITHUB_OUTPUT, `root=${installRoot}\n`);
+          NODE
+      - name: Run read-only provider smoke
+        env:
+          INSTALL_ROOT: ${{ steps.install.outputs.root }}
+        shell: bash
+        run: |
+          cd "$INSTALL_ROOT"
+          node --input-type=module <<'NODE'
+          import { mkdtempSync } from 'node:fs';
+          import { tmpdir } from 'node:os';
+          import path from 'node:path';
+          import { createClaudeProvider, createCodexProvider } from '@jaddid911/claudex/providers';
+
+          const workspace = mkdtempSync(path.join(tmpdir(), 'claudex-live-workspace-'));
+          const providers = [
+            ['codex', createCodexProvider()],
+            ['claude', createClaudeProvider()],
+          ];
+
+          for (const [name, provider] of providers) {
+            const status = await provider.detect();
+            if (!status.available || !status.canRead) {
+              throw new Error(`${name} is unavailable for read-only smoke: ${status.reason ?? 'unknown reason'}`);
+            }
+
+            const result = await provider.runTurn({
+              prompt: 'Reply with exactly OK.',
+              workspace,
+              access: 'read',
+            });
+
+            if (result.status !== 'completed') {
+              throw new Error(`${name} read-only smoke did not complete: ${result.status}`);
+            }
+
+            if (!/\bOK\b/u.test(String(result.text ?? ''))) {
+              throw new Error(`${name} read-only smoke returned unexpected text: ${String(result.text ?? '').slice(0, 120)}`);
+            }
+          }
+          NODE

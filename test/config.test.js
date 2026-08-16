@@ -8,8 +8,13 @@ import {
   createDefaultConfig,
   createProviderEnvironment,
   getConfigPath,
+  getProjectConfigPath,
+  loadEffectiveConfig,
   loadConfig,
+  loadProjectConfig,
+  mergeProjectConfig,
   normalizeConfig,
+  normalizeProjectConfig,
   saveConfig,
 } from '../src/config.js';
 import { getDefaultStorageRoot } from '../src/core/store.js';
@@ -47,7 +52,11 @@ test('default configuration stays non-secret and uses safe provider profiles', (
   const storageRoot = getDefaultStorageRoot(env);
   const config = createDefaultConfig({ env });
 
+  assert.equal(config.version, 1);
   assert.equal(config.storageRoot, storageRoot);
+  assert.equal(config.contextCapBytes, 256 * 1024);
+  assert.equal(config.timeoutMs, 30 * 60 * 1000);
+  assert.equal(config.writeTimeoutMs, 2 * 60 * 60 * 1000);
   assert.equal(getConfigPath({ env }), path.join(storageRoot, 'config.json'));
   assert.equal(config.codex.ignoreRules, false);
   assert.equal(config.codex.configurationMode, 'configured');
@@ -64,6 +73,7 @@ test('default configuration stays non-secret and uses safe provider profiles', (
 test('normalization preserves configured Codex profiles and requires explicit full Claude profile', () => {
   const config = normalizeConfig({
     timeoutMs: -1,
+    writeTimeoutMs: -1,
     contextCapBytes: 2048,
     weights: { codex: 4, claude: -2 },
     environmentPassThrough: ['ROOM_PROXY', 'ROOM_PROXY', '', 42],
@@ -72,6 +82,7 @@ test('normalization preserves configured Codex profiles and requires explicit fu
   });
 
   assert.equal(config.timeoutMs, 30 * 60 * 1000);
+  assert.equal(config.writeTimeoutMs, 2 * 60 * 60 * 1000);
   assert.equal(config.contextCapBytes, 2048);
   assert.deepEqual(config.weights, { codex: 4, claude: 1 });
   assert.deepEqual(config.environmentPassThrough, ['ROOM_PROXY']);
@@ -116,6 +127,7 @@ test('load and save configuration atomically round-trip supported preferences', 
     {
       storageRoot: tempRoot,
       color: 'never',
+      writeTimeoutMs: 75 * 60 * 1000,
       codex: { configurationMode: 'lean', profile: 'fast' },
       claude: { profileMode: 'lean' },
     },
@@ -124,6 +136,7 @@ test('load and save configuration atomically round-trip supported preferences', 
 
   const loaded = await loadConfig({ configPath, storageRoot: tempRoot });
   assert.equal(loaded.color, 'never');
+  assert.equal(loaded.writeTimeoutMs, 75 * 60 * 1000);
   assert.equal(loaded.codex.configurationMode, 'lean');
   assert.equal(loaded.codex.ignoreUserConfig, true);
   assert.equal(loaded.codex.profile, 'fast');
@@ -131,6 +144,42 @@ test('load and save configuration atomically round-trip supported preferences', 
     assert.equal((await fs.stat(tempRoot)).mode & 0o777, 0o755);
     assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
   }
+});
+
+test('loadConfig migrates the legacy unversioned 64 KiB context cap to the new default', async (context) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'room-config-migration-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const configPath = path.join(tempRoot, 'config.json');
+
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ storageRoot: tempRoot, contextCapBytes: 64 * 1024 }, null, 2)}\n`,
+    'utf8',
+  );
+  const migrated = await loadConfig({ configPath, storageRoot: tempRoot });
+  assert.equal(migrated.contextCapBytes, 256 * 1024);
+});
+
+test('loadConfig preserves versioned and custom context caps during legacy migration handling', async (context) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'room-config-migration-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const configPath = path.join(tempRoot, 'config.json');
+
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ storageRoot: tempRoot, version: 1, contextCapBytes: 64 * 1024 }, null, 2)}\n`,
+    'utf8',
+  );
+  const versioned = await loadConfig({ configPath, storageRoot: tempRoot });
+  assert.equal(versioned.contextCapBytes, 64 * 1024);
+
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ storageRoot: tempRoot, contextCapBytes: 128 * 1024 }, null, 2)}\n`,
+    'utf8',
+  );
+  const custom = await loadConfig({ configPath, storageRoot: tempRoot });
+  assert.equal(custom.contextCapBytes, 128 * 1024);
 });
 
 test('default-named config directories are private without chmodding custom parents', {
@@ -382,4 +431,204 @@ test('provider environment excludes unlisted secrets and includes explicit names
     ROOM_PROXY: 'http://proxy.invalid',
   });
   assert.equal('UNRELATED_SECRET' in environment, false);
+});
+
+test('project configuration normalization only keeps routing, model, effort, and weights overrides', () => {
+  const projectConfig = normalizeProjectConfig({
+    timeoutMs: 123,
+    writeTimeoutMs: 456,
+    storageRoot: 'C:\\unsafe',
+    environmentPassThrough: ['ROOM_PROXY'],
+    weights: { codex: 3, claude: 0, mock: 99 },
+    modeProviders: {
+      ui: 'claude',
+      review: 'codex',
+      invalid: 'mock',
+    },
+    stageProfiles: {
+      ui: {
+        claude: { model: 'fable', effort: 'max', unsafe: true },
+      },
+      review: {
+        codex: { model: 'gpt-review', effort: 'ultra' },
+        mock: { model: 'ignore-me' },
+      },
+    },
+    codex: {
+      model: 'gpt-5.6-sol',
+      effort: 'medium',
+      executable: 'C:\\unsafe\\codex.exe',
+      launcher: 'node unsafe.js',
+      ignoreRules: true,
+    },
+    claude: {
+      model: 'opus',
+      effort: 'high',
+      executable: 'C:\\unsafe\\claude.exe',
+      profileMode: 'full',
+      safeMode: false,
+    },
+    futureFlag: true,
+  });
+
+  assert.deepEqual(projectConfig, {
+    weights: { codex: 3, claude: 0 },
+    modeProviders: {
+      ux: 'claude',
+      review: 'codex',
+    },
+    stageProfiles: {
+      ux: {
+        claude: { model: 'fable', effort: 'max' },
+      },
+      review: {
+        codex: { model: 'gpt-review', effort: 'ultra' },
+      },
+    },
+    codex: {
+      model: 'gpt-5.6-sol',
+      effort: 'medium',
+    },
+    claude: {
+      model: 'opus',
+      effort: 'high',
+    },
+  });
+});
+
+test('project configuration rejects unsafe model tokens and oversized files', async (context) => {
+  const normalized = normalizeProjectConfig({
+    codex: { model: '--dangerously-bypass-approvals-and-sandbox' },
+    stageProfiles: {
+      review: { claude: { model: 'opus\n--permission-mode bypassPermissions' } },
+    },
+  });
+  assert.equal(normalized.codex, undefined);
+  assert.equal(normalized.stageProfiles, undefined);
+
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'claudex-project-config-limit-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const projectConfigPath = path.join(tempRoot, '.claudex.json');
+  await fs.writeFile(projectConfigPath, JSON.stringify({ padding: 'x'.repeat(300 * 1024) }), 'utf8');
+  await assert.rejects(
+    loadProjectConfig({ workspace: tempRoot, projectConfigPath }),
+    /exceeds.*256 KiB/iu,
+  );
+});
+
+test('project configuration merges over global config without copying blocked fields', () => {
+  const globalConfig = normalizeConfig({
+    color: 'never',
+    timeoutMs: 60_000,
+    codex: {
+      executable: 'C:\\trusted\\codex.exe',
+      model: 'gpt-global',
+    },
+    claude: {
+      model: 'sonnet',
+    },
+  });
+  const merged = mergeProjectConfig(globalConfig, {
+    timeoutMs: 10,
+    modeProviders: { ui: 'claude' },
+    codex: {
+      model: 'gpt-project',
+      executable: 'C:\\unsafe\\codex.exe',
+    },
+    stageProfiles: {
+      review: {
+        claude: { model: 'opus', effort: 'max' },
+      },
+    },
+  });
+
+  assert.equal(merged.color, 'never');
+  assert.equal(merged.timeoutMs, 60_000);
+  assert.equal(merged.codex.executable, 'C:\\trusted\\codex.exe');
+  assert.equal(merged.codex.model, 'gpt-project');
+  assert.equal(merged.modeProviders.ux, 'claude');
+  assert.deepEqual(merged.stageProfiles.review.claude, { model: 'opus', effort: 'max' });
+});
+
+test('project config path and source info resolve from the workspace root', async (context) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'room-effective-config-'));
+  const workspace = path.join(tempRoot, 'workspace');
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  await fs.mkdir(workspace, { recursive: true });
+
+  const globalConfigPath = path.join(tempRoot, 'config.json');
+  await saveConfig({
+    storageRoot: tempRoot,
+    color: 'never',
+    weights: { codex: 5, claude: 1 },
+    codex: {
+      executable: 'C:\\trusted\\codex.exe',
+      model: 'gpt-global',
+    },
+  }, { configPath: globalConfigPath, storageRoot: tempRoot });
+  await fs.writeFile(
+    getProjectConfigPath(workspace),
+    `${JSON.stringify({
+      timeoutMs: 10,
+      weights: { claude: 7 },
+      modeProviders: { ui: 'claude' },
+      codex: {
+        model: 'gpt-project',
+        executable: 'C:\\unsafe\\codex.exe',
+      },
+      claude: { model: 'opus' },
+      stageProfiles: {
+        review: {
+          claude: { model: 'claude-custom-review', effort: 'max', unsafe: true },
+        },
+      },
+    }, null, 2)}\n`,
+    'utf8',
+  );
+
+  const loadedProject = await loadProjectConfig({ workspace });
+  const effective = await loadEffectiveConfig({
+    workspace,
+    configPath: globalConfigPath,
+    storageRoot: tempRoot,
+  });
+
+  assert.equal(loadedProject.sourceInfo.path, path.join(workspace, '.claudex.json'));
+  assert.equal(loadedProject.sourceInfo.exists, true);
+  assert.equal(effective.config.color, 'never');
+  assert.equal(effective.config.timeoutMs, 30 * 60 * 1000);
+  assert.deepEqual(effective.config.weights, { codex: 5, claude: 7 });
+  assert.equal(effective.config.modeProviders.ux, 'claude');
+  assert.equal(effective.config.codex.executable, 'C:\\trusted\\codex.exe');
+  assert.equal(effective.config.codex.model, 'gpt-project');
+  assert.equal(effective.config.claude.model, 'opus');
+  assert.deepEqual(effective.config.stageProfiles.review.claude, {
+    model: 'claude-custom-review',
+    effort: 'max',
+  });
+  assert.equal(effective.globalConfig.codex.model, 'gpt-global');
+  assert.equal(effective.globalConfig.codex.executable, 'C:\\trusted\\codex.exe');
+  assert.deepEqual(effective.projectConfig, {
+    weights: { claude: 7 },
+    modeProviders: { ux: 'claude' },
+    codex: { model: 'gpt-project' },
+    claude: { model: 'opus' },
+    stageProfiles: {
+      review: {
+        claude: { model: 'claude-custom-review', effort: 'max' },
+      },
+    },
+  });
+  assert.deepEqual(effective.sourceInfo.defaults, { source: 'defaults' });
+  assert.equal(effective.sourceInfo.global.source, 'global');
+  assert.equal(effective.sourceInfo.global.path, globalConfigPath);
+  assert.equal(effective.sourceInfo.global.exists, true);
+  assert.equal(effective.sourceInfo.project.source, 'project');
+  assert.equal(effective.sourceInfo.project.path, path.join(workspace, '.claudex.json'));
+  assert.equal(effective.sourceInfo.project.exists, true);
+  assert.ok(effective.sourceInfo.project.appliedPaths.includes('modeProviders.ux'));
+  assert.ok(effective.sourceInfo.project.appliedPaths.includes('codex.model'));
+  assert.ok(effective.sourceInfo.project.blockedPaths.includes('timeoutMs'));
+  assert.ok(effective.sourceInfo.project.blockedPaths.includes('codex.executable'));
+  assert.ok(effective.sourceInfo.project.blockedPaths.includes('stageProfiles.review.claude.unsafe'));
 });

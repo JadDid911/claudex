@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events';
 import {
   canUseInteractivePrompt,
   createInteractivePrompt,
+  terminalDisplayWidth,
 } from '../../src/ui/interactive-prompt.js';
 import { sanitizeVisibleText } from '../../src/ui/renderer.js';
 
@@ -57,6 +58,13 @@ const context = {
 
 const HIDE_CURSOR = '\u001B[?25l';
 const SHOW_CURSOR = '\u001B[?25h';
+
+test('terminal display width handles wide and combining graphemes for prompt row accounting', () => {
+  assert.equal(terminalDisplayWidth('plain'), 5);
+  assert.equal(terminalDisplayWidth('界'), 2);
+  assert.equal(terminalDisplayWidth('e\u0301'), 1);
+  assert.equal(terminalDisplayWidth('👨‍👩‍👧‍👦'), 2);
+});
 
 async function settle() {
   await new Promise((resolve) => setImmediate(resolve));

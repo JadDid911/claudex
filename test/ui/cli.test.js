@@ -5,9 +5,9 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { handleLine, parseArgv, runCli } from '../../src/cli.js';
+import { handleLine, installPromptOutputCoordinator, parseArgv, runCli } from '../../src/cli.js';
 import { createInteractivePrompt } from '../../src/ui/interactive-prompt.js';
-import { sanitizeVisibleText } from '../../src/ui/renderer.js';
+import { createTranscriptRenderer, sanitizeVisibleText } from '../../src/ui/renderer.js';
 
 function createOutput(isTTY = false) {
   let text = '';
@@ -21,6 +21,32 @@ function createOutput(isTTY = false) {
     },
   };
 }
+
+test('prompt output coordinator waits for a streamed body line boundary before restoring input', async () => {
+  const output = createOutput(true);
+  const renderer = createTranscriptRenderer({ output, color: false });
+  const calls = [];
+  const restore = installPromptOutputCoordinator({
+    renderer,
+    prompt: {
+      hide() { calls.push('hide'); },
+      show() { calls.push('show'); },
+    },
+  });
+
+  try {
+    renderer.renderEvent({ actor: 'CLAUDE', label: 'lead', type: 'delta', text: 'Hello ' });
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.deepEqual(calls, ['hide']);
+
+    renderer.renderEvent({ actor: 'CLAUDE', label: 'lead', type: 'delta', text: 'world\n' });
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.deepEqual(calls, ['hide', 'hide', 'show']);
+    assert.match(sanitizeVisibleText(output.read()), /Hello world/u);
+  } finally {
+    restore();
+  }
+});
 
 class FakeReadline extends EventEmitter {
   constructor() {
@@ -89,6 +115,7 @@ test('parseArgv defaults workspace to cwd and handles resume', () => {
     help: false,
     version: false,
     demo: false,
+    command: null,
     resumeRoomId: null,
     workspace: 'C:/repo',
   });
@@ -97,9 +124,60 @@ test('parseArgv defaults workspace to cwd and handles resume', () => {
     help: false,
     version: false,
     demo: false,
+    command: null,
     resumeRoomId: 'latest',
     workspace: 'D:/work',
   });
+
+  assert.deepEqual(parseArgv(['--doctor'], 'C:/repo'), {
+    help: false,
+    version: false,
+    demo: false,
+    command: 'doctor',
+    resumeRoomId: null,
+    workspace: 'C:/repo',
+  });
+  assert.equal(parseArgv(['--doctor', '--update'], 'C:/repo').error, 'Choose only one maintenance command.');
+});
+
+test('runCli dispatches a maintenance flag once and exits without opening a prompt', async () => {
+  const stdout = createOutput(false);
+  const stderr = createOutput(false);
+  const dispatched = [];
+  let closed = 0;
+  let readlineCreated = 0;
+
+  const code = await runCli({
+    argv: ['--doctor'],
+    cwd: 'C:/repo',
+    stdout,
+    stderr,
+    packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
+    readlineFactory() {
+      readlineCreated += 1;
+      return new FakeReadline();
+    },
+    createRoomApplication() {
+      return {
+        async start() {
+          return { roomId: 'room-1', workspace: 'C:/repo', providers: [] };
+        },
+        async dispatch(command) {
+          dispatched.push(command);
+        },
+        async close() {
+          closed += 1;
+        },
+      };
+    },
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(dispatched, [{ kind: 'command', name: 'doctor', raw: '/doctor' }]);
+  assert.equal(readlineCreated, 0);
+  assert.equal(closed, 1);
+  assert.equal(stderr.read(), '');
 });
 
 test('handleLine dispatches parsed turns and cancels on /cancel', async () => {

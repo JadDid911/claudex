@@ -1,5 +1,4 @@
 import {
-  appendPromptContract,
   BaseProvider,
   diagnosticEvents,
   executionError,
@@ -7,15 +6,64 @@ import {
   isInternalDiagnosticCode,
   NON_INTERACTIVE_QUESTION_CONTRACT,
   normalizeExecutionStatus,
+  serializeBoundedContext,
   summarizeProviderStderr,
   truncateUtf8,
 } from './base.js';
 import { createSpawnSpec, resolveCommand } from '../process/resolve-command.js';
-import { runJsonlChild } from '../process/child-process.js';
+import { runJsonlChild, runTextChild } from '../process/child-process.js';
 import { normalizeProviderEffort } from '../core/preferences.js';
 
-const DEFAULT_CONTEXT_BYTES = 64 * 1024;
+const DEFAULT_CONTEXT_BYTES = 256 * 1024;
 const SAFE_READ_TOOLS = new Set(['Read', 'Glob', 'Grep']);
+const INCOMPLETE_STOP_REASONS = new Set(['max_tokens', 'max_output_tokens']);
+const DETECT_PROBE_TIMEOUT_MS = 3_000;
+const MAX_PROVIDER_VERSION_LENGTH = 64;
+
+function boundedFirstLine(value, maxLength = MAX_PROVIDER_VERSION_LENGTH) {
+  return String(value ?? '')
+    .replace(/[\r\n\t]+/gu, ' ')
+    .replace(/\s{2,}/gu, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function parseProviderVersion(result) {
+  const probeText = boundedFirstLine(result?.stdout ?? result?.stderr ?? '');
+  if (!probeText) return null;
+  if (!/\bclaude\b/iu.test(probeText)) return null;
+  const match = probeText.match(/\b(\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?)\b/u);
+  return match?.[1] ?? null;
+}
+
+function parseProbeAuthStatus(result) {
+  const lines = String(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`)
+    .split(/\r?\n/u)
+    .map((line) => line.trim().toLowerCase())
+    .filter(Boolean);
+  if (lines.some((line) => /^(?:not authenticated|not logged in|login required|signed out|unauthenticated)(?:\b|[.:])/u.test(line))) {
+    return 'not-authenticated';
+  }
+  if (lines.some((line) => /^(?:authenticated|logged in|signed in|active session)(?:\b|[.:])/u.test(line))) {
+    return 'authenticated';
+  }
+  return 'unknown';
+}
+
+function parseTrustStatus(result) {
+  const text = String(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`).toLowerCase();
+  if (!text.trim()) return 'unknown';
+  if (/(?:^|[.;]\s*)workspace trust:\s*(?:not applicable|n\/a)(?:[.;]|$)/mu.test(text)) {
+    return 'not-applicable';
+  }
+  if (/(?:^|[.;]\s*)workspace trust:\s*(?:needs trust|needs approval|not trusted|trust required|approve trust)(?:[.;]|$)/mu.test(text)) {
+    return 'needs-trust';
+  }
+  if (/(?:^|[.;]\s*)workspace trust:\s*trusted(?:[.;]|$)/mu.test(text)) {
+    return 'trusted';
+  }
+  return 'unknown';
+}
 
 function permissionMode(access) {
   return access === 'write' ? 'acceptEdits' : 'dontAsk';
@@ -59,6 +107,8 @@ export function createClaudeParserState() {
     visibleText: '',
     sawStreamText: false,
     currentTool: null,
+    incomplete: false,
+    stopReason: null,
   };
 }
 
@@ -142,7 +192,18 @@ export function normalizeClaudeEvent(rawEvent, state = createClaudeParserState()
       events.push(BaseProvider.createEvent('tool.finish', state.currentTool));
       state.currentTool = null;
     } else if (subtype === 'message_delta' && streamEvent.delta?.stop_reason) {
-      events.push(BaseProvider.createEvent('activity', { status: streamEvent.delta.stop_reason }));
+      const stopReason = String(streamEvent.delta.stop_reason);
+      state.stopReason = stopReason;
+      if (INCOMPLETE_STOP_REASONS.has(stopReason)) {
+        state.incomplete = true;
+        events.push(BaseProvider.createEvent('warning', {
+          code: 'response_incomplete',
+          message: 'Claude reached its output token limit; this response is incomplete. Ask Claude to continue from the last visible sentence.',
+          stopReason,
+        }));
+      } else {
+        events.push(BaseProvider.createEvent('activity', { status: stopReason }));
+      }
     }
   }
 
@@ -223,17 +284,8 @@ export function normalizeClaudeEvent(rawEvent, state = createClaudeParserState()
 
 export function buildClaudePrompt(prompt, context, maxBytes = DEFAULT_CONTEXT_BYTES) {
   if (!context) return truncateUtf8(String(prompt ?? ''), maxBytes);
-  let serialized;
-  try {
-    serialized = JSON.stringify(context, null, 2);
-  } catch {
-    serialized = JSON.stringify({ warning: 'Room context was not serializable.' });
-  }
-  return appendPromptContract(
-    `${String(prompt ?? '')}\n\nRoom context:\n${serialized}`,
-    NON_INTERACTIVE_QUESTION_CONTRACT,
-    maxBytes,
-  );
+  const serialized = serializeBoundedContext(context, maxBytes);
+  return `${String(prompt ?? '')}\n\nRoom context:\n${serialized}\n\n${NON_INTERACTIVE_QUESTION_CONTRACT}`;
 }
 
 export class ClaudeProvider extends BaseProvider {
@@ -241,6 +293,7 @@ export class ClaudeProvider extends BaseProvider {
     super({ ...options, name: 'claude', command: options.command ?? 'claude' });
     this.resolveCommandImpl = options.resolveCommand ?? resolveCommand;
     this.runJsonlChildImpl = options.runJsonlChild ?? runJsonlChild;
+    this.runTextChildImpl = options.runTextChild ?? runTextChild;
     this.model = options.model ?? this.defaultModel;
     this.effort = normalizeProviderEffort(this.name, options.effort, this.effort);
     this.profileMode = options.profileMode ?? 'lean';
@@ -257,9 +310,47 @@ export class ClaudeProvider extends BaseProvider {
     return this.resolveCommandImpl({ command: this.command, cwd: workspace, env: this.env });
   }
 
-  async detect() {
+  detectCapabilities() {
+    return {
+      nativeResume: true,
+      permissionMode: {
+        read: permissionMode('read'),
+        write: permissionMode('write'),
+      },
+      readTools: this.readAllowedTools.filter((tool) => SAFE_READ_TOOLS.has(tool)),
+      readIsolation: {
+        safeMode: true,
+        noChrome: true,
+        disableSlashCommands: true,
+      },
+      writeRestrictions: {
+        disallowedTools: ['AskUserQuestion'],
+      },
+    };
+  }
+
+  async runDetectProbe(resolved, args, workspace = process.cwd()) {
+    const spawnSpec = createSpawnSpec(resolved, args);
     try {
-      const resolved = await this.resolve();
+      return await this.runTextChildImpl({
+        command: spawnSpec.command,
+        args: spawnSpec.args,
+        cwd: workspace,
+        env: this.env,
+        timeoutMs: DETECT_PROBE_TIMEOUT_MS,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  async detect(workspace = process.cwd()) {
+    try {
+      const resolved = await this.resolve(workspace);
+      const [versionProbe, authProbe] = await Promise.all([
+        this.runDetectProbe(resolved, ['--version'], workspace),
+        this.runDetectProbe(resolved, ['auth', 'status'], workspace),
+      ]);
       return {
         available: true,
         canRead: true,
@@ -267,7 +358,10 @@ export class ClaudeProvider extends BaseProvider {
         supportsResume: true,
         resumeMode: 'native-with-permissions',
         profile: this.profileMode,
-        authStatus: 'not-verified',
+        authStatus: authProbe ? parseProbeAuthStatus(authProbe) : 'unknown',
+        providerVersion: parseProviderVersion(versionProbe),
+        trustStatus: authProbe ? parseTrustStatus(authProbe) : 'unknown',
+        capabilities: this.detectCapabilities(),
         command: resolved,
       };
     } catch (error) {
@@ -279,6 +373,9 @@ export class ClaudeProvider extends BaseProvider {
         resumeMode: 'unavailable',
         profile: this.profileMode,
         authStatus: 'not-verified',
+        providerVersion: null,
+        trustStatus: 'unknown',
+        capabilities: this.detectCapabilities(),
         reason: error.message,
       };
     }
@@ -389,7 +486,7 @@ export class ClaudeProvider extends BaseProvider {
       env: this.env,
       input: buildClaudePrompt(prompt, context, this.contextMaxBytes),
       signal,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: access === 'write' ? this.writeTimeoutMs : this.timeoutMs,
       idleTimeoutMs: access === 'write' ? this.idleTimeoutMs : 0,
       onEvent(rawEvent) {
         for (const event of normalizeClaudeEvent(rawEvent, parserState)) emit(event);
@@ -501,7 +598,12 @@ export class ClaudeProvider extends BaseProvider {
       raw: execution,
     });
 
-    return { ...result, sessionInvalidated: resumeFailed };
+    return {
+      ...result,
+      incomplete: parserState.incomplete,
+      stopReason: parserState.stopReason,
+      sessionInvalidated: resumeFailed,
+    };
   }
 }
 

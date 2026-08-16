@@ -65,7 +65,7 @@ export class MockProvider extends BaseProvider {
     this.runJsonlChildImpl = options.runJsonlChild ?? runJsonlChild;
     this.fixturePath = options.fixturePath;
     this.scenario = options.scenario ?? 'basic';
-    this.contextMaxBytes = options.contextMaxBytes ?? 64 * 1024;
+    this.contextMaxBytes = options.contextMaxBytes ?? 256 * 1024;
   }
 
   async detect() {
@@ -138,7 +138,7 @@ export class MockProvider extends BaseProvider {
       env: this.env,
       input: buildMockPrompt(prompt, context, this.contextMaxBytes),
       signal,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: access === 'write' ? this.writeTimeoutMs : this.timeoutMs,
       idleTimeoutMs: access === 'write' ? this.idleTimeoutMs : 0,
       onEvent: (rawEvent) => {
         const mapped = normalizeMockEvent(rawEvent);

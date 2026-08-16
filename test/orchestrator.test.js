@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 
-import { createDefaultConfig, loadConfig } from '../src/config.js';
+import { createDefaultConfig, loadConfig, saveConfig } from '../src/config.js';
 import { normalizeWorkspacePath } from '../src/core/store.js';
 import {
   createRoomApplication,
@@ -32,6 +32,7 @@ class FakeProvider {
       canWrite: this.options.canWrite !== false,
       supportsResume: true,
       profile: 'fake',
+      ...(this.options.detect ?? {}),
     };
   }
 
@@ -48,6 +49,12 @@ class FakeProvider {
         }
       });
       return this.result(input, { status: 'cancelled', text: '' });
+    }
+    const waitFor = Array.isArray(this.options.waitFor)
+      ? this.options.waitFor[this.calls.length - 1]
+      : this.options.waitFor;
+    if (waitFor) {
+      await waitFor;
     }
 
     input.onEvent?.({ type: 'session', sessionId: `${this.name}-session` });
@@ -67,8 +74,12 @@ class FakeProvider {
   async runSynthesisTurn(input) {
     this.synthesisCalls.push(input);
     this.trace.push({ provider: this.name, kind: 'synthesis', input });
-    input.onEvent?.({ type: 'text.message', text: `${this.name} synthesis` });
-    return this.result({ ...input, access: 'write' }, { text: `${this.name} synthesis` });
+    const synthesisResult = this.options.synthesisResult ?? { text: `${this.name} synthesis` };
+    input.onEvent?.({
+      type: 'text.message',
+      text: synthesisResult.text ?? `${this.name} synthesis`,
+    });
+    return this.result({ ...input, access: 'write' }, synthesisResult);
   }
 
   result(input, override = {}) {
@@ -79,10 +90,11 @@ class FakeProvider {
       status,
       sessionId: override?.sessionId ?? `${this.name}-session`,
       text: override?.text ?? `${this.name} findings`,
-      usage: { input_tokens: 2, output_tokens: 3 },
+      usage: override?.usage ?? { input_tokens: 2, output_tokens: 3 },
       sideEffectsPossible: override?.sideEffectsPossible ?? input.access === 'write',
       error: status === 'completed' ? null : { message: override?.message ?? status },
       events: override?.events ?? [],
+      incomplete: override?.incomplete === true,
       raw: {},
     };
   }
@@ -270,6 +282,46 @@ test('supermode keeps saved lane profiles and ends with the configured reviewer'
   assert.equal(loaded.stageProfiles.execute.codex.effort, 'max');
   assert.equal(loaded.stageProfiles.ux.claude.effort, 'high');
   assert.equal(loaded.stageProfiles.review.claude.model, 'opus');
+});
+
+test('project config overrides routing without being copied into global preferences', async (context) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'claudex-project-config-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const workspace = path.join(tempRoot, 'workspace');
+  const storageRoot = path.join(tempRoot, 'state');
+  const configPath = path.join(tempRoot, 'global-config.json');
+  await fs.mkdir(workspace, { recursive: true });
+  const globalConfig = createDefaultConfig({ storageRoot });
+  globalConfig.codex.model = 'global-codex';
+  await saveConfig(globalConfig, { configPath, storageRoot });
+  await fs.writeFile(path.join(workspace, '.claudex.json'), JSON.stringify({
+    claude: { model: 'project-claude', executable: 'blocked-claude' },
+    modeProviders: { review: 'claude' },
+    storageRoot: 'blocked-state',
+  }), 'utf8');
+
+  const codex = new FakeProvider('codex');
+  const claude = new FakeProvider('claude');
+  const app = createRoomApplication({
+    workspace,
+    storageRoot,
+    configPath,
+    providers: { codex, claude },
+  });
+  const startup = await app.start();
+
+  assert.equal(app.config.codex.model, 'global-codex');
+  assert.equal(app.config.claude.model, 'project-claude');
+  assert.equal(startup.modelCatalogConfig.claude.model, 'project-claude');
+  assert.equal(app.config.storageRoot, storageRoot);
+  assert.ok(app.configSourceInfo.project.blockedPaths.includes('claude.executable'));
+
+  await app.dispatch({ kind: 'command', name: 'model', provider: 'codex', model: 'runtime-codex' });
+  const persistedGlobal = await loadConfig({ configPath, storageRoot });
+  assert.equal(persistedGlobal.codex.model, 'runtime-codex');
+  assert.equal(persistedGlobal.claude.model, null);
+  assert.notEqual(persistedGlobal.storageRoot, 'blocked-state');
+  await app.close();
 });
 
 test('supermode never resumes a read-stage Claude session into write access', async (context) => {
@@ -706,14 +758,14 @@ test('a supermode code-stage clarification sentinel still blocks when preceded b
   await dispatch;
 });
 
-test('a failed supermode code writer skips execute, review, and provider replay', async (context) => {
+test('a timed-out supermode code writer keeps side-effects uncertainty, skips execute and review, and never replays via fallback', async (context) => {
   const harness = await createHarness(context, {
     claude: { result: { text: 'PLAN_HANDOFF: make the bounded change.' } },
     codex: {
       result: {
-        status: 'failed',
+        status: 'timeout',
         text: '',
-        message: 'writer failed after starting',
+        message: 'writer timed out after starting',
         sideEffectsPossible: true,
       },
     },
@@ -732,7 +784,19 @@ test('a failed supermode code writer skips execute, review, and provider replay'
   assert.deepEqual(harness.trace.map(traceStage), ['plan', 'code']);
   assert.equal(harness.codex.calls.length, 1);
   assert.equal(harness.codex.synthesisCalls.length, 0);
+  assert.equal(harness.claude.calls.length, 1);
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'failed');
+  assert.equal(Object.values(harness.app.store.state.activeTurns)[0].writerSideEffectsPossible, true);
+  const replay = await harness.app.store.replayEvents();
+  assert.equal(replay.events.some((event) => event.metadata?.code === 'supermode-safe-fallback'), false);
+  assert.equal(replay.events.some((event) => /retrying once/iu.test(event.content ?? '')), false);
+  const timeoutWarning = replay.events.find(
+    (event) => event.metadata?.code === 'supermode-stage-failed',
+  );
+  assert.match(timeoutWarning.content, /configured write deadline/iu);
+  assert.match(timeoutWarning.content, /later stages were skipped and workspace changes may remain/iu);
+  assert.match(timeoutWarning.content, /did not retry the writer/iu);
+  assert.match(timeoutWarning.content, /writeTimeoutMs/iu);
 });
 
 test('cancelling supermode during code skips later stages and releases its one writer lease', { timeout: 1_000 }, async (context) => {
@@ -931,13 +995,135 @@ test('automatic implementation persists lead/helper handoff and uses fresh Codex
 
   const replay = await harness.app.store.replayEvents();
   assert.ok(replay.events.some((event) => event.content === 'code · CODEX writes · CLAUDE reviews'));
-  assert.ok(replay.events.some((event) => /handed findings/iu.test(event.content)));
+  assert.ok(replay.events.some((event) => /review complete/iu.test(event.content)));
   assert.ok(replay.events.some((event) => event.metadata?.label === 'helper'));
   assert.ok(replay.events.some((event) => event.metadata?.label === 'synthesis'));
   assert.equal(harness.app.lease.snapshot().current, null);
   assert.equal(harness.app.store.state.activeTurns[Object.keys(harness.app.store.state.activeTurns)[0]].status, 'completed');
   assert.equal(harness.app.store.state.providerSessions.codex.sessionId, 'codex-session');
   assert.equal(harness.app.store.state.providerSessions.claude.sessionId, 'claude-session');
+});
+
+test('ordinary auto writes wait for the writer to finish before starting helper review, then synthesize', {
+  timeout: 1_000,
+}, async (context) => {
+  let releaseLead;
+  const leadGate = new Promise((resolve) => {
+    releaseLead = resolve;
+  });
+  const harness = await createHarness(context, {
+    codex: { waitFor: leadGate },
+  });
+  let helperStarted = false;
+  harness.claude.started.then(() => {
+    helperStarted = true;
+  });
+
+  const turn = harness.app.dispatch({
+    kind: 'turn',
+    route: 'auto',
+    prompt: 'fix the authentication race',
+  });
+  await harness.codex.started;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(helperStarted, false);
+  assert.equal(harness.claude.calls.length, 0);
+  assert.equal(harness.codex.synthesisCalls.length, 0);
+
+  releaseLead();
+  await turn;
+
+  assert.equal(harness.codex.calls[0].access, 'write');
+  assert.equal(harness.claude.calls[0].access, 'read');
+  assert.equal(harness.codex.synthesisCalls.length, 1);
+});
+
+test('ordinary multi-provider live provider prose stays intermediate while synthesis is the only final-facing provider text', async (context) => {
+  const harness = await createHarness(context, {
+    codex: { eventText: 'LEAD_VISIBLE_FINAL' },
+    claude: { eventText: 'HELPER_VISIBLE_FINAL' },
+  });
+
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'auto',
+    prompt: 'fix the authentication race',
+  });
+
+  const liveProviderMessages = harness.emitted.filter((event) =>
+    ['CODEX', 'CLAUDE'].includes(event.actor) &&
+      event.metadata?.providerEventType === 'text.message',
+  );
+  assert.deepEqual(
+    liveProviderMessages.map((event) => [
+      event.actor,
+      event.metadata?.label ?? null,
+      event.content,
+      event.metadata?.intermediate === true,
+    ]),
+    [
+      ['CODEX', 'lead', 'LEAD_VISIBLE_FINAL', true],
+      ['CLAUDE', 'helper', 'HELPER_VISIBLE_FINAL', true],
+      ['CODEX', 'synthesis', 'codex synthesis', false],
+    ],
+  );
+  assert.deepEqual(
+    liveProviderMessages
+      .filter((event) => event.metadata?.intermediate !== true)
+      .map((event) => [event.actor, event.metadata?.label ?? null, event.content]),
+    [['CODEX', 'synthesis', 'codex synthesis']],
+  );
+
+  const replay = await harness.app.store.replayEvents();
+  assert.ok(replay.events.some((event) => (
+    event.metadata?.code === 'provider-result-snapshot' &&
+    event.metadata?.label === 'lead'
+  )));
+  assert.ok(replay.events.some((event) => (
+    event.metadata?.code === 'provider-result-snapshot' &&
+    event.metadata?.label === 'helper'
+  )));
+  assert.ok(replay.events.some((event) => (
+    event.metadata?.code === 'provider-result-snapshot' &&
+    event.metadata?.label === 'synthesis'
+  )));
+});
+
+test('a synthesis failure persists the lead fallback so replay still shows the completed answer', async (context) => {
+  const harness = await createHarness(context, {
+    codex: {
+      result: { text: 'Durable writer result.' },
+      synthesisResult: {
+        status: 'failed',
+        text: '',
+        message: 'synthesis failed',
+        sideEffectsPossible: false,
+      },
+    },
+  });
+
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'auto',
+    prompt: 'fix the authentication race',
+  });
+
+  const replay = await harness.app.store.replayEvents();
+  const fallback = replay.events.find((event) => (
+    event.metadata?.code === 'provider-result-fallback'
+  ));
+  assert.ok(fallback);
+  assert.equal(fallback.content, 'Durable writer result.');
+  assert.equal(fallback.metadata?.ttyFallback, true);
+
+  const replayStart = harness.emitted.length;
+  await harness.app.replayTranscript();
+  assert.ok(harness.emitted.slice(replayStart).some((event) => (
+    event.metadata?.code === 'provider-result-fallback' &&
+    event.content === 'Durable writer result.' &&
+    event.metadata?.ttyFallback === true
+  )));
 });
 
 test('a provider clarification pauses the active turn and resumes the same session after an answer', { timeout: 1_000 }, async (context) => {
@@ -952,8 +1138,16 @@ test('a provider clarification pauses the active turn and resumes the same sessi
     codex: {
       eventText: question,
       results: [
-        { text: question, sessionId: 'codex-question-session' },
-        { text: 'Inspection complete.', sessionId: 'codex-question-session' },
+        {
+          text: question,
+          sessionId: 'codex-question-session',
+          usage: { input_tokens: 7, output_tokens: 3 },
+        },
+        {
+          text: 'Inspection complete.',
+          sessionId: 'codex-question-session',
+          usage: { input_tokens: 11, output_tokens: 4 },
+        },
       ],
     },
     claude: { available: false },
@@ -995,6 +1189,9 @@ test('a provider clarification pauses the active turn and resumes the same sessi
   assert.match(JSON.stringify(harness.codex.calls[1].context), /src\/orchestrator\.js/u);
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'completed');
   assert.equal(harness.app.isBusy(), false);
+  assert.ok(harness.emitted.some((event) => (
+    event.metadata?.code === 'turn-summary' && /25 turn tokens/iu.test(event.content)
+  )));
   assert.ok((await harness.app.store.replayEvents()).events.some((event) =>
     event.actor === 'YOU' &&
     event.content === 'src/orchestrator.js' &&
@@ -1093,6 +1290,32 @@ test('provider streaming activity stays live but persists one bounded result sna
   assert.equal(persistedProviderEvents[0].content, 'codex findings');
 });
 
+test('a hidden helper stream persists its complete intermediate snapshot without a second tty final', async (context) => {
+  const helperText = `CLAUDE_COMPLETE:${'h'.repeat(6_000)}:END`;
+  const harness = await createHarness(context, {
+    claude: { eventText: helperText, result: { text: helperText } },
+  });
+
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'both',
+    prompt: 'Review the parser boundary.',
+  });
+
+  const replay = await harness.app.store.replayEvents();
+  const snapshot = replay.events.find((event) => (
+    event.actor === 'CLAUDE' &&
+    event.metadata?.providerEventType === 'result.snapshot'
+  ));
+  assert.ok(snapshot);
+  assert.equal(snapshot.metadata?.intermediate, true);
+  assert.match(snapshot.content, /:END$/u);
+  assert.equal(
+    harness.emitted.some((event) => event.metadata?.ttyFallback === true),
+    false,
+  );
+});
+
 test('successful turns finish with a concise visible room summary', async (context) => {
   const harness = await createHarness(context, { claude: { available: false } });
   await harness.app.dispatch({
@@ -1103,7 +1326,160 @@ test('successful turns finish with a concise visible room summary', async (conte
 
   const summary = harness.emitted.find((event) => event.metadata?.code === 'turn-summary');
   assert.equal(summary.actor, 'SYSTEM');
-  assert.match(summary.content, /Complete · CODEX completed · 5 observed tokens/u);
+  assert.match(summary.content, /Complete · CODEX completed · 5 turn tokens/u);
+});
+
+test('startup and status expose safe provider compatibility diagnostics', async (context) => {
+  const harness = await createHarness(context, {
+    codex: {
+      detect: { providerVersion: '1.2.3', authStatus: 'available', trustStatus: 'trusted' },
+    },
+    claude: {
+      detect: { providerVersion: '4.5.6', authStatus: 'not-verified', trustStatus: 'unknown' },
+    },
+  });
+
+  assert.deepEqual(
+    harness.startup.providers.map(({ name, providerVersion, authStatus, trustStatus }) => ({
+      name,
+      providerVersion,
+      authStatus,
+      trustStatus,
+    })),
+    [
+      { name: 'codex', providerVersion: '1.2.3', authStatus: 'available', trustStatus: 'trusted' },
+      { name: 'claude', providerVersion: '4.5.6', authStatus: 'not-verified', trustStatus: 'unknown' },
+    ],
+  );
+
+  const status = harness.app.getStatus();
+  assert.equal(status.providers[0].providerVersion, '1.2.3');
+  assert.equal(status.providers[1].trustStatus, 'unknown');
+});
+
+test('daily-driver maintenance commands are local, bounded, and provider-free', async (context) => {
+  const diagnosticsCalls = [];
+  const updateCalls = [];
+  const harness = await createHarness(context, {}, {
+    packageVersion: '0.5.0',
+    packageName: '@jaddid911/claudex',
+    resolveCommand: async () => ({ command: 'C:\\Program Files\\Git\\cmd\\git.exe', argsPrefix: [] }),
+    inspectWorkspace: async () => ({
+      status: 'git',
+      branch: 'main',
+      counts: { staged: 1, modified: 2, untracked: 1, conflicted: 0 },
+      entries: [{ path: 'src/app.js', stagedStatus: ' ', worktreeStatus: 'M', status: ' M' }],
+      truncated: false,
+      omittedCount: 0,
+    }),
+    writeDiagnostics: async (options) => {
+      diagnosticsCalls.push(options);
+      return { outputPath: options.outputPath, bytes: 2048, bundle: {} };
+    },
+    checkForUpdate: async (options) => {
+      updateCalls.push(options);
+      return {
+        status: 'ok',
+        current: '0.5.0',
+        latest: '0.6.0',
+        updateAvailable: true,
+        installCommand: 'npm install -g @jaddid911/claudex@0.6.0',
+      };
+    },
+  });
+
+  for (const name of ['doctor', 'changes', 'recover', 'diagnostics', 'update', 'memory', 'project']) {
+    await harness.app.dispatch({ kind: 'command', name, raw: `/${name}` });
+  }
+
+  const codes = harness.emitted.map((event) => event.metadata?.code).filter(Boolean);
+  for (const code of [
+    'doctor-report',
+    'changes-report',
+    'recovery-report',
+    'diagnostics-export',
+    'update-status',
+    'memory-status',
+    'project-profile',
+  ]) {
+    assert.ok(codes.includes(code), `missing ${code}`);
+  }
+  assert.equal(harness.codex.calls.length, 0);
+  assert.equal(harness.claude.calls.length, 0);
+  assert.equal(diagnosticsCalls.length, 1);
+  assert.equal(updateCalls[0].packageName, '@jaddid911/claudex');
+  assert.ok(diagnosticsCalls[0].outputPath.startsWith(harness.app.store.paths.roomPath));
+  assert.doesNotMatch(
+    harness.emitted.find((event) => event.metadata?.code === 'diagnostics-export').content,
+    /session/iu,
+  );
+  assert.equal(
+    harness.emitted.find((event) => event.metadata?.code === 'diagnostics-export').content
+      .includes(harness.app.store.paths.storageRoot),
+    false,
+  );
+});
+
+test('semantic memory compacts old durable events while retaining recent transcript context', async (context) => {
+  const harness = await createHarness(context, { claude: { available: false } }, {
+    memoryCompactionThreshold: 5,
+    memoryRecentEventCount: 2,
+  });
+
+  await harness.app.dispatch({ kind: 'turn', route: 'codex', prompt: 'Remember Constraint: keep the parser API stable.' });
+  await harness.app.dispatch({ kind: 'turn', route: 'codex', prompt: 'Explain the second parser step.' });
+
+  const roomMemory = await harness.app.store.loadRoomMemory();
+  const projectMemory = await harness.app.store.loadProjectMemory();
+  assert.ok(roomMemory?.sourceThroughSequence > 0);
+  assert.match(projectMemory?.resumeBrief ?? '', /parser/iu);
+
+  await harness.app.dispatch({ kind: 'turn', route: 'codex', prompt: 'What constraints remain?' });
+  const providerContext = harness.codex.calls.at(-1).context;
+  assert.match(JSON.stringify(providerContext.extra.projectMemory), /parser/iu);
+  assert.ok(providerContext.transcript.every((event) => event.sequence > roomMemory.sourceThroughSequence));
+});
+
+test('turn summary counts one current-turn total and avoids double-counting cached, reasoning, or total token fields', async (context) => {
+  const harness = await createHarness(context, {
+    claude: { available: false },
+    codex: {
+      result: {
+        usage: {
+          input_tokens: 100,
+          cached_input_tokens: 80,
+          output_tokens: 20,
+          reasoning_output_tokens: 10,
+          total_tokens: 120,
+        },
+      },
+    },
+  });
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'codex',
+    prompt: 'Explain the current room state.',
+  });
+
+  const summary = harness.emitted.find((event) => event.metadata?.code === 'turn-summary');
+  assert.match(summary.content, /Complete \u00b7 CODEX completed \u00b7 120 turn tokens/u);
+});
+
+test('token-limited provider results cannot end with a misleading Complete summary', async (context) => {
+  const harness = await createHarness(context, {
+    claude: {
+      result: { text: 'partial answer', incomplete: true },
+    },
+  });
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'claude',
+    prompt: 'Explain the current room state.',
+  });
+
+  const summary = harness.emitted.find((event) => event.metadata?.code === 'turn-summary');
+  assert.equal(summary.metadata.status, 'incomplete');
+  assert.match(summary.content, /^Incomplete ·/u);
 });
 
 test('status exposes observed tokens and provider-reported account-limit telemetry', async (context) => {
@@ -2052,6 +2428,29 @@ test('assignment context emits one truncation warning', async (context) => {
     (event) => event.actor === 'SYSTEM' && /CODEX context was truncated/iu.test(event.content ?? ''),
   );
   assert.equal(notices.length, 1);
+});
+
+test('dropping old transcript entries does not emit a noisy context warning', async (context) => {
+  const priorResult = `PRIOR:${'x'.repeat(3_500)}`;
+  const harness = await createHarness(
+    context,
+    {
+      codex: {
+        eventText: priorResult,
+        results: [{ text: priorResult }, { text: 'current result' }],
+      },
+      claude: { available: false },
+    },
+    { contextCapBytes: 4 * 1024 },
+  );
+  await harness.app.dispatch({ kind: 'turn', route: 'codex', prompt: 'first turn' });
+  await harness.app.dispatch({ kind: 'turn', route: 'codex', prompt: 'second turn' });
+
+  const notices = harness.emitted.filter(
+    (event) => event.actor === 'SYSTEM' && /context was truncated/iu.test(event.content ?? ''),
+  );
+  assert.equal(notices.length, 0);
+  assert.ok(harness.codex.calls[1].context.truncation.droppedTranscriptEvents > 0);
 });
 
 test('an invalidated failed session is cleared even if an adapter echoes its ID', async (context) => {

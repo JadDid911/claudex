@@ -13,7 +13,13 @@ It uses the official Codex and Claude CLIs that are already installed on your ma
 
 ## Installation
 
-Claudex is marked `private` in `package.json`, so there is no npm registry install path. Install it from a Git checkout or by linking a local clone.
+After a release is published, install the public package globally:
+
+```powershell
+npm install -g @jaddid911/claudex
+```
+
+For development, install from a Git checkout:
 
 From a GitHub checkout:
 
@@ -50,6 +56,11 @@ claudex --resume
 claudex --resume <room-id>
 claudex --workspace C:\path\to\repo
 claudex --demo
+claudex --doctor
+claudex --changes
+claudex --recover
+claudex --diagnostics
+claudex --update
 ```
 
 If you do not pass `--workspace`, Claudex uses the current directory.
@@ -91,6 +102,13 @@ Claudex opens with one durable, outlined identity card showing the Claudex versi
 | `/effort <codex|claude> <effort|default>` | Save or clear a provider effort override. |
 | `/weight <codex|claude> <number>` | Set a non-negative routing weight. |
 | `/status` | Show room, provider, model, effort, weight, activity, and lease status. |
+| `/doctor` | Check provider CLI versions, auth/trust state, capabilities, Git, and configuration. |
+| `/changes` | Show bounded Git status and paths without reading or modifying file contents. |
+| `/recover` | Inspect the latest failed/interrupted turn and possible writer side effects. |
+| `/diagnostics` | Export a bounded, sanitized support bundle outside the workspace. |
+| `/update` | Explicitly check npm for a newer Claudex; never installs automatically. |
+| `/memory` | Show rolling room/project memory and the retained transcript window. |
+| `/project` | Show applied and blocked `.claudex.json` fields. |
 | `/cancel` | Cancel the active provider turn. |
 | `/new` | Start a fresh room in the current workspace. |
 | `/resume [room-id]` | Resume the latest room in this workspace, or a specific room. |
@@ -119,6 +137,7 @@ Important details:
 - Plain text uses the persisted room workflow. `/auto`, `/plan`, `/code`, `/execute`, and `/ux` affect one turn and do not start Supermode.
 - `/codex` and `/claude` preserve the current workflow's read/write semantics, force the lead provider, and suppress the helper for that turn.
 - With clean equal-weight defaults and both providers available, ordinary implementation turns use Codex as writer and Claude as read-only reviewer. Explicit affinity, weights, capacity, cooldown, and workspace/session stickiness can change that pairing.
+- Ordinary multi-provider turns show compact activity and tool progress for intermediate work, then render one full synthesis response. Write turns finish the writer first, start a fresh read-only review against the updated workspace, and keep the write lease through synthesis. If synthesis fails, Claudex reveals the completed lead result as a fallback instead of losing it.
 
 | Workflow | Lead access | Helper access | Typical roles |
 | --- | --- | --- | --- |
@@ -178,12 +197,14 @@ See [docs/architecture.md](docs/architecture.md) for the runtime flow and intern
 
 Non-secret preferences live at `%LOCALAPPDATA%\codex-claude-room\config.json`. The legacy data-directory name is retained so existing Room profiles, transcripts, and resume handles continue to work after upgrading to Claudex.
 
-Defaults include a 30-minute turn timeout, a 64 KiB shared-context cap, equal provider weights, automatic stage affinities, configured Codex settings that honor project `.rules`, and a lean Claude reader profile.
+Defaults include a 30-minute read timeout, a two-hour write timeout, a five-minute writer no-output watchdog, a 256 KiB shared-context cap, equal provider weights, automatic stage affinities, configured Codex settings that honor project `.rules`, and a lean Claude reader profile. On first load, an unversioned configuration still carrying the former 64 KiB default migrates to 256 KiB; versioned or custom context limits remain unchanged.
 
 Example:
 
 ```json
 {
+  "timeoutMs": 1800000,
+  "writeTimeoutMs": 7200000,
   "modeProviders": {
     "plan": "claude",
     "code": "codex",
@@ -212,9 +233,25 @@ Example:
 
 Only explicitly named `environmentPassThrough` variables are added to the provider subprocess's minimal runtime environment. Claude read stages are restricted to the intrinsically read-only `Read`, `Glob`, and `Grep` tools; shell commands are deliberately unavailable because repository scripts can mutate a workspace without a writer lease. Do not put secret values in this JSON file.
 
+Repositories may commit a `.claudex.json` file for safe, non-secret team defaults. Project settings override the user-global file only for model IDs, effort, weights, stage routing, and stage profiles. Claudex ignores and reports project attempts to change executables, environment pass-through, storage, timeouts, permissions, or tool policy. Example:
+
+```json
+{
+  "modeProviders": { "code": "codex", "review": "claude" },
+  "stageProfiles": {
+    "code": { "codex": { "model": "gpt-5.6-sol", "effort": "high" } },
+    "review": { "claude": { "model": "opus", "effort": "high" } }
+  }
+}
+```
+
+Use `/project` to inspect precedence and blocked fields. Interactive `/model`, `/effort`, `/weight`, `/mode`, and `/profile` changes continue to update the user-global config; project overrides are never copied into it.
+
 ### Room files
 
-Each room stores an append-only sanitized `events.jsonl`, atomic `state.json`, and room metadata outside the project. Transient deltas, tools, and spinner frames stay live-only; each provider stage persists one bounded result snapshot so streaming noise does not consume the next model's context. `claudex --resume` restores the latest room for the current workspace. On restart, a torn event tail is repaired to its last valid record, and interrupted work is marked interrupted instead of silently replayed.
+Each room stores an append-only sanitized `events.jsonl`, atomic `state.json`, and room metadata outside the project. Transient deltas, tools, and spinner frames stay live-only; each provider stage persists one bounded result snapshot so streaming noise does not consume the next model's context. When durable history grows, Claudex deterministically compacts the older prefix into bounded `room-memory.json` and `project-memory.json` artifacts while retaining recent events verbatim. The raw sanitized event log remains the source of truth. Project memory carries decisions, constraints, stage evidence, outcomes, warnings, and open questions across rooms without writing into the repository. `/memory` reports its watermark and health.
+
+`claudex --resume` restores the latest room for the current workspace. On restart, a torn event tail is repaired to its last valid record, and interrupted work is marked interrupted instead of silently replayed.
 
 ## Authentication and privacy
 
@@ -239,7 +276,7 @@ Official references:
 - [Codex authentication](https://learn.chatgpt.com/docs/auth)
 - [Claude Code setup and authentication](https://docs.anthropic.com/en/docs/claude-code/getting-started)
 
-Startup only checks whether the executables are available. It does not verify account auth, so `authStatus` starts as `not-verified`.
+Startup resolves each executable and performs a short, non-secret compatibility probe for CLI version, capabilities, and best-effort auth/trust state. A failed probe does not make an otherwise usable executable unavailable, and `unknown` means the provider did not expose a reliable answer. Run `/doctor` for the complete local report. Claudex never reads provider credential files.
 
 Shared room context is bounded and sanitized. Claudex does not expose one provider's private reasoning or hidden session state to the other provider.
 
@@ -262,11 +299,15 @@ When a provider needs required input, it asks one plain-text question prefixed w
 ## Troubleshooting
 
 - `Command not found` or `unavailable`: ensure `codex` and `claude` resolve on `PATH` and that both CLIs are installed.
+- Start with `/doctor`; it reports executable compatibility, best-effort auth/trust, Git, and active configuration without invoking a model turn.
 - `Not authenticated`: run `codex login status` and `claude auth status`, then use the matching login command above.
 - Claude workspace trust warning: run `claude` interactively once from that project directory, review the path, accept its trust prompt, then exit and restart Claudex. Do not commit Claude's local credential or trust files.
 - `Write-protected workspace`: move the room to a dedicated project directory or pass `--workspace` explicitly.
 - `Rate limit`, `quota`, or `capacity`: wait for the provider to recover, inspect `/status`, or lower the provider weight with `/weight`.
-- `Timeout` or `idle-timeout`: split the task into smaller turns or retry with a narrower prompt.
+- `Timeout`: inspect any possible workspace changes before continuing. Write turns are never replayed automatically; increase `writeTimeoutMs` in `config.json` only when a legitimate stage needs more than the two-hour default.
+- Interrupted or uncertain writer: run `/recover`, then `/changes`. Claudex reports possible side effects and never replays an uncertain writer automatically.
+- Support request: run `/diagnostics`. The JSON bundle is capped, redacted, excludes transcript text/session handles/absolute workspace and home paths, and is stored in the room's private external-state directory.
+- `idle-timeout`: the writer produced no output for five minutes. Inspect any possible workspace changes, then retry with a narrower prompt.
 - `Question for you:`: choose an offered option or type a custom answer in the live prompt. Claudex resumes the paused workflow; it does not start an unrelated turn.
 
 ## Development and verification
@@ -275,17 +316,19 @@ When a provider needs required input, it asks one plain-text question prefixed w
 npm run check
 npm test
 npm run demo
+npm run pack:dry-run
 ```
 
 - `npm run check` validates JavaScript syntax and repository safety rules.
 - `npm test` runs the Node test suite.
 - `npm run demo` exercises the offline mock-provider orchestrator.
+- `npm run pack:dry-run` verifies the public package allowlist; tagged releases use npm trusted publishing, while manual release workflow runs remain dry-run only.
 - In PowerShell, `$env:ROOM_LIVE_PROVIDER_SMOKE='1'; npm test` enables opt-in read-only calls to the installed provider CLIs. Those calls use the signed-in accounts and their normal usage limits.
 
 ## Limitations
 
 - Provider JSON event formats can change.
-- Startup does not prove provider account auth.
+- Provider auth/trust detection is best-effort; `unknown` is not proof of authentication or failure.
 - `/status` shows selected-model context windows, the smaller shared-room handoff cap, observed per-turn/room tokens, cooldowns, and provider-reported reset/scope data. Subscription balance percentages are shown only when a provider emits them; otherwise Claudex says the account limit is not exposed.
 - Capacity and quota are observed locally, not queried from a provider control plane.
 - Shared room context is bounded and sanitized, not a full merged provider history.
@@ -295,6 +338,8 @@ npm run demo
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Release history is documented in [CHANGELOG.md](CHANGELOG.md).
 
 ## Security
 

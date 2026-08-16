@@ -22,6 +22,8 @@ All user-visible activity is normalized into an ordered event envelope with a se
 
 `events.jsonl` is append-only. Provider deltas, tool progress, and activity frames are rendered live without persistence; one bounded result snapshot per provider stage becomes durable transcript/context. `state.json` is atomically replaced and tracks the next event sequence, provider-private session handles, observed capacity, active turns, active Supermode stages, and lease state. A torn JSONL tail is truncated to its last valid record during replay.
 
+When the durable event count crosses the compaction threshold, Claudex rebuilds a bounded `room-memory.json` from the authoritative event prefix and merges it into bounded `project-memory.json` at the hashed workspace root. Both are atomic private files outside the repository. The memory schema retains evidence sequence/turn IDs, decisions, constraints, stage artifacts, outcomes, warnings, and open questions; it never replaces or deletes the raw event log. Provider context receives project memory plus only transcript events newer than the room watermark.
+
 The renderer maps canonical events to `YOU`, `SYSTEM`, `CODEX`, and `CLAUDE`. Interactive terminals present `SYSTEM` as compact `ROOM` notices, merge concurrent provider activity into one replace-in-place line, and collapse synthesis back into the visible lead identity. Redirected output keeps deterministic actor blocks. Every provider body line is indented, including lines split across stream chunks, so provider output cannot forge a trusted actor header. Durable messages, handoffs, failures, and final answers remain in normal terminal scrollback.
 
 ## Provider boundary
@@ -64,7 +66,7 @@ Prompts can also carry an inferred or explicit task lane: `plan`, `code`, `execu
 
 Selection considers lane affinity, configured weight, availability, cooldown, observed failure/turn counts, and workspace/session stickiness. Provider-reported capacity failures enter exponential cooldown. Claude rate-limit telemetry remains advisory until the turn actually fails, so a successful result cannot be mislabeled as capacity.
 
-Lead and helper may run concurrently only when the helper is enforced read-only. The helper result is persisted, then the lead receives one bounded synthesis handoff. Delegation depth is one and at most two provider processes run concurrently.
+Read-only lead/helper pairs may run concurrently. Write-capable ordinary turns instead complete the writer before starting a fresh read-only helper against the updated workspace, while retaining the same write lease through synthesis. Intermediate provider prose is persisted for handoff and replay but remains quiet in the interactive terminal; activity and tools stay visible, and synthesis is the single full user-facing answer. If synthesis cannot complete, the renderer exposes the completed lead result as a fallback. Delegation depth is one and at most two provider processes run concurrently.
 
 Plain text, `/auto`, `/plan`, `/code`, `/execute`, and `/ux` all use this ordinary-turn path; they do not expand into a multi-stage pipeline. With the clean equal-weight defaults and both providers eligible, implementation ties keep Codex as the write-capable lead and Claude as the read-only reviewer. Explicit affinity, unequal weights, capacity, cooldown, or workspace/session stickiness can change that result.
 
@@ -97,7 +99,7 @@ If a write-capable call fails after side effects may have occurred, the orchestr
 
 ## Process lifecycle
 
-Child processes are spawned with `shell: false`, explicit argument arrays, a minimal allowlisted environment, hidden windows, streamed stdout/stderr, total timeout, writer idle watchdog, and abort support. Prompts travel only over stdin. Additional environment names require explicit `environmentPassThrough` configuration.
+Child processes are spawned with `shell: false`, explicit argument arrays, a minimal allowlisted environment, hidden windows, streamed stdout/stderr, total timeout, writer idle watchdog, and abort support. Read calls default to the configured 30-minute `timeoutMs`; write calls use the separate two-hour `writeTimeoutMs` so active implementation stages are not killed by the shorter review deadline. A writer that emits nothing for five minutes is still stopped by the independent idle watchdog. Prompts travel only over stdin. Additional environment names require explicit `environmentPassThrough` configuration.
 
 Executable discovery never searches the workspace for a bare provider name. Windows cancellation resolves `taskkill.exe` from the trusted system directory and terminates the process tree; it does not execute a workspace-local lookalike.
 
@@ -106,3 +108,11 @@ Tests use mock executables and sanitized provider fixtures. Live provider smoke 
 ## Local installation
 
 `package.json` exposes `bin/claudex.js` as the global `claudex` command. `npm link` creates the platform shim in npm's global bin directory. Because the CLI resolves `process.cwd()` at launch, each terminal pane naturally scopes a room to its current project without a separate integration layer.
+
+The public package has an explicit file allowlist and exports only config, orchestrator, and provider adapter surfaces. Cross-platform CI verifies the suite, packs the tarball, installs it outside the checkout, and smokes the installed binary. Tagged releases use npm trusted publishing; the opt-in nightly live-compat workflow requires a dedicated self-hosted runner and performs read-only provider calls only.
+
+## Project configuration and maintenance
+
+The effective config precedence is defaults, user-global config, then `<workspace>/.claudex.json`. Project files may select weights, stage providers, models, and efforts. Executables, environment, storage, timeouts, permission profiles, and tool restrictions are deliberately blocked at this trust boundary. Runtime preference commands save only the user-global config and never copy project overrides into it.
+
+`/doctor`, `/changes`, and `/recover` are local read-only surfaces. Git status uses a resolved absolute executable with `shell: false` and never reads file contents. `/diagnostics` writes a capped redacted bundle to the room's private external state; transcript text, session IDs, credential values, and absolute workspace/home paths are excluded. `/update` is an explicit registry lookup and only prints an install command—there is no background network check or self-update mutation.

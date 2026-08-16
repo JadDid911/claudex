@@ -82,6 +82,13 @@ if (scenario === 'huge-line') {
   process.exit(0);
 }
 
+if (scenario === 'fragmented-huge-line') {
+  process.stdout.write(`{"type":"message","text":"${'x'.repeat(2 * 1024)}`);
+  process.stdout.write(`${'y'.repeat(2 * 1024)}"}\n`);
+  emit({ type: 'message', text: 'after-fragmented-huge-line' });
+  process.exit(0);
+}
+
 if (scenario === 'idle') {
   emit({ type: 'delta', text: 'starting' });
   await sleep(5_000);

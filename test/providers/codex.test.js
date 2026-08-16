@@ -52,6 +52,9 @@ test('CodexProvider detect reports writer support from exec help', async () => {
   assert.equal(detection.available, true);
   assert.equal(detection.canWrite, true);
   assert.equal(detection.supportsResume, true);
+  assert.equal(detection.authStatus, 'unknown');
+  assert.equal(detection.providerVersion, null);
+  assert.equal(detection.capabilities.canWrite, true);
 });
 
 test('CodexProvider writer mode uses approve-for-me without an explicit sandbox flag', async () => {
@@ -144,6 +147,104 @@ test('createCodexProvider exposes graceful missing-command detection', async () 
   const detection = await provider.detect();
   assert.equal(detection.available, false);
   assert.match(detection.reason, /not found/);
+});
+
+test('CodexProvider detect derives providerVersion and authStatus from local probes without leaking probe output', async () => {
+  const probeCalls = [];
+  const provider = new CodexProvider({
+    command: process.execPath,
+    resolveCommand: async () => ({
+      command: process.execPath,
+      argsPrefix: [],
+      resolvedPath: process.execPath,
+      shellSafe: true,
+      kind: 'executable',
+    }),
+    runTextChild: async (execution) => {
+      probeCalls.push(execution);
+      if (execution.args[0] === '--version') {
+        return {
+          status: 'completed',
+          exitCode: 0,
+          stdout: 'codex 0.147.0-beta.1',
+          stderr: '',
+        };
+      }
+      if (execution.args[0] === 'login') {
+        return {
+          status: 'completed',
+          exitCode: 0,
+          stdout: 'Authenticated as room-user. token=secret-should-not-leak',
+          stderr: '',
+        };
+      }
+      return {
+        status: 'completed',
+        exitCode: 0,
+        stdout: '--json --cd --sandbox workspace-write --approve-for-me resume',
+        stderr: '',
+      };
+    },
+  });
+
+  const detection = await provider.detect();
+
+  assert.equal(detection.available, true);
+  assert.equal(detection.providerVersion, '0.147.0-beta.1');
+  assert.equal(detection.authStatus, 'authenticated');
+  assert.equal(probeCalls.some((call) => call.args.join(' ') === '--version'), true);
+  assert.equal(probeCalls.some((call) => call.args.join(' ') === 'login status'), true);
+  assert.doesNotMatch(JSON.stringify(detection), /secret-should-not-leak/u);
+});
+
+test('CodexProvider detect keeps the binary available when auth or version probes fail', async () => {
+  const provider = new CodexProvider({
+    command: process.execPath,
+    resolveCommand: async () => ({
+      command: process.execPath,
+      argsPrefix: [],
+      resolvedPath: process.execPath,
+      shellSafe: true,
+      kind: 'executable',
+    }),
+    runTextChild: async (execution) => {
+      if (execution.args[0] === 'exec') {
+        return {
+          status: 'completed',
+          exitCode: 0,
+          stdout: '--json --cd --sandbox workspace-write --approve-for-me resume',
+          stderr: '',
+        };
+      }
+      throw new Error('probe unavailable');
+    },
+  });
+
+  const detection = await provider.detect();
+
+  assert.equal(detection.available, true);
+  assert.equal(detection.canWrite, true);
+  assert.equal(detection.authStatus, 'unknown');
+  assert.equal(detection.providerVersion, null);
+});
+
+test('CodexProvider auth detection ignores incidental authenticated path text', async () => {
+  const provider = new CodexProvider({
+    command: process.execPath,
+    resolveCommand: async () => ({ command: process.execPath, argsPrefix: [] }),
+    runTextChild: async (execution) => ({
+      status: 'completed',
+      exitCode: 0,
+      stdout: execution.args[0] === 'exec'
+        ? '--json --cd --sandbox workspace-write --approve-for-me resume'
+        : execution.args[0] === '--version'
+          ? 'codex 1.0.0'
+          : 'Workspace root: C:/authenticated-fixture/repo',
+      stderr: '',
+    }),
+  });
+
+  assert.equal((await provider.detect()).authStatus, 'unknown');
 });
 
 test('CodexProvider classifies capacity-shaped failures', async () => {
@@ -501,6 +602,62 @@ test('CodexProvider write turns use a five-minute quiet-work watchdog by default
   assert.equal(calls[0].idleTimeoutMs, 5 * 60 * 1000);
   assert.equal(calls[1].idleTimeoutMs, 0);
   assert.equal(overrideCalls[0].idleTimeoutMs, 42_000);
+});
+
+test('CodexProvider read turns keep the 30-minute absolute timeout while writes default to two hours and honor explicit overrides', async () => {
+  const { provider, calls } = makeProvider('codex');
+  const overrideCalls = [];
+
+  await provider.runTurn({
+    prompt: 'Review it',
+    workspace: process.cwd(),
+    access: 'read',
+  });
+  await provider.runTurn({
+    prompt: 'Edit it',
+    workspace: process.cwd(),
+    access: 'write',
+  });
+
+  const overridden = new CodexProvider({
+    command: process.execPath,
+    resolveCommand: async () => ({
+      command: process.execPath,
+      argsPrefix: [],
+      resolvedPath: process.execPath,
+      shellSafe: true,
+      kind: 'executable',
+    }),
+    runTextChild: async () => ({
+      exitCode: 0,
+      stdout: '--json --cd --sandbox workspace-write --approve-for-me resume',
+      stderr: '',
+    }),
+    writeTimeoutMs: 42_000,
+    runJsonlChild: async (execution) => {
+      overrideCalls.push(execution);
+      execution.onEvent({ type: 'session.started', session_id: 'codex-session' });
+      execution.onEvent({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
+      return {
+        status: 'completed',
+        exitCode: 0,
+        stderr: '',
+        stderrLines: [],
+        parseErrors: [],
+        rawEvents: [],
+      };
+    },
+  });
+
+  await overridden.runTurn({
+    prompt: 'Override it',
+    workspace: process.cwd(),
+    access: 'write',
+  });
+
+  assert.equal(calls[0].timeoutMs, 30 * 60 * 1000);
+  assert.equal(calls[1].timeoutMs, 2 * 60 * 60 * 1000);
+  assert.equal(overrideCalls[0].timeoutMs, 42_000);
 });
 
 test('buildCodexPrompt ends with a queued clarification contract for the same room turn', async () => {

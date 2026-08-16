@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createCanonicalEvent, isCanonicalEvent } from './events.js';
+import { readProjectMemoryArtifact, readRoomMemoryArtifact } from './memory.js';
 import { normalizeDelegationMode } from './preferences.js';
 import { createWriteLeaseState, getWriteLeaseSnapshot, reconcilePersistedWriteLease } from './write-lease.js';
 
@@ -145,6 +146,19 @@ async function readJsonFile(filePath, fallback = null) {
   } catch (error) {
     if (error?.code === 'ENOENT') {
       return fallback;
+    }
+
+    throw error;
+  }
+}
+
+async function readOptionalMemoryArtifact(filePath, reader) {
+  try {
+    const text = await fs.readFile(filePath, 'utf8');
+    return reader(JSON.parse(text));
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error instanceof SyntaxError) {
+      return null;
     }
 
     throw error;
@@ -435,6 +449,58 @@ export class RoomStore {
       return recovery;
     });
   }
+
+  /**
+   * Load the optional versioned room memory document without mutating it.
+   */
+  async loadRoomMemory() {
+    return this.#queue(async () => readOptionalMemoryArtifact(
+      this.paths.roomMemoryPath,
+      readRoomMemoryArtifact,
+    ));
+  }
+
+  /**
+   * Atomically persist a validated room memory document.
+   *
+   * @param {object} memory
+   */
+  async saveRoomMemory(memory) {
+    return this.#queue(async () => {
+      const artifact = readRoomMemoryArtifact(memory);
+      if (!artifact || artifact.roomId !== this.room.roomId || artifact.workspaceHash !== this.room.workspaceHash) {
+        throw new TypeError('saveRoomMemory requires a valid room memory artifact for this room.');
+      }
+      await writeJsonAtomically(this.paths.roomMemoryPath, artifact);
+      return structuredClone(artifact);
+    });
+  }
+
+  /**
+   * Load the optional versioned project memory document without mutating it.
+   */
+  async loadProjectMemory() {
+    return this.#queue(async () => readOptionalMemoryArtifact(
+      this.paths.projectMemoryPath,
+      readProjectMemoryArtifact,
+    ));
+  }
+
+  /**
+   * Atomically persist a validated project memory document.
+   *
+   * @param {object} memory
+   */
+  async saveProjectMemory(memory) {
+    return this.#queue(async () => {
+      const artifact = readProjectMemoryArtifact(memory);
+      if (!artifact || artifact.workspaceHash !== this.room.workspaceHash) {
+        throw new TypeError('saveProjectMemory requires a valid project memory artifact for this workspace.');
+      }
+      await writeJsonAtomically(this.paths.projectMemoryPath, artifact);
+      return structuredClone(artifact);
+    });
+  }
 }
 
 export async function createRoomStore(options) {
@@ -456,6 +522,8 @@ export async function createRoomStore(options) {
     roomMetadataPath: path.join(roomPath, 'room.json'),
     statePath: path.join(roomPath, 'state.json'),
     eventsPath: path.join(roomPath, 'events.jsonl'),
+    roomMemoryPath: path.join(roomPath, 'room-memory.json'),
+    projectMemoryPath: path.join(workspacePaths.workspaceRoot, 'project-memory.json'),
   };
 
   await ensureStorageDirectories(workspacePaths, roomPath);
@@ -522,6 +590,8 @@ export async function resumeRoomStore(options) {
     roomMetadataPath: path.join(roomPath, 'room.json'),
     statePath: path.join(roomPath, 'state.json'),
     eventsPath: path.join(roomPath, 'events.jsonl'),
+    roomMemoryPath: path.join(roomPath, 'room-memory.json'),
+    projectMemoryPath: path.join(workspacePaths.workspaceRoot, 'project-memory.json'),
   };
   const room = await readJsonFile(paths.roomMetadataPath);
   const state = await readJsonFile(paths.statePath);

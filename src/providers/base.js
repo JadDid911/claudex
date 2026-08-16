@@ -143,6 +143,20 @@ export function truncateUtf8(value, maxBytes) {
   return `${utf8Prefix(text, maxBytes - markerBytes)}${marker}`;
 }
 
+export function serializeBoundedContext(context, maxBytes) {
+  let serialized;
+  try {
+    serialized = JSON.stringify(context, null, 2);
+  } catch {
+    serialized = JSON.stringify({ warning: 'Room context was not serializable.' });
+  }
+  if (Buffer.byteLength(serialized, 'utf8') <= maxBytes) return serialized;
+  return JSON.stringify({
+    warning: 'Room context exceeded its configured byte limit and was omitted.',
+    originalBytes: Buffer.byteLength(serialized, 'utf8'),
+  }, null, 2);
+}
+
 export function appendPromptContract(value, contract, maxBytes) {
   const body = String(value ?? '');
   const tail = String(contract ?? '').trim();
@@ -176,6 +190,7 @@ export class BaseProvider {
     this.name = options.name ?? 'provider';
     this.command = options.command ?? this.name;
     this.timeoutMs = options.timeoutMs ?? 30 * 60 * 1000;
+    this.writeTimeoutMs = options.writeTimeoutMs ?? 2 * 60 * 60 * 1000;
     this.idleTimeoutMs = options.idleTimeoutMs ?? 5 * 60 * 1000;
     this.defaultModel = options.model ?? null;
     this.effort = options.effort ?? null;
@@ -192,7 +207,14 @@ export class BaseProvider {
   }
 
   static createEvent(type, fields = {}) {
-    return sanitizeValue({ type, ...fields });
+    const event = sanitizeValue({ type, ...fields });
+    if (
+      (type === 'text.delta' || type === 'text.message') &&
+      typeof fields.text === 'string'
+    ) {
+      event.text = sanitizeProviderText(fields.text, 1024 * 1024);
+    }
+    return event;
   }
 
   static firstString(...values) {
@@ -255,10 +277,7 @@ export class BaseProvider {
     raw,
   }) {
     const publicEvents = events.map((event) => BaseProvider.createEvent(event.type, event));
-    const combinedText = text ?? publicEvents
-      .filter((event) => event.type === 'text.delta' || event.type === 'text.message')
-      .map((event) => event.text ?? '')
-      .join('');
+    const combinedText = text ?? BaseProvider.collectResponseText(publicEvents);
 
     return {
       provider,
@@ -272,5 +291,35 @@ export class BaseProvider {
       events: publicEvents,
       raw,
     };
+  }
+
+  static collectResponseText(events = []) {
+    const sections = [];
+    let streamed = '';
+
+    const flushStream = () => {
+      if (streamed) sections.push(streamed);
+      streamed = '';
+    };
+
+    for (const event of events) {
+      if (event?.type === 'text.delta') {
+        streamed += event.text ?? '';
+        continue;
+      }
+      if (event?.type === 'text.message') {
+        if (streamed) {
+          streamed += event.text ?? '';
+          flushStream();
+        } else if (event.text) {
+          sections.push(event.text);
+        }
+        continue;
+      }
+      flushStream();
+    }
+    flushStream();
+
+    return sections.filter(Boolean).join('\n\n');
   }
 }

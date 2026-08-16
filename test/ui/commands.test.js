@@ -49,6 +49,26 @@ test('context parses as live Supermode context and requires content', () => {
   assert.equal(parseInputLine('/context').kind, 'error');
 });
 
+test('daily-driver maintenance commands parse without becoming provider turns', () => {
+  for (const name of ['doctor', 'changes', 'recover', 'diagnostics', 'update', 'memory', 'project']) {
+    assert.deepEqual(parseInputLine(`/${name}`), {
+      kind: 'command',
+      name,
+      raw: `/${name}`,
+    });
+  }
+
+  const help = getHelpText();
+  assert.match(help, /\/doctor/u);
+  assert.match(help, /\/changes/u);
+  assert.match(help, /\/recover/u);
+  assert.match(help, /\/diagnostics/u);
+  assert.match(help, /\/update/u);
+  assert.match(help, /\/memory/u);
+  assert.match(help, /\/project/u);
+  assert.doesNotMatch(help, /Supermode.+synthesis/iu);
+});
+
 test('canonical lane turn commands set one-turn delegation mode and preserve the prompt', () => {
   assert.deepEqual(parseInputLine('/plan map the migration'), {
     kind: 'turn',

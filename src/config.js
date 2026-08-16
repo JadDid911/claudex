@@ -2,8 +2,11 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import {
+  MODE_PROVIDER_LANES,
   createDefaultModeProviders,
   createDefaultStageProfiles,
+  normalizeModeProvider,
+  normalizeModeProviderLane,
   normalizeModeProviders,
   normalizeProviderEffort,
   normalizeStageProfiles,
@@ -11,9 +14,23 @@ import {
 import { getDefaultStorageRoot } from './core/store.js';
 
 const CONFIG_FILE = 'config.json';
+const PROJECT_CONFIG_FILE = '.claudex.json';
+const CONFIG_VERSION = 1;
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
-const DEFAULT_CONTEXT_CAP_BYTES = 64 * 1024;
+const DEFAULT_WRITE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const DEFAULT_CONTEXT_CAP_BYTES = 256 * 1024;
+const LEGACY_CONTEXT_CAP_BYTES = 64 * 1024;
+const MAX_PROJECT_CONFIG_BYTES = 256 * 1024;
+const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/u;
 const SAFE_CLAUDE_READ_TOOLS = new Set(['Read', 'Glob', 'Grep']);
+const PROJECT_PROVIDER_KEYS = new Set(['codex', 'claude']);
+const PROJECT_TOP_LEVEL_KEYS = new Set([
+  'weights',
+  'modeProviders',
+  'stageProfiles',
+  'codex',
+  'claude',
+]);
 const REQUIRED_PROVIDER_ENVIRONMENT = new Set([
   'appdata',
   'claude_config_dir',
@@ -63,6 +80,31 @@ function optionalString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function optionalProjectModel(value) {
+  const candidate = optionalString(value);
+  return candidate && MODEL_ID_PATTERN.test(candidate) ? candidate : null;
+}
+
+function optionalNonNegativeNumber(value) {
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function hasOwn(source, key) {
+  return Object.prototype.hasOwnProperty.call(source, key);
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function uniquePaths(paths) {
+  return [...new Set(paths)];
+}
+
+function trackBlockedPath(blockedPaths, entry) {
+  if (entry) blockedPaths.push(entry);
+}
+
 function stringList(value) {
   return Array.isArray(value)
     ? [...new Set(value.filter((item) => typeof item === 'string' && item.trim()).map((item) => item.trim()))]
@@ -92,12 +134,18 @@ export function getConfigPath(options = {}) {
   return path.join(storageRoot, CONFIG_FILE);
 }
 
+export function getProjectConfigPath(workspace = process.cwd()) {
+  return path.join(path.resolve(workspace), PROJECT_CONFIG_FILE);
+}
+
 export function createDefaultConfig(options = {}) {
   const storageRoot = options.storageRoot ?? getDefaultStorageRoot(options.env);
 
   return {
+    version: CONFIG_VERSION,
     storageRoot,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    writeTimeoutMs: DEFAULT_WRITE_TIMEOUT_MS,
     contextCapBytes: DEFAULT_CONTEXT_CAP_BYTES,
     color: 'auto',
     environmentPassThrough: [],
@@ -137,12 +185,22 @@ export function normalizeConfig(input = {}, options = {}) {
   const weights = input.weights && typeof input.weights === 'object' ? input.weights : {};
   const configurationMode = codex.configurationMode === 'lean' ? 'lean' : 'configured';
   const profileMode = claude.profileMode === 'full' ? 'full' : 'lean';
+  const isLegacyDefaultContext = (
+    !Number.isInteger(input.version) &&
+    input.contextCapBytes === LEGACY_CONTEXT_CAP_BYTES
+  );
 
   return {
     ...input,
+    version: Number.isInteger(input.version) && input.version > 0
+      ? input.version
+      : CONFIG_VERSION,
     storageRoot: optionalString(input.storageRoot) ?? defaults.storageRoot,
     timeoutMs: positiveNumber(input.timeoutMs, defaults.timeoutMs),
-    contextCapBytes: positiveNumber(input.contextCapBytes, defaults.contextCapBytes),
+    writeTimeoutMs: positiveNumber(input.writeTimeoutMs, defaults.writeTimeoutMs),
+    contextCapBytes: isLegacyDefaultContext
+      ? defaults.contextCapBytes
+      : positiveNumber(input.contextCapBytes, defaults.contextCapBytes),
     color: ['auto', 'always', 'never'].includes(input.color) ? input.color : defaults.color,
     environmentPassThrough: stringList(input.environmentPassThrough),
     modeProviders: normalizeModeProviders(input.modeProviders, defaults.modeProviders),
@@ -180,6 +238,193 @@ export function normalizeConfig(input = {}, options = {}) {
   };
 }
 
+function normalizeProjectConfigDetailed(input = {}) {
+  const source = isPlainObject(input) ? input : {};
+  const blockedPaths = [];
+  const appliedPaths = [];
+  const normalized = {};
+
+  for (const key of Object.keys(source)) {
+    if (!PROJECT_TOP_LEVEL_KEYS.has(key)) {
+      trackBlockedPath(blockedPaths, key);
+    }
+  }
+
+  if (source.weights !== undefined && !isPlainObject(source.weights)) {
+    trackBlockedPath(blockedPaths, 'weights');
+  } else if (isPlainObject(source.weights)) {
+    const weights = {};
+    for (const key of Object.keys(source.weights)) {
+      if (!['codex', 'claude'].includes(key)) {
+        trackBlockedPath(blockedPaths, `weights.${key}`);
+      }
+    }
+    for (const provider of ['codex', 'claude']) {
+      if (!hasOwn(source.weights, provider)) continue;
+      const value = optionalNonNegativeNumber(source.weights[provider]);
+      if (value === undefined) continue;
+      weights[provider] = value;
+      appliedPaths.push(`weights.${provider}`);
+    }
+    if (Object.keys(weights).length > 0) normalized.weights = weights;
+  }
+
+  if (source.modeProviders !== undefined && !isPlainObject(source.modeProviders)) {
+    trackBlockedPath(blockedPaths, 'modeProviders');
+  } else if (isPlainObject(source.modeProviders)) {
+    const modeProviders = {};
+    for (const key of Object.keys(source.modeProviders)) {
+      const lane = normalizeModeProviderLane(key);
+      if (!lane) {
+        trackBlockedPath(blockedPaths, `modeProviders.${key}`);
+        continue;
+      }
+      const provider = normalizeModeProvider(source.modeProviders[key], null);
+      if (!provider) continue;
+      modeProviders[lane] = provider;
+      appliedPaths.push(`modeProviders.${lane}`);
+    }
+    if (Object.keys(modeProviders).length > 0) normalized.modeProviders = modeProviders;
+  }
+
+  if (source.stageProfiles !== undefined && !isPlainObject(source.stageProfiles)) {
+    trackBlockedPath(blockedPaths, 'stageProfiles');
+  } else if (isPlainObject(source.stageProfiles)) {
+    const stageProfiles = {};
+    for (const rawStage of Object.keys(source.stageProfiles)) {
+      const stage = normalizeModeProviderLane(rawStage);
+      if (!stage) {
+        trackBlockedPath(blockedPaths, `stageProfiles.${rawStage}`);
+        continue;
+      }
+      const stageSource = source.stageProfiles[rawStage];
+      if (!isPlainObject(stageSource)) {
+        trackBlockedPath(blockedPaths, `stageProfiles.${rawStage}`);
+        continue;
+      }
+      const normalizedStage = {};
+      for (const provider of Object.keys(stageSource)) {
+        if (!PROJECT_PROVIDER_KEYS.has(provider)) {
+          trackBlockedPath(blockedPaths, `stageProfiles.${stage}.${provider}`);
+          continue;
+        }
+        const providerSource = stageSource[provider];
+        if (!isPlainObject(providerSource)) {
+          trackBlockedPath(blockedPaths, `stageProfiles.${stage}.${provider}`);
+          continue;
+        }
+        for (const key of Object.keys(providerSource)) {
+          if (!['model', 'effort'].includes(key)) {
+            trackBlockedPath(blockedPaths, `stageProfiles.${stage}.${provider}.${key}`);
+          }
+        }
+        const profile = {};
+        if (hasOwn(providerSource, 'model')) {
+          const model = optionalProjectModel(providerSource.model);
+          if (model) {
+            profile.model = model;
+            appliedPaths.push(`stageProfiles.${stage}.${provider}.model`);
+          } else if (providerSource.model != null) {
+            trackBlockedPath(blockedPaths, `stageProfiles.${stage}.${provider}.model`);
+          }
+        }
+        if (hasOwn(providerSource, 'effort')) {
+          profile.effort = normalizeProviderEffort(provider, providerSource.effort, null);
+          appliedPaths.push(`stageProfiles.${stage}.${provider}.effort`);
+        }
+        if (Object.keys(profile).length > 0) {
+          normalizedStage[provider] = profile;
+        }
+      }
+      if (Object.keys(normalizedStage).length > 0) {
+        stageProfiles[stage] = normalizedStage;
+      }
+    }
+    if (Object.keys(stageProfiles).length > 0) normalized.stageProfiles = stageProfiles;
+  }
+
+  for (const provider of ['codex', 'claude']) {
+    const providerSource = source[provider];
+    if (providerSource !== undefined && !isPlainObject(providerSource)) {
+      trackBlockedPath(blockedPaths, provider);
+      continue;
+    }
+    if (!isPlainObject(providerSource)) continue;
+    const normalizedProvider = {};
+    for (const key of Object.keys(providerSource)) {
+      if (!['model', 'effort'].includes(key)) {
+        trackBlockedPath(blockedPaths, `${provider}.${key}`);
+      }
+    }
+    if (hasOwn(providerSource, 'model')) {
+      const model = optionalProjectModel(providerSource.model);
+      if (model) {
+        normalizedProvider.model = model;
+        appliedPaths.push(`${provider}.model`);
+      } else if (providerSource.model != null) {
+        trackBlockedPath(blockedPaths, `${provider}.model`);
+      }
+    }
+    if (hasOwn(providerSource, 'effort')) {
+      normalizedProvider.effort = normalizeProviderEffort(provider, providerSource.effort, null);
+      appliedPaths.push(`${provider}.effort`);
+    }
+    if (Object.keys(normalizedProvider).length > 0) {
+      normalized[provider] = normalizedProvider;
+    }
+  }
+
+  return {
+    config: normalized,
+    appliedPaths: uniquePaths(appliedPaths),
+    blockedPaths: uniquePaths(blockedPaths),
+  };
+}
+
+export function normalizeProjectConfig(input = {}) {
+  return normalizeProjectConfigDetailed(input).config;
+}
+
+export function mergeProjectConfig(baseConfig, projectConfigInput = {}, options = {}) {
+  const globalConfig = normalizeConfig(baseConfig, options);
+  const projectConfig = normalizeProjectConfig(projectConfigInput);
+  const merged = structuredClone(globalConfig);
+
+  if (projectConfig.weights) {
+    merged.weights = {
+      ...merged.weights,
+      ...projectConfig.weights,
+    };
+  }
+  if (projectConfig.modeProviders) {
+    merged.modeProviders = {
+      ...merged.modeProviders,
+      ...projectConfig.modeProviders,
+    };
+  }
+  if (projectConfig.stageProfiles) {
+    for (const stage of MODE_PROVIDER_LANES) {
+      if (!projectConfig.stageProfiles[stage]) continue;
+      for (const provider of ['codex', 'claude']) {
+        if (!projectConfig.stageProfiles[stage][provider]) continue;
+        merged.stageProfiles[stage][provider] = {
+          ...merged.stageProfiles[stage][provider],
+          ...projectConfig.stageProfiles[stage][provider],
+        };
+      }
+    }
+  }
+  for (const provider of ['codex', 'claude']) {
+    if (!projectConfig[provider]) continue;
+    merged[provider] = {
+      ...merged[provider],
+      ...projectConfig[provider],
+    };
+  }
+
+  return normalizeConfig(merged, options);
+}
+
 export function createProviderEnvironment(source = process.env, passThrough = []) {
   const allowed = new Set([
     ...REQUIRED_PROVIDER_ENVIRONMENT,
@@ -196,25 +441,105 @@ export function createProviderEnvironment(source = process.env, passThrough = []
   return environment;
 }
 
-export async function loadConfig(options = {}) {
-  const configPath = options.configPath ?? getConfigPath(options);
+async function readJsonConfig(configPath, options = {}) {
+  const {
+    hardenPrivatePaths = false,
+    label = 'room configuration',
+    platform,
+  } = options;
   let parsed = {};
+  let exists = false;
 
   try {
-    if (isApplicationConfigDirectory(path.dirname(configPath))) {
-      await hardenPrivatePath(path.dirname(configPath), 0o700, options.platform);
+    if (hardenPrivatePaths && isApplicationConfigDirectory(path.dirname(configPath))) {
+      await hardenPrivatePath(path.dirname(configPath), 0o700, platform);
     }
-    await hardenPrivatePath(configPath, 0o600, options.platform);
-    parsed = JSON.parse(await fs.readFile(configPath, 'utf8'));
+    if (hardenPrivatePaths) {
+      await hardenPrivatePath(configPath, 0o600, platform);
+    }
+    if (options.maxBytes) {
+      const metadata = await fs.stat(configPath);
+      if (metadata.size > options.maxBytes) {
+        throw new Error(`file exceeds the ${Math.round(options.maxBytes / 1024)} KiB safety limit`);
+      }
+    }
+    const text = await fs.readFile(configPath, 'utf8');
+    if (options.maxBytes && Buffer.byteLength(text, 'utf8') > options.maxBytes) {
+      throw new Error(`file exceeds the ${Math.round(options.maxBytes / 1024)} KiB safety limit`);
+    }
+    parsed = JSON.parse(text);
+    exists = true;
   } catch (error) {
     if (error?.code !== 'ENOENT') {
-      throw new Error(`Unable to read room configuration at ${configPath}: ${error.message}`, {
+      throw new Error(`Unable to read ${label} at ${configPath}: ${error.message}`, {
         cause: error,
       });
     }
   }
 
+  return { parsed, exists };
+}
+
+export async function loadConfig(options = {}) {
+  const configPath = options.configPath ?? getConfigPath(options);
+  const { parsed } = await readJsonConfig(configPath, {
+    ...options,
+    hardenPrivatePaths: true,
+    label: 'room configuration',
+  });
   return normalizeConfig(parsed, options);
+}
+
+export async function loadProjectConfig(options = {}) {
+  const configPath = options.projectConfigPath ?? getProjectConfigPath(
+    options.workspace ?? process.cwd(),
+  );
+  const { parsed, exists } = await readJsonConfig(configPath, {
+    ...options,
+    hardenPrivatePaths: false,
+    label: 'project configuration',
+    maxBytes: MAX_PROJECT_CONFIG_BYTES,
+  });
+  const { config, appliedPaths, blockedPaths } = normalizeProjectConfigDetailed(parsed);
+  return {
+    config,
+    sourceInfo: {
+      source: 'project',
+      path: configPath,
+      exists,
+      appliedPaths,
+      blockedPaths,
+    },
+  };
+}
+
+export async function loadEffectiveConfig(options = {}) {
+  const globalConfigPath = options.configPath ?? getConfigPath(options);
+  const { parsed: globalParsed, exists: globalExists } = await readJsonConfig(globalConfigPath, {
+    ...options,
+    hardenPrivatePaths: true,
+    label: 'room configuration',
+  });
+  const globalConfig = normalizeConfig(globalParsed, options);
+  const { config: projectConfig, sourceInfo: projectSourceInfo } = await loadProjectConfig({
+    ...options,
+    projectConfigPath: options.projectConfigPath,
+  });
+
+  return {
+    config: mergeProjectConfig(globalConfig, projectConfig, options),
+    globalConfig,
+    projectConfig,
+    sourceInfo: {
+      defaults: { source: 'defaults' },
+      global: {
+        source: 'global',
+        path: globalConfigPath,
+        exists: globalExists,
+      },
+      project: projectSourceInfo,
+    },
+  };
 }
 
 export async function saveConfig(config, options = {}) {

@@ -77,6 +77,22 @@ test('runJsonlChild bounds oversized lines and continues with later events', asy
   assert.equal(result.rawEvents.at(-1).text, 'after-huge-line');
 });
 
+test('runJsonlChild discards every fragment of an oversized line before parsing the next event', async () => {
+  const result = await runJsonlChild({
+    command: process.execPath,
+    args: [fixturePath, '--scenario', 'fragmented-huge-line'],
+    input: 'hello',
+    maxLineBytes: 1024,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(result.parseErrors.map(({ code }) => code), ['line_too_long']);
+  assert.deepEqual(
+    result.rawEvents.map(({ text }) => text).filter(Boolean),
+    ['after-fragmented-huge-line'],
+  );
+});
+
 test('runTextChild reports missing executables without throwing', async () => {
   const result = await runTextChild({
     command: `definitely-missing-room-provider-${process.pid}.exe`,

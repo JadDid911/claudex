@@ -121,6 +121,10 @@ class TranscriptRenderer {
               usageSummary ? `usage=${sanitizeVisibleText(usageSummary)}` : null,
               `usageLimit=${sanitizeVisibleText(usageLimitSummary)}`,
               `auth=${sanitizeVisibleText(provider.authStatus ?? 'not-verified')}`,
+              provider.providerVersion
+                ? `cliVersion=${sanitizeVisibleText(provider.providerVersion)}`
+                : null,
+              `trust=${sanitizeVisibleText(provider.trustStatus ?? 'unknown')}`,
             ].filter(Boolean).join(' ')
         );
       }
@@ -195,15 +199,30 @@ class TranscriptRenderer {
     const actor = normalizeActor(event.actor);
     const label = event.label || event.mode || null;
     const text = sanitizeVisibleText(event.text ?? event.content ?? '');
+    if (event.metadata?.ttyFallback === true && !this.isTTY) {
+      return;
+    }
 
-    if (event.type !== 'delta') {
+    const transientUpdate = (
+      event.type === 'activity' ||
+      event.type === 'tool' ||
+      (
+        event.type === 'status' &&
+        event.metadata?.providerEventType !== 'turn.finish'
+      )
+    );
+    if (event.type !== 'delta' && !transientUpdate) {
       this.flushPendingBodyStream();
     }
 
     switch (event.type) {
       case 'delta':
-        if (this.shouldHideHelperProse(actor, label)) {
-          this.updateActivityLine(actor, label, 'Reviewing in background...');
+        if (this.shouldHideHelperProse(actor, label, event)) {
+          this.updateActivityLine(
+            actor,
+            label,
+            label === 'helper' ? 'Reviewing in background...' : 'Working in background...',
+          );
         } else {
           this.appendStream(actor, label, text);
         }
@@ -241,8 +260,12 @@ class TranscriptRenderer {
         this.writeBlock(actor, prefixLines(text || 'Status updated', '- '));
         break;
       default:
-        if (this.shouldHideHelperProse(actor, label)) {
-          this.updateActivityLine(actor, label, 'Reviewing in background...');
+        if (this.shouldHideHelperProse(actor, label, event)) {
+          this.updateActivityLine(
+            actor,
+            label,
+            label === 'helper' ? 'Reviewing in background...' : 'Working in background...',
+          );
         } else {
           this.writeBlock(actor, text || '[no visible content]', label);
         }
@@ -377,8 +400,16 @@ class TranscriptRenderer {
     return this.isTTY && normalizeActor(actor) !== 'SYSTEM';
   }
 
-  shouldHideHelperProse(actor, label) {
-    return label === 'helper' && this.shouldRenderQuietActivity(actor);
+  shouldHideHelperProse(actor, label, event = {}) {
+    const isCompleteFallback = (
+      event.metadata?.ttyFallback === true ||
+      (
+        event.metadata?.providerEventType === 'result.snapshot' &&
+        event.metadata?.intermediate !== true
+      )
+    );
+    const isIntermediate = label === 'helper' || event.metadata?.intermediate === true;
+    return isIntermediate && !isCompleteFallback && this.shouldRenderQuietActivity(actor);
   }
 
   updateActivityLine(actor, label, detail) {
@@ -433,8 +464,7 @@ class TranscriptRenderer {
     }
 
     if (!this.atLineStart && !this.activityVisible) {
-      this.output.write('\n');
-      this.atLineStart = true;
+      return;
     }
 
     this.output.write(
@@ -702,13 +732,19 @@ function formatIdentityProvider(provider, width) {
   const status = singleLine(provider?.availability ?? provider?.status ?? 'unknown');
   const facts = [name, model, effort, status];
   const full = facts.join(' · ');
-  if (full.length <= width) return [full];
+  const diagnosticFacts = [
+    provider?.providerVersion ? `cli ${singleLine(provider.providerVersion)}` : null,
+    `auth ${singleLine(provider?.authStatus ?? 'not-verified')}`,
+    `trust ${singleLine(provider?.trustStatus ?? 'unknown')}`,
+  ].filter(Boolean).join(' · ');
+  const diagnosticLines = wrapToWidth(`  ${diagnosticFacts}`, width);
+  if (full.length <= width) return [full, ...diagnosticLines];
 
   const identity = [name, model].join(' · ');
   if (identity.length <= width) {
-    return [identity, ...wrapToWidth(`  ${effort} · ${status}`, width)];
+    return [identity, ...wrapToWidth(`  ${effort} · ${status}`, width), ...diagnosticLines];
   }
-  return wrapToWidth(full, width);
+  return [...wrapToWidth(full, width), ...diagnosticLines];
 }
 
 function formatIdentityBorder(left, right, label, width) {

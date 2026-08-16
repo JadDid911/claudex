@@ -1,5 +1,4 @@
 import {
-  appendPromptContract,
   BaseProvider,
   diagnosticEvents,
   executionError,
@@ -7,6 +6,7 @@ import {
   isInternalDiagnosticCode,
   NON_INTERACTIVE_QUESTION_CONTRACT,
   normalizeExecutionStatus,
+  serializeBoundedContext,
   summarizeProviderStderr,
   truncateUtf8,
 } from './base.js';
@@ -14,7 +14,39 @@ import { createSpawnSpec, resolveCommand } from '../process/resolve-command.js';
 import { runJsonlChild, runTextChild } from '../process/child-process.js';
 import { normalizeProviderEffort } from '../core/preferences.js';
 
-const DEFAULT_CONTEXT_BYTES = 64 * 1024;
+const DEFAULT_CONTEXT_BYTES = 256 * 1024;
+const DETECT_PROBE_TIMEOUT_MS = 3_000;
+const MAX_PROVIDER_VERSION_LENGTH = 64;
+
+function boundedFirstLine(value, maxLength = MAX_PROVIDER_VERSION_LENGTH) {
+  return String(value ?? '')
+    .replace(/[\r\n\t]+/gu, ' ')
+    .replace(/\s{2,}/gu, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function parseProviderVersion(result) {
+  const probeText = boundedFirstLine(result?.stdout ?? result?.stderr ?? '');
+  if (!probeText) return null;
+  if (!/\bcodex\b/iu.test(probeText)) return null;
+  const match = probeText.match(/\b(\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?)\b/u);
+  return match?.[1] ?? null;
+}
+
+function parseProbeAuthStatus(result) {
+  const lines = String(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`)
+    .split(/\r?\n/u)
+    .map((line) => line.trim().toLowerCase())
+    .filter(Boolean);
+  if (lines.some((line) => /^(?:not authenticated|not logged in|login required|signed out|unauthenticated)(?:\b|[.:])/u.test(line))) {
+    return 'not-authenticated';
+  }
+  if (lines.some((line) => /^(?:authenticated|logged in|signed in|active session)(?:\b|[.:])/u.test(line))) {
+    return 'authenticated';
+  }
+  return 'unknown';
+}
 
 export function parseCodexCapabilities(helpText, helpStatus = 'completed') {
   const normalized = String(helpText ?? '');
@@ -131,30 +163,21 @@ export function normalizeCodexEvent(rawEvent) {
   return events;
 }
 
-function safeContextJson(context) {
-  try {
-    return JSON.stringify(context, null, 2);
-  } catch {
-    return JSON.stringify({ warning: 'Room context was not serializable.' });
-  }
-}
-
 export function buildCodexPrompt(prompt, { context, priorSessionId, maxBytes = DEFAULT_CONTEXT_BYTES } = {}) {
   const sections = [String(prompt ?? '')];
   const packet = context || priorSessionId
     ? {
         ...(context && typeof context === 'object' ? context : { context }),
         ...(priorSessionId ? { priorProviderSession: priorSessionId } : {}),
-        safety: 'This is a fresh Codex exec invocation; obey the supplied workspace and sandbox envelope.',
       }
     : null;
   if (packet) {
-    sections.push('', 'Room context:', safeContextJson(packet));
+    sections.push('', 'Room context:', serializeBoundedContext(packet, maxBytes));
+    sections.push('', 'This is a fresh Codex exec invocation; obey the supplied workspace and sandbox envelope.');
+    sections.push('', NON_INTERACTIVE_QUESTION_CONTRACT);
   }
   const built = sections.join('\n');
-  return packet
-    ? appendPromptContract(built, NON_INTERACTIVE_QUESTION_CONTRACT, maxBytes)
-    : truncateUtf8(built, maxBytes);
+  return packet ? built : truncateUtf8(built, maxBytes);
 }
 
 export class CodexProvider extends BaseProvider {
@@ -178,10 +201,29 @@ export class CodexProvider extends BaseProvider {
     return this.resolveCommandImpl({ command: this.command, cwd: workspace, env: this.env });
   }
 
-  async detect() {
+  async runDetectProbe(resolved, args, workspace = process.cwd()) {
+    const spawnSpec = createSpawnSpec(resolved, args);
     try {
-      const resolved = await this.resolve();
+      return await this.runTextChildImpl({
+        command: spawnSpec.command,
+        args: spawnSpec.args,
+        cwd: workspace,
+        env: this.env,
+        timeoutMs: DETECT_PROBE_TIMEOUT_MS,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  async detect(workspace = process.cwd()) {
+    try {
+      const resolved = await this.resolve(workspace);
       const capabilities = await this.getCapabilities(resolved);
+      const [versionProbe, authProbe] = await Promise.all([
+        this.runDetectProbe(resolved, ['--version'], workspace),
+        this.runDetectProbe(resolved, ['login', 'status'], workspace),
+      ]);
       return {
         available: capabilities.canRun,
         canRead: capabilities.canRun,
@@ -189,7 +231,8 @@ export class CodexProvider extends BaseProvider {
         supportsResume: capabilities.canRun,
         resumeMode: 'fresh-context',
         profile: this.profile ?? this.configurationMode,
-        authStatus: 'not-verified',
+        authStatus: authProbe ? parseProbeAuthStatus(authProbe) : 'unknown',
+        providerVersion: parseProviderVersion(versionProbe),
         command: resolved,
         capabilities,
         reason: capabilities.canRun ? null : 'Required Codex exec JSON/sandbox flags are unavailable.',
@@ -203,6 +246,7 @@ export class CodexProvider extends BaseProvider {
         resumeMode: 'unavailable',
         profile: this.profile ?? this.configurationMode,
         authStatus: 'not-verified',
+        providerVersion: null,
         reason: error.message,
       };
     }
@@ -339,7 +383,7 @@ export class CodexProvider extends BaseProvider {
         maxBytes: this.contextMaxBytes,
       }),
       signal,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: access === 'write' ? this.writeTimeoutMs : this.timeoutMs,
       idleTimeoutMs: access === 'write' ? this.idleTimeoutMs : 0,
       onEvent(rawEvent) {
         for (const event of normalizeCodexEvent(rawEvent)) emit(event);

@@ -26,6 +26,72 @@ const CLAUDE_MODELS = [
   efforts: model.id === 'default' ? undefined : [...CLAUDE_EFFORTS],
 }));
 
+function cloneClaudeModels() {
+  return CLAUDE_MODELS.map((model) => ({
+    ...model,
+    efforts: model.efforts ? [...model.efforts] : undefined,
+  }));
+}
+
+function extractClaudeModelsFromConfig(config) {
+  const ids = [];
+  const claudeModel = config?.claude?.model;
+  if (typeof claudeModel === 'string' && MODEL_ID_PATTERN.test(claudeModel.trim())) {
+    ids.push(claudeModel.trim());
+  }
+
+  for (const profile of Object.values(config?.stageProfiles ?? {})) {
+    const stageModel = profile?.claude?.model;
+    if (typeof stageModel === 'string' && MODEL_ID_PATTERN.test(stageModel.trim())) {
+      ids.push(stageModel.trim());
+    }
+  }
+
+  return ids;
+}
+
+function addClaudeModel(models, id, description) {
+  if (!MODEL_ID_PATTERN.test(String(id ?? '').trim())) return false;
+  const normalizedId = String(id).trim();
+  if (models.some((model) => model.id === normalizedId)) return false;
+  models.push({
+    id: normalizedId,
+    description,
+    efforts: [...CLAUDE_EFFORTS],
+  });
+  return true;
+}
+
+function extractClaudeModelIdsFromCache(payload) {
+  const candidates = [];
+  if (Array.isArray(payload)) {
+    candidates.push(...payload);
+  } else if (payload && typeof payload === 'object') {
+    for (const key of ['models', 'recentModels', 'modelIds', 'selectedModels']) {
+      if (Array.isArray(payload[key])) {
+        candidates.push(...payload[key]);
+      }
+    }
+  }
+
+  const ids = [];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string') {
+      if (MODEL_ID_PATTERN.test(candidate.trim())) ids.push(candidate.trim());
+      continue;
+    }
+    if (!candidate || typeof candidate !== 'object') continue;
+    for (const key of ['id', 'model', 'slug', 'name']) {
+      const value = candidate[key];
+      if (typeof value === 'string' && MODEL_ID_PATTERN.test(value.trim())) {
+        ids.push(value.trim());
+        break;
+      }
+    }
+  }
+  return ids;
+}
+
 export async function loadLocalModelCatalog(options = {}) {
   const env = options.env ?? process.env;
   const homeDirectory = options.homeDirectory ?? os.homedir();
@@ -36,6 +102,7 @@ export async function loadLocalModelCatalog(options = {}) {
   const codexModels = [
     { id: 'default', description: 'Use the Codex subscription default.' },
   ];
+  let codexCatalogSource = 'default';
 
   try {
     const cache = JSON.parse(await readText(path.join(codexHome, 'models_cache.json')));
@@ -51,16 +118,54 @@ export async function loadLocalModelCatalog(options = {}) {
         effectiveContextPercent: boundedPercent(model?.effective_context_window_percent),
       });
     }
+    if (codexModels.length > 1) {
+      codexCatalogSource = 'cache';
+    }
   } catch {
     // The official CLI cache is optional and can change shape; custom IDs still work.
   }
 
+  const claudeModels = cloneClaudeModels();
+  let sawClaudeConfigModels = false;
+  for (const config of [options.globalConfig, options.projectConfig]) {
+    for (const modelId of extractClaudeModelsFromConfig(config)) {
+      sawClaudeConfigModels = addClaudeModel(
+        claudeModels,
+        modelId,
+        'Locally configured Claude model ID.',
+      ) || sawClaudeConfigModels;
+    }
+  }
+
+  let sawClaudeCacheModels = false;
+  for (const cachePath of Array.isArray(options.claudeCachePaths) ? options.claudeCachePaths : []) {
+    try {
+      const cache = JSON.parse(await readText(cachePath));
+      for (const modelId of extractClaudeModelIdsFromCache(cache)) {
+        sawClaudeCacheModels = addClaudeModel(
+          claudeModels,
+          modelId,
+          'Locally cached Claude model ID.',
+        ) || sawClaudeCacheModels;
+      }
+    } catch {
+      // Optional local cache formats may vary across Claude CLI versions.
+    }
+  }
+
+  const claudeCatalogSource = [
+    'static',
+    ...(sawClaudeConfigModels ? ['config'] : []),
+    ...(sawClaudeCacheModels ? ['cache'] : []),
+  ].join('+');
+
   return {
     codex: dedupeModels(codexModels),
-    claude: CLAUDE_MODELS.map((model) => ({
-      ...model,
-      efforts: model.efforts ? [...model.efforts] : undefined,
-    })),
+    claude: dedupeModels(claudeModels),
+    catalogSource: {
+      codex: codexCatalogSource,
+      claude: claudeCatalogSource,
+    },
   };
 }
 

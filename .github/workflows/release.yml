@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Verify tag matches package version
+        if: ${{ github.event_name == 'push' }}
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node --input-type=module -e "import pkg from './package.json' with { type: 'json' }; if (process.env.RELEASE_TAG !== 'v' + pkg.version) throw new Error('Release tag must equal v' + pkg.version)"
+      - run: npm run verify
+      - if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npm publish --provenance --access public --dry-run
+      - if: ${{ github.event_name == 'push' }}
+        run: npm publish --provenance --access public

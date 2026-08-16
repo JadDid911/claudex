@@ -44,6 +44,13 @@ test('ClaudeProvider detect returns available command', async () => {
   assert.equal(detection.available, true);
   assert.equal(detection.canWrite, true);
   assert.equal(detection.supportsResume, true);
+  assert.equal(detection.authStatus, 'unknown');
+  assert.equal(detection.providerVersion, null);
+  assert.equal(detection.trustStatus, 'unknown');
+  assert.deepEqual(detection.capabilities.permissionMode, {
+    read: 'dontAsk',
+    write: 'acceptEdits',
+  });
 });
 
 test('ClaudeProvider defaults to lean read-only restricted mode', async () => {
@@ -190,7 +197,8 @@ test('ClaudeProvider sends bounded room context through stdin', async () => {
     context: { helper: 'x'.repeat(1000) },
   });
   assert.match(calls[0].input, /Room context:/);
-  assert.ok(Buffer.byteLength(calls[0].input, 'utf8') <= 256);
+  assert.match(calls[0].input, /context exceeded its configured byte limit/iu);
+  assert.ok(Buffer.byteLength(calls[0].input, 'utf8') < 1024);
 });
 
 test('createClaudeProvider exposes graceful missing-command detection', async () => {
@@ -202,6 +210,106 @@ test('createClaudeProvider exposes graceful missing-command detection', async ()
   const detection = await provider.detect();
   assert.equal(detection.available, false);
   assert.match(detection.reason, /missing/);
+});
+
+test('ClaudeProvider detect derives providerVersion, authStatus, and trustStatus from local probes without leaking probe output', async () => {
+  const probeCalls = [];
+  const provider = new ClaudeProvider({
+    command: process.execPath,
+    resolveCommand: async () => ({
+      command: process.execPath,
+      argsPrefix: [],
+      resolvedPath: process.execPath,
+      shellSafe: true,
+      kind: 'executable',
+    }),
+    runJsonlChild: async () => {
+      throw new Error('runTurn should not be called during detect');
+    },
+    runTextChild: async (execution) => {
+      probeCalls.push(execution);
+      if (execution.args[0] === '--version') {
+        return {
+          status: 'completed',
+          exitCode: 0,
+          stdout: 'claude 1.2.3',
+          stderr: '',
+        };
+      }
+      if (execution.args[0] === 'auth') {
+        return {
+          status: 'completed',
+          exitCode: 0,
+          stdout: 'Authenticated\nWorkspace trust: trusted\ntoken=secret-should-not-leak',
+          stderr: '',
+        };
+      }
+      throw new Error(`Unexpected probe: ${execution.args.join(' ')}`);
+    },
+  });
+
+  const detection = await provider.detect();
+
+  assert.equal(detection.available, true);
+  assert.equal(detection.providerVersion, '1.2.3');
+  assert.equal(detection.authStatus, 'authenticated');
+  assert.equal(detection.trustStatus, 'trusted');
+  assert.equal(probeCalls.some((call) => call.args.join(' ') === '--version'), true);
+  assert.equal(probeCalls.some((call) => call.args.join(' ') === 'auth status'), true);
+  assert.doesNotMatch(JSON.stringify(detection), /secret-should-not-leak/u);
+});
+
+test('ClaudeProvider detect keeps the binary available when auth or version probes fail and surfaces trust only when evidenced', async () => {
+  const provider = new ClaudeProvider({
+    command: process.execPath,
+    resolveCommand: async () => ({
+      command: process.execPath,
+      argsPrefix: [],
+      resolvedPath: process.execPath,
+      shellSafe: true,
+      kind: 'executable',
+    }),
+    runJsonlChild: async () => {
+      throw new Error('runTurn should not be called during detect');
+    },
+    runTextChild: async (execution) => {
+      if (execution.args[0] === 'auth') {
+        return {
+          status: 'completed',
+          exitCode: 0,
+          stdout: 'Not authenticated. Workspace trust: needs approval.',
+          stderr: '',
+        };
+      }
+      throw new Error('version probe unavailable');
+    },
+  });
+
+  const detection = await provider.detect();
+
+  assert.equal(detection.available, true);
+  assert.equal(detection.authStatus, 'not-authenticated');
+  assert.equal(detection.trustStatus, 'needs-trust');
+  assert.equal(detection.providerVersion, null);
+});
+
+test('ClaudeProvider trust detection ignores incidental trusted path text', async () => {
+  const provider = new ClaudeProvider({
+    command: process.execPath,
+    resolveCommand: async () => ({ command: process.execPath, argsPrefix: [] }),
+    runTextChild: async (execution) => ({
+      status: 'completed',
+      exitCode: 0,
+      stdout: execution.args[0] === '--version'
+        ? 'claude 1.0.0'
+        : 'Workspace root: C:/trusted-fixture/repo',
+      stderr: '',
+    }),
+  });
+
+  const detection = await provider.detect();
+  assert.equal(detection.authStatus, 'unknown');
+  assert.equal(detection.trustStatus, 'unknown');
 });
 
 test('ClaudeProvider configured writers keep integrations while readers stay isolated', () => {
@@ -553,6 +661,50 @@ test('ClaudeProvider write turns use a five-minute quiet-work watchdog by defaul
   assert.equal(overrideCalls[0].idleTimeoutMs, 42_000);
 });
 
+test('ClaudeProvider read turns keep the 30-minute absolute timeout while writes default to two hours and honor explicit overrides', async () => {
+  const { provider, calls } = makeProvider('claude');
+  const overrideCalls = [];
+
+  await provider.runTurn({
+    prompt: 'Review it',
+    workspace: process.cwd(),
+    access: 'read',
+  });
+  await provider.runTurn({
+    prompt: 'Apply it',
+    workspace: process.cwd(),
+    access: 'write',
+  });
+
+  const overridden = new ClaudeProvider({
+    command: process.execPath,
+    resolveCommand: async () => ({
+      command: process.execPath,
+      argsPrefix: [],
+      resolvedPath: process.execPath,
+      shellSafe: true,
+      kind: 'executable',
+    }),
+    writeTimeoutMs: 42_000,
+    runJsonlChild: async (execution) => {
+      overrideCalls.push(execution);
+      execution.onEvent({ type: 'system', subtype: 'init', session_id: 'claude-session' });
+      execution.onEvent({ type: 'result', session_id: 'claude-session', result: 'Done.' });
+      return { status: 'completed', exitCode: 0, stderrLines: [], parseErrors: [], rawEvents: [] };
+    },
+  });
+
+  await overridden.runTurn({
+    prompt: 'Override it',
+    workspace: process.cwd(),
+    access: 'write',
+  });
+
+  assert.equal(calls[0].timeoutMs, 30 * 60 * 1000);
+  assert.equal(calls[1].timeoutMs, 2 * 60 * 60 * 1000);
+  assert.equal(overrideCalls[0].timeoutMs, 42_000);
+});
+
 test('buildClaudePrompt ends with a queued clarification contract for the same room turn', async () => {
   const { buildClaudePrompt } = await import('../../src/providers/claude.js');
 
@@ -569,6 +721,24 @@ test('buildClaudePrompt ends with a queued clarification contract for the same r
     /Never invoke interactive question tools[\s\S]*ask one text question[\s\S]*numbered options[\s\S]*wait for the answer in this Room turn\.\s*$/iu,
   );
   assert.match(built, /prefixed "Question for you: "/u);
+});
+
+test('Claude stream max_tokens stop is surfaced as an incomplete-response warning', () => {
+  const state = createClaudeParserState();
+  const events = normalizeClaudeEvent({
+    type: 'stream_event',
+    event: {
+      type: 'message_delta',
+      delta: { stop_reason: 'max_tokens' },
+    },
+  }, state);
+
+  assert.equal(state.incomplete, true);
+  assert.equal(state.stopReason, 'max_tokens');
+  assert.deepEqual(events.map(({ type, code }) => [type, code]), [
+    ['warning', 'response_incomplete'],
+  ]);
+  assert.match(events[0].message, /token limit.*incomplete/iu);
 });
 
 test('ClaudeProvider write args explicitly disallow AskUserQuestion while retaining write permissions', () => {

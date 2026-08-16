@@ -2,7 +2,7 @@ import { realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { createProviderEnvironment, loadConfig, saveConfig } from './config.js';
+import { createProviderEnvironment, loadEffectiveConfig, saveConfig } from './config.js';
 import {
   createCapacityLedger,
   getCapacitySnapshot,
@@ -16,6 +16,8 @@ import {
   setProviderWeight,
 } from './core/capacity.js';
 import { buildContextPacket } from './core/context.js';
+import { writeDiagnosticsBundle } from './core/diagnostics.js';
+import { buildRoomMemory, mergeProjectMemory } from './core/memory.js';
 import {
   normalizeDelegationMode,
   normalizeModeProvider,
@@ -28,7 +30,10 @@ import {
   createSupermodePlan,
 } from './core/scheduler.js';
 import { createRoomStore, normalizeWorkspacePath, resumeRoomStore } from './core/store.js';
+import { checkForUpdate } from './core/update.js';
+import { inspectWorkspace } from './core/workspace-inspection.js';
 import { WriteLease } from './core/write-lease.js';
+import { resolveCommand } from './process/resolve-command.js';
 import { createClaudeProvider } from './providers/claude.js';
 import { createCodexProvider } from './providers/codex.js';
 import { ROOM_CLARIFICATION_PREFIX } from './providers/base.js';
@@ -225,12 +230,56 @@ function usageTokens(usage) {
     return 0;
   }
 
-  return Object.entries(usage).reduce((total, [key, value]) => {
-    if (typeof value === 'number' && /token/iu.test(key)) {
-      return total + Math.max(0, value);
+  const valueFor = (...keys) => {
+    for (const key of keys) {
+      const value = usage[key];
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.max(0, value);
+      }
     }
-    return total;
-  }, 0);
+    return null;
+  };
+  const total = valueFor('total_tokens', 'totalTokens');
+  if (total !== null) return total;
+
+  const input = valueFor('input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens') ?? 0;
+  const output = valueFor(
+    'output_tokens',
+    'outputTokens',
+    'completion_tokens',
+    'completionTokens',
+  ) ?? 0;
+  const claudeCacheCreation = valueFor('cache_creation_input_tokens', 'cacheCreationInputTokens') ?? 0;
+  const claudeCacheRead = valueFor('cache_read_input_tokens', 'cacheReadInputTokens') ?? 0;
+  return input + output + claudeCacheCreation + claudeCacheRead;
+}
+
+function formatByteCount(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return 'unknown';
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KiB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function formatWorkspaceSummary(inspection = {}) {
+  if (inspection.status !== 'git') return 'not a Git repository';
+  const counts = inspection.counts ?? {};
+  return [
+    inspection.branch ? `branch ${inspection.branch}` : 'detached or unborn branch',
+    `${counts.staged ?? 0} staged`,
+    `${counts.modified ?? 0} modified`,
+    `${counts.untracked ?? 0} untracked`,
+    `${counts.conflicted ?? 0} conflicted`,
+  ].join(' · ');
+}
+
+function formatPrivateStatePath(outputPath, storageRoot) {
+  const relative = path.relative(storageRoot, outputPath);
+  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+    return path.join('<state>', relative);
+  }
+  return path.join('<private-state>', path.basename(outputPath));
 }
 
 function failureKind(result) {
@@ -405,10 +454,11 @@ function createLinkedAbortController(parentSignal) {
   };
 }
 
-function providerEventToCanonical(provider, event, turnId, taskId, label) {
+function providerEventToCanonical(provider, event, turnId, taskId, label, options = {}) {
   const metadata = {
     label,
     providerEventType: event.type ?? 'unknown',
+    ...(options.intermediate ? { intermediate: true } : {}),
   };
   let type = 'status';
   let content = '';
@@ -482,6 +532,12 @@ function isDurableTranscriptEvent(event) {
   return event?.type === 'message' || event?.type === 'warning';
 }
 
+function contextTruncationNeedsWarning(context) {
+  const details = context?.packet?.truncation;
+  if (!details || typeof details !== 'object') return false;
+  return Object.keys(details).some((key) => key !== 'droppedTranscriptEvents');
+}
+
 function detectRoomQuery(prompt) {
   const text = String(prompt ?? '').trim();
   if (!text || text.length > 240) {
@@ -540,6 +596,7 @@ function buildDefaultProviders(config, sourceEnvironment) {
       env: providerEnvironment,
       command: config.codex.executable ?? config.codex.launcher ?? 'codex',
       timeoutMs: config.timeoutMs,
+      writeTimeoutMs: config.writeTimeoutMs,
       model: config.codex.model,
       effort: config.codex.effort,
       profile: config.codex.profile,
@@ -552,6 +609,7 @@ function buildDefaultProviders(config, sourceEnvironment) {
       env: providerEnvironment,
       command: config.claude.executable ?? 'claude',
       timeoutMs: config.timeoutMs,
+      writeTimeoutMs: config.writeTimeoutMs,
       model: config.claude.model,
       effort: config.claude.effort,
       profileMode: config.claude.profileMode,
@@ -589,14 +647,28 @@ export class RoomApplication {
     this.setTimer = options.setTimer ?? setTimeout;
     this.clearTimer = options.clearTimer ?? clearTimeout;
     this.providers = options.providers ?? null;
+    this.packageVersion = options.packageVersion ?? 'unknown';
+    this.packageName = options.packageName ?? '@jaddid911/claudex';
+    this.inspectWorkspaceImpl = options.inspectWorkspace ?? inspectWorkspace;
+    this.writeDiagnosticsImpl = options.writeDiagnostics ?? writeDiagnosticsBundle;
+    this.checkForUpdateImpl = options.checkForUpdate ?? checkForUpdate;
+    this.resolveCommandImpl = options.resolveCommand ?? resolveCommand;
+    this.memoryCompactionThreshold = options.memoryCompactionThreshold ?? 128;
+    this.memoryRecentEventCount = options.memoryRecentEventCount ?? 64;
+    this.memoryCompactionBatch = options.memoryCompactionBatch ?? 32;
     this.providerStatus = {};
     this.config = options.config ?? null;
+    this.globalConfig = options.config ? structuredClone(options.config) : null;
     this.store = null;
     this.ledger = null;
     this.lease = this.createWriteLease();
     this.active = null;
     this.turnCounter = 0;
     this.contextEvents = [];
+    this.roomMemory = null;
+    this.projectMemory = null;
+    this.memoryError = null;
+    this.configSourceInfo = null;
     this.delegationMode = 'auto';
     this.started = false;
     this.closed = false;
@@ -607,16 +679,35 @@ export class RoomApplication {
       return this.startupSnapshot();
     }
 
-    this.config ??= await loadConfig({
-      env: this.options.env,
-      configPath: this.options.configPath,
-      storageRoot: this.options.storageRoot,
-    });
-    if (this.options.persistConfig !== false) {
-      await saveConfig(this.config, {
+    if (!this.config) {
+      const loaded = await loadEffectiveConfig({
+        workspace: this.workspace,
         env: this.options.env,
         configPath: this.options.configPath,
-        storageRoot: this.config.storageRoot,
+        projectConfigPath: this.options.projectConfigPath,
+        storageRoot: this.options.storageRoot,
+      });
+      this.config = loaded.config;
+      this.globalConfig = loaded.globalConfig;
+      this.configSourceInfo = loaded.sourceInfo;
+    } else {
+      this.configSourceInfo = {
+        defaults: { source: 'defaults' },
+        global: { source: 'injected', path: this.options.configPath ?? null, exists: true },
+        project: {
+          source: 'project',
+          path: this.options.projectConfigPath ?? path.join(this.workspace, '.claudex.json'),
+          exists: false,
+          appliedPaths: [],
+          blockedPaths: [],
+        },
+      };
+    }
+    if (this.options.persistConfig !== false) {
+      this.globalConfig = await saveConfig(this.globalConfig, {
+        env: this.options.env,
+        configPath: this.options.configPath,
+        storageRoot: this.globalConfig.storageRoot,
       });
     }
     this.providers ??= buildDefaultProviders(this.config, this.options.env ?? process.env);
@@ -624,6 +715,11 @@ export class RoomApplication {
     await this.detectProviders();
     await this.persistRuntimeState();
     await this.replayTranscript();
+    try {
+      await this.refreshMemory();
+    } catch (error) {
+      this.memoryError = errorMessage(error);
+    }
     this.started = true;
     return this.startupSnapshot();
   }
@@ -640,10 +736,19 @@ export class RoomApplication {
         model: this.config?.[name]?.model ?? 'default',
         effort: this.config?.[name]?.effort ?? 'default',
         weight: this.ledger?.providers[name]?.weight ?? this.config?.weights?.[name] ?? 1,
+        providerVersion: this.providerStatus[name]?.providerVersion ?? null,
+        authStatus: this.providerStatus[name]?.authStatus ?? 'not-verified',
+        trustStatus: this.providerStatus[name]?.trustStatus ?? 'unknown',
       })),
       routingMode: this.delegationMode,
       modeProviders: structuredClone(this.config?.modeProviders ?? {}),
       stageProfiles: structuredClone(this.config?.stageProfiles ?? {}),
+      modelCatalogConfig: {
+        codex: { model: this.config?.codex?.model ?? null },
+        claude: { model: this.config?.claude?.model ?? null },
+        stageProfiles: structuredClone(this.config?.stageProfiles ?? {}),
+      },
+      memory: this.memoryStatus(),
       safetyMode: this.isHomeWorkspace()
         ? 'single-writer lease; helpers read-only; home workspace write-protected'
         : 'single-writer lease; helpers read-only',
@@ -754,6 +859,49 @@ export class RoomApplication {
       await this.appendSystem('Recovered the valid transcript prefix after an incomplete final record.', 'warning');
     }
     await this.emitRecoveryNotices(replay.events);
+  }
+
+  async refreshMemory() {
+    this.roomMemory = await this.store.loadRoomMemory();
+    this.projectMemory = await this.store.loadProjectMemory();
+
+    if ((this.store.state.nextSequence - 1) < this.memoryCompactionThreshold) {
+      return;
+    }
+    const replay = await this.store.replayEvents();
+    const retained = Math.max(1, this.memoryRecentEventCount);
+    const compactableCount = Math.max(0, replay.events.length - retained);
+    if (replay.events.length < this.memoryCompactionThreshold || compactableCount === 0) {
+      return;
+    }
+
+    const compactableEvents = replay.events.slice(0, compactableCount);
+    const sourceThroughSequence = compactableEvents.at(-1)?.sequence ?? 0;
+    if ((this.roomMemory?.sourceThroughSequence ?? 0) >= sourceThroughSequence) {
+      return;
+    }
+    if (
+      this.roomMemory &&
+      sourceThroughSequence - this.roomMemory.sourceThroughSequence < this.memoryCompactionBatch
+    ) {
+      return;
+    }
+
+    const roomMemory = buildRoomMemory({
+      room: this.store.room,
+      events: compactableEvents,
+      now: isoNow(this.now),
+    });
+    const projectMemory = mergeProjectMemory({
+      workspaceHash: this.store.room.workspaceHash,
+      roomMemory,
+      projectMemory: this.projectMemory,
+      now: isoNow(this.now),
+    });
+    await this.store.saveRoomMemory(roomMemory);
+    await this.store.saveProjectMemory(projectMemory);
+    this.roomMemory = roomMemory;
+    this.projectMemory = projectMemory;
   }
 
   async emitRecoveryNotices(replayedEvents) {
@@ -887,6 +1035,20 @@ export class RoomApplication {
       }
     } else if (command.name === 'weight') {
       await this.updateWeight(command.provider, command.value);
+    } else if (command.name === 'doctor') {
+      await this.runDoctor();
+    } else if (command.name === 'changes') {
+      await this.showWorkspaceChanges();
+    } else if (command.name === 'recover') {
+      await this.showRecoveryState();
+    } else if (command.name === 'diagnostics') {
+      await this.exportDiagnostics();
+    } else if (command.name === 'update') {
+      await this.showUpdateStatus();
+    } else if (command.name === 'memory') {
+      await this.showMemoryStatus();
+    } else if (command.name === 'project') {
+      await this.showProjectConfiguration();
     } else if (command.name === 'new') {
       await this.newRoom();
     } else if (command.name === 'resume') {
@@ -913,6 +1075,12 @@ export class RoomApplication {
     try {
       await execution;
     } finally {
+      try {
+        await this.refreshMemory();
+        this.memoryError = null;
+      } catch (error) {
+        this.memoryError = errorMessage(error);
+      }
       if (this.active?.turnId === turnId) {
         this.active = null;
       }
@@ -1175,6 +1343,8 @@ export class RoomApplication {
 
     const taskId = `${turnId}-lead`;
     const helperTaskId = plan.helper ? `${turnId}-helper` : null;
+    const intermediateProse = Boolean(plan.helper);
+    const sequentialReview = Boolean(plan.helper && plan.requiresWriteLease);
     await this.markTurn(turnId, {
       status: 'running',
       route: command.route,
@@ -1191,6 +1361,12 @@ export class RoomApplication {
     let disposeHelperAbortLink = () => {};
     let helperOutcomePromise = null;
     let helperSettled = false;
+    let helperAssignment = plan.helper;
+    const usageResults = new Set();
+    const collectUsage = (result) => {
+      if (result) usageResults.add(result);
+      return result;
+    };
     try {
       if (plan.requiresWriteLease) {
         const acquisition = this.lease.acquire({
@@ -1213,19 +1389,24 @@ export class RoomApplication {
         turnId,
         taskId,
         controller.signal,
+        {},
+        { intermediate: intermediateProse },
       );
-      if (plan.helper) {
+      if (plan.helper && !sequentialReview) {
         const linked = createLinkedAbortController(controller.signal);
         helperController = linked.controller;
         disposeHelperAbortLink = linked.dispose;
         helperOutcomePromise = this.runAssignment(
-          plan.helper,
+          helperAssignment,
           providerObjective,
           turnId,
           helperTaskId,
           helperController.signal,
+          {},
+          { intermediate: intermediateProse },
         ).then(
           (result) => {
+            collectUsage(result);
             helperSettled = true;
             return { result, error: null };
           },
@@ -1235,7 +1416,7 @@ export class RoomApplication {
           },
         );
       }
-      let leadResult = await leadPromise;
+      let leadResult = collectUsage(await leadPromise);
       const helperOutcome = helperOutcomePromise ? await helperOutcomePromise : null;
       if (helperOutcome?.error) {
         throw helperOutcome.error;
@@ -1249,17 +1430,20 @@ export class RoomApplication {
             result: leadResult,
             taskId,
             role: 'lead',
+            intermediate: intermediateProse,
           },
           ...(plan.helper && helperResult ? [{
             assignment: plan.helper,
             result: helperResult,
             taskId: helperTaskId,
             role: 'helper',
+            intermediate: intermediateProse,
           }] : []),
         ],
         providerObjective,
         turnId,
         controller.signal,
+        { onResult: collectUsage },
       );
       leadResult = clarified[0].result;
       helperResult = clarified[1]?.result ?? null;
@@ -1294,13 +1478,15 @@ export class RoomApplication {
               await this.persistRuntimeState();
             }
           }
-          leadResult = await this.runAssignment(
+          leadResult = collectUsage(await this.runAssignment(
             { ...fallback, delegationMode: resolvedDelegationMode, taskLane, reviewFocus },
             providerObjective,
             turnId,
             `${turnId}-fallback`,
             controller.signal,
-          );
+            {},
+            { intermediate: intermediateProse },
+          ));
           plan = {
             ...plan,
             lead: { ...fallback, delegationMode: resolvedDelegationMode, taskLane, reviewFocus },
@@ -1316,15 +1502,84 @@ export class RoomApplication {
         !controller.signal.aborted
       ) {
         const [fallbackClarified] = await this.resolveClarificationResults(
-          [{ assignment: plan.lead, result: leadResult, taskId: `${turnId}-fallback`, role: 'lead' }],
+          [{
+            assignment: plan.lead,
+            result: leadResult,
+            taskId: `${turnId}-fallback`,
+            role: 'lead',
+            intermediate: intermediateProse,
+          }],
           providerObjective,
           turnId,
           controller.signal,
+          { onResult: collectUsage },
         );
         leadResult = fallbackClarified.result;
       }
 
+      if (
+        sequentialReview &&
+        plan.helper &&
+        leadResult.status === TERMINAL_SUCCESS &&
+        !controller.signal.aborted
+      ) {
+        await this.appendSystem(
+          `${actorFor(plan.lead.provider)} implementation complete \u00b7 ` +
+            `${actorFor(plan.helper.provider)} reviewing the updated workspace.`,
+          'message',
+          turnId,
+        );
+        const linked = createLinkedAbortController(controller.signal);
+        helperController = linked.controller;
+        disposeHelperAbortLink = linked.dispose;
+        helperAssignment = {
+          ...plan.helper,
+          freshSession: true,
+          ...(plan.helper.provider === plan.lead.provider ? { persistSession: false } : {}),
+        };
+        helperOutcomePromise = this.runAssignment(
+          helperAssignment,
+          providerObjective,
+          turnId,
+          helperTaskId,
+          helperController.signal,
+          {
+            leadResult: leadResult.text,
+            reviewTarget: 'updated workspace after writer completion',
+          },
+          { intermediate: true },
+        ).then(
+          (result) => {
+            collectUsage(result);
+            helperSettled = true;
+            return { result, error: null };
+          },
+          (error) => {
+            helperSettled = true;
+            return { result: null, error };
+          },
+        );
+        const sequentialHelperOutcome = await helperOutcomePromise;
+        if (sequentialHelperOutcome.error) throw sequentialHelperOutcome.error;
+        helperResult = sequentialHelperOutcome.result;
+        const [clarifiedHelper] = await this.resolveClarificationResults(
+          [{
+            assignment: helperAssignment,
+            result: helperResult,
+            taskId: helperTaskId,
+            role: 'helper',
+            intermediate: true,
+          }],
+          providerObjective,
+          turnId,
+          controller.signal,
+          { onResult: collectUsage },
+        );
+        helperResult = clarifiedHelper.result;
+      }
+
       let finalResult = leadResult;
+      let synthesized = false;
       if (
         plan.helper &&
         leadResult.status === TERMINAL_SUCCESS &&
@@ -1332,11 +1587,13 @@ export class RoomApplication {
         !controller.signal.aborted
       ) {
         await this.appendSystem(
-          `${actorFor(plan.helper.provider)} handed findings to ${actorFor(plan.lead.provider)} for synthesis.`,
+          `${actorFor(plan.helper.provider)} review complete \u00b7 ` +
+            `${actorFor(plan.lead.provider)} synthesizing the final response.`,
           'message',
           turnId,
         );
-        finalResult = await this.runSynthesis(
+        synthesized = true;
+        finalResult = collectUsage(await this.runSynthesis(
           plan,
           providerObjective,
           leadResult,
@@ -1344,7 +1601,7 @@ export class RoomApplication {
           turnId,
           `${turnId}-synthesis`,
           controller.signal,
-        );
+        ));
         if (isClarificationRequest(finalResult.text) && !controller.signal.aborted) {
           const [clarifiedSynthesis] = await this.resolveClarificationResults(
             [{
@@ -1352,13 +1609,30 @@ export class RoomApplication {
               result: finalResult,
               taskId: `${turnId}-synthesis`,
               role: 'synthesis',
+              intermediate: false,
             }],
             providerObjective,
             turnId,
             controller.signal,
+            { onResult: collectUsage },
           );
           finalResult = clarifiedSynthesis.result;
         }
+      }
+
+      if (
+        intermediateProse &&
+        leadResult.status === TERMINAL_SUCCESS &&
+        (!synthesized || finalResult.status !== TERMINAL_SUCCESS) &&
+        !controller.signal.aborted
+      ) {
+        await this.persistProviderResultFallback(
+          plan.lead.provider,
+          leadResult,
+          turnId,
+          taskId,
+          'lead',
+        );
       }
 
       const status = controller.signal.aborted
@@ -1380,17 +1654,21 @@ export class RoomApplication {
       } else if (status === 'cancelled') {
         await this.appendSystem('Turn cancelled; provider processes stopped.', 'warning', turnId);
       } else {
+        const responseIncomplete = finalResult.incomplete === true;
         const providerSummary = plan.helper
           ? `${actorFor(plan.lead.provider)} led · ${actorFor(plan.helper.provider)} reviewed`
           : `${actorFor(plan.lead.provider)} completed`;
-        const tokenTotal = [...new Set([leadResult, helperResult, finalResult].filter(Boolean))]
+        const tokenTotal = [...usageResults]
           .reduce((total, result) => total + usageTokens(result.usage), 0);
         await this.appendEvent({
           actor: 'SYSTEM',
           type: 'message',
           turnId,
-          content: `Complete · ${providerSummary} · ${tokenTotal} observed tokens`,
-          metadata: { code: 'turn-summary', status: 'completed' },
+          content: `${responseIncomplete ? 'Incomplete' : 'Complete'} · ${providerSummary} · ${tokenTotal} turn tokens`,
+          metadata: {
+            code: 'turn-summary',
+            status: responseIncomplete ? 'incomplete' : 'completed',
+          },
         });
       }
     } catch (error) {
@@ -1763,7 +2041,7 @@ export class RoomApplication {
         turnId,
         content: `Complete · Supermode · ${actorFor(pipeline.coder.provider)} coded · ` +
           `${actorFor(pipeline.executor.provider)} executed · ` +
-          `${actorFor(pipeline.reviewer.provider)} reviewed last · ${tokenTotal} observed tokens`,
+          `${actorFor(pipeline.reviewer.provider)} reviewed last · ${tokenTotal} turn tokens`,
         metadata: { code: 'turn-summary', status: 'completed', workflow: 'supermode' },
       });
     } catch (error) {
@@ -2149,6 +2427,14 @@ export class RoomApplication {
     }
 
     if (result.status !== TERMINAL_SUCCESS) {
+      const failureLead = result.status === 'timeout'
+        ? `${stage.toUpperCase()} timed out with ${actorFor(assignment.provider)} at the configured ` +
+          `${writerSideEffectsPossible ? 'write ' : ''}deadline`
+        : `${stage.toUpperCase()} failed with ${actorFor(assignment.provider)} (${result.status})`;
+      const recovery = result.status === 'timeout' && writerSideEffectsPossible
+        ? ' Claudex did not retry the writer; inspect the workspace before continuing. ' +
+          'Increase writeTimeoutMs in config.json if this stage needs a longer deadline.'
+        : '';
       await this.markTurn(turnId, {
         status: 'failed',
         workflow: 'supermode',
@@ -2161,7 +2447,7 @@ export class RoomApplication {
         actor: 'SYSTEM',
         type: 'warning',
         turnId,
-        content: `${stage.toUpperCase()} failed with ${actorFor(assignment.provider)} (${result.status}); later stages were skipped${writerSideEffectsPossible ? ' and workspace changes may remain' : ''}.`,
+        content: `${failureLead}; later stages were skipped${writerSideEffectsPossible ? ' and workspace changes may remain' : ''}.${recovery}`,
         metadata: { code: 'supermode-stage-failed', workflow: 'supermode', stage },
       });
       return 'failed';
@@ -2226,8 +2512,12 @@ export class RoomApplication {
             clarificationProvider: entry.assignment.provider,
             priorProviderResult: entry.result.text,
           },
-          { sessionIdOverride: entry.result.sessionId ?? null },
+          {
+            sessionIdOverride: entry.result.sessionId ?? null,
+            intermediate: entry.intermediate === true,
+          },
         );
+        options.onResult?.(result);
         return { ...entry, result };
       }));
     }
@@ -2266,7 +2556,7 @@ export class RoomApplication {
       reviewFocus: assignment.reviewFocus ?? null,
       profileStage: assignment.profileStage ?? null,
     });
-    if (context.truncated) {
+    if (contextTruncationNeedsWarning(context)) {
       await this.appendSystem(
         `${actorFor(assignment.provider)} context was truncated to the configured byte limit.`,
         'warning',
@@ -2306,6 +2596,7 @@ export class RoomApplication {
         turnId,
         taskId,
         label,
+        { intermediate: runOptions.intermediate === true },
       ));
     };
 
@@ -2347,7 +2638,12 @@ export class RoomApplication {
       turnId,
       taskId,
       label,
-      { emit: !sawVisibleProviderText },
+      {
+        emit: runOptions.intermediate !== true && !sawVisibleProviderText,
+        ttyFallback:
+          runOptions.intermediate !== true && sawVisibleProviderText && label === 'helper',
+        intermediate: runOptions.intermediate === true,
+      },
     );
     await this.recordResult(assignment, result);
     return result;
@@ -2378,7 +2674,7 @@ export class RoomApplication {
       reviewFocus: plan.classification.reviewFocus ?? null,
       profileStage: assignment.profileStage ?? null,
     });
-    if (context.truncated) {
+    if (contextTruncationNeedsWarning(context)) {
       await this.appendSystem('The synthesis context was truncated to the configured byte limit.', 'warning', turnId);
     }
     let completionInstruction = 'Remain read-only and report the combined conclusion.';
@@ -2529,6 +2825,10 @@ export class RoomApplication {
 
   async contextPacket(objective, role, extra = {}) {
     const { turnId, ...packetExtra } = extra;
+    const memoryWatermark = this.roomMemory?.sourceThroughSequence ?? 0;
+    const contextTranscript = this.contextEvents.filter((event) => (
+      event.sequence > memoryWatermark && (!turnId || event.turnId !== turnId)
+    ));
     const roomRoster = PROVIDER_NAMES.map((name) => ({
       name,
       availability: this.providerStatus[name]?.available ? 'available' : 'unavailable',
@@ -2542,9 +2842,7 @@ export class RoomApplication {
       objective,
       role,
       dispatchSequence: this.store.state.nextSequence,
-      transcript: turnId
-        ? this.contextEvents.filter((event) => event.turnId !== turnId)
-        : this.contextEvents,
+      transcript: contextTranscript,
       safetyConstraints: [
         packetExtra.access === 'write'
           ? 'This provider holds the only workspace-write lease.'
@@ -2553,6 +2851,10 @@ export class RoomApplication {
       ],
       extra: {
         ...packetExtra,
+        ...(this.projectMemory ? { projectMemory: this.projectMemory } : {}),
+        ...(this.roomMemory?.resumeBrief
+          ? { roomMemory: { resumeBrief: this.roomMemory.resumeBrief } }
+          : {}),
         roomRoster,
         delegationMode: packetExtra.delegationMode ?? this.delegationMode,
         roomBehavior: 'Providers are invoked per turn and receive a bounded sanitized shared transcript. They do not receive the other provider\'s private reasoning or hidden session state. A provider may continue its own official CLI session when resumed.',
@@ -2581,7 +2883,211 @@ export class RoomApplication {
     return `Providers in this room: ${roster}. Providers are invoked per turn, not continuously active in every transcript. Use /codex <prompt>, /claude <prompt>, or /both <prompt> to direct routing.`;
   }
 
-  async appendProviderEvent(provider, normalizedEvent, turnId, taskId, label) {
+  async inspectCurrentWorkspace() {
+    const configuredGit = this.options.gitExecutable ?? null;
+    const resolved = configuredGit
+      ? { command: configuredGit, argsPrefix: [] }
+      : await this.resolveCommandImpl({
+          command: 'git',
+          cwd: this.workspace,
+          env: createProviderEnvironment(
+            this.options.env ?? process.env,
+            this.config.environmentPassThrough,
+          ),
+        });
+    if (resolved.argsPrefix?.length) {
+      throw new Error('The resolved Git command is not a direct executable.');
+    }
+    return this.inspectWorkspaceImpl({
+      workspacePath: this.workspace,
+      gitExecutable: resolved.command,
+    });
+  }
+
+  async safeWorkspaceInspection() {
+    try {
+      return { inspection: await this.inspectCurrentWorkspace(), error: null };
+    } catch (error) {
+      return { inspection: null, error: errorMessage(error) };
+    }
+  }
+
+  async runDoctor() {
+    const { inspection, error } = await this.safeWorkspaceInspection();
+    const lines = [
+      `Doctor · Claudex ${this.packageVersion} · Node ${process.version}`,
+      ...PROVIDER_NAMES.map((name) => {
+        const provider = this.providerStatus[name] ?? {};
+        const capabilities = [
+          provider.canRead === false ? 'read unavailable' : 'read ready',
+          provider.canWrite === false ? 'write unavailable' : 'write ready',
+          provider.supportsResume === false ? 'resume unavailable' : 'resume ready',
+        ].join(' · ');
+        return `${actorFor(name)} · ${provider.available ? 'available' : 'unavailable'} · ` +
+          `CLI ${provider.providerVersion ?? 'unknown'} · auth ${provider.authStatus ?? 'not-verified'} · ` +
+          `trust ${provider.trustStatus ?? 'unknown'} · ${capabilities}`;
+      }),
+      inspection
+        ? `Workspace · ${formatWorkspaceSummary(inspection)}`
+        : `Workspace check unavailable · ${error}`,
+      `Configuration · ${this.configSourceInfo?.project?.exists ? 'global + project' : 'global'} · ` +
+        `shared context ${formatByteCount(this.config.contextCapBytes)}`,
+      'Next · fix any unavailable provider or trust warning, then run /status for live routing details.',
+    ];
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      content: lines.join('\n'),
+      metadata: { code: 'doctor-report' },
+    });
+  }
+
+  async showWorkspaceChanges() {
+    const { inspection, error } = await this.safeWorkspaceInspection();
+    if (!inspection) {
+      await this.appendSystem(`Workspace changes unavailable · ${error}`, 'warning');
+      return;
+    }
+    const lines = [`Changes · ${formatWorkspaceSummary(inspection)}`];
+    for (const entry of inspection.entries ?? []) {
+      lines.push(`${entry.status} · ${entry.previousPath ? `${entry.previousPath} → ` : ''}${entry.path}`);
+    }
+    if (inspection.truncated) {
+      lines.push(`… ${inspection.omittedCount} more path(s) omitted`);
+    }
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      content: lines.join('\n'),
+      metadata: { code: 'changes-report' },
+    });
+  }
+
+  async showRecoveryState() {
+    const turns = Object.entries(this.store.state.activeTurns ?? {});
+    const candidate = turns
+      .filter(([, turn]) => ['failed', 'interrupted', 'cancelled'].includes(turn?.status))
+      .at(-1);
+    const { inspection, error } = await this.safeWorkspaceInspection();
+    const lines = candidate
+      ? [
+          `Recovery · ${candidate[0]} · ${candidate[1].status}`,
+          candidate[1].writerSideEffectsPossible
+            ? 'Workspace changes may remain; Claudex will not replay this writer automatically.'
+            : 'No possible writer side effects were recorded for this turn.',
+        ]
+      : ['Recovery · no failed, interrupted, or cancelled turn is recorded in this room.'];
+    lines.push(inspection
+      ? `Workspace · ${formatWorkspaceSummary(inspection)}`
+      : `Workspace check unavailable · ${error}`);
+    lines.push('Next · inspect /changes before retrying or reverting anything.');
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      content: lines.join('\n'),
+      metadata: { code: 'recovery-report' },
+    });
+  }
+
+  async exportDiagnostics() {
+    const stamp = isoNow(this.now).replace(/[:.]/gu, '-');
+    const outputPath = path.join(this.store.paths.roomPath, `diagnostics-${stamp}.json`);
+    const providerVersions = Object.fromEntries(PROVIDER_NAMES.map((name) => [name, {
+      version: this.providerStatus[name]?.providerVersion ?? null,
+      status: this.providerStatus[name]?.available ? 'available' : 'unavailable',
+      capabilities: this.providerStatus[name]?.capabilities ?? {},
+    }]));
+    const result = await this.writeDiagnosticsImpl({
+      outputPath,
+      workspacePath: this.workspace,
+      workspaceHash: this.store.room.workspaceHash,
+      homePath: this.homeDirectory,
+      generatedAt: isoNow(this.now),
+      packageName: this.packageName,
+      packageVersion: this.packageVersion,
+      room: this.store.room,
+      state: this.store.state,
+      status: this.getStatus(),
+      providerVersions,
+      config: this.config,
+      recentEvents: this.contextEvents,
+    });
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      content: `Diagnostics exported · ${formatPrivateStatePath(result.outputPath, this.store.paths.storageRoot)} · ${formatByteCount(result.bytes)}`,
+      metadata: { code: 'diagnostics-export' },
+    });
+  }
+
+  async showUpdateStatus() {
+    let result;
+    try {
+      result = await this.checkForUpdateImpl({
+        packageName: this.packageName,
+        currentVersion: this.packageVersion,
+      });
+    } catch (error) {
+      result = { status: 'offline', reason: errorMessage(error), updateAvailable: false };
+    }
+    let content;
+    if (result.status !== 'ok') {
+      content = `Update check unavailable · ${result.reason ?? result.status} · no installation was attempted.`;
+    } else if (result.updateAvailable) {
+      content = `Update available · ${result.current} → ${result.latest}\nRun: ${result.installCommand}`;
+    } else {
+      content = `Claudex ${result.current} is current · no installation was attempted.`;
+    }
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      content,
+      metadata: { code: 'update-status', updateAvailable: result.updateAvailable },
+    });
+  }
+
+  async showMemoryStatus() {
+    const status = this.memoryStatus();
+    const lines = [
+      ...(status.error ? [`Memory warning · ${status.error}`] : []),
+      status.room
+        ? `Room memory · through event ${status.room.sourceThroughSequence} · updated ${status.room.updatedAt}`
+        : 'Room memory · not needed yet; recent durable context still fits.',
+      status.project
+        ? `Project memory · last room ${status.project.lastRoomId} · updated ${status.project.updatedAt}`
+        : 'Project memory · no compacted project history yet.',
+      `Recent durable events retained · ${status.retainedTranscriptEvents}`,
+      'Raw sanitized events remain the source of truth; memory only replaces older handoff context.',
+    ];
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      content: lines.join('\n'),
+      metadata: { code: 'memory-status' },
+    });
+  }
+
+  async showProjectConfiguration() {
+    const project = this.configSourceInfo?.project;
+    const lines = project?.exists
+      ? [
+          `Project profile · ${project.path}`,
+          `Applied · ${(project.appliedPaths ?? []).join(', ') || 'none'}`,
+          `Blocked · ${(project.blockedPaths ?? []).join(', ') || 'none'}`,
+        ]
+      : [
+          `Project profile · none (${project?.path ?? path.join(this.workspace, '.claudex.json')})`,
+          'Create .claudex.json to pin safe model, effort, weight, and stage-routing preferences for this repository.',
+        ];
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      content: lines.join('\n'),
+      metadata: { code: 'project-profile' },
+    });
+  }
+
+  async appendProviderEvent(provider, normalizedEvent, turnId, taskId, label, options = {}) {
     if (
       normalizedEvent?.type === 'activity' &&
       String(normalizedEvent?.status ?? '').startsWith('rate_limit_')
@@ -2597,7 +3103,14 @@ export class RoomApplication {
         reportedAt: isoNow(this.now),
       });
     }
-    const mapped = providerEventToCanonical(provider, normalizedEvent, turnId, taskId, label);
+    const mapped = providerEventToCanonical(
+      provider,
+      normalizedEvent,
+      turnId,
+      taskId,
+      label,
+      options,
+    );
     if (mapped.input.type !== 'warning') {
       this.emitEvent(replayDisplayEvent(mapped.input));
       return mapped.input;
@@ -2622,13 +3135,42 @@ export class RoomApplication {
         label,
         providerEventType: 'result.snapshot',
         status: result?.status ?? null,
+        ...(result?.incomplete ? {
+          incomplete: true,
+          stopReason: result.stopReason ?? null,
+        } : {}),
+        ...(options.ttyFallback ? { ttyFallback: true } : {}),
+        ...(options.intermediate ? { intermediate: true } : {}),
       },
     }, { timestamp: isoNow(this.now) });
     this.rememberEvent(event);
-    if (options.emit) {
+    if (options.emit || options.ttyFallback) {
       this.emitEvent(replayDisplayEvent(event));
     }
     return event;
+  }
+
+  async persistProviderResultFallback(provider, result, turnId, taskId, label) {
+    const content = String(result?.text ?? '').trim();
+    if (!content) return;
+    const event = await this.store.appendEvent({
+      actor: actorFor(provider),
+      type: 'message',
+      turnId,
+      taskId,
+      content,
+      label,
+      metadata: {
+        code: 'provider-result-fallback',
+        label,
+        providerEventType: 'result.snapshot',
+        status: result?.status ?? null,
+        intermediate: true,
+        ttyFallback: true,
+      },
+    }, { timestamp: isoNow(this.now) });
+    this.rememberEvent(event);
+    this.emitEvent(replayDisplayEvent(event));
   }
 
   createActivityWatch(provider, label) {
@@ -2843,6 +3385,28 @@ export class RoomApplication {
     });
   }
 
+  memoryStatus() {
+    return {
+      room: this.roomMemory
+        ? {
+            sourceThroughSequence: this.roomMemory.sourceThroughSequence,
+            updatedAt: this.roomMemory.updatedAt,
+          }
+        : null,
+      project: this.projectMemory
+        ? {
+            sourceThroughSequence: this.projectMemory.sourceThroughSequence,
+            updatedAt: this.projectMemory.updatedAt,
+            lastRoomId: this.projectMemory.lastRoomId,
+          }
+        : null,
+      retainedTranscriptEvents: this.contextEvents.filter((event) => (
+        event.sequence > (this.roomMemory?.sourceThroughSequence ?? 0)
+      )).length,
+      error: this.memoryError,
+    };
+  }
+
   getStatus() {
     const snapshot = getCapacitySnapshot(this.ledger, { now: this.now() });
     return {
@@ -2851,6 +3415,7 @@ export class RoomApplication {
       contextCapBytes: this.config?.contextCapBytes ?? null,
       modeProviders: structuredClone(this.config.modeProviders),
       stageProfiles: structuredClone(this.config.stageProfiles),
+      memory: this.memoryStatus(),
       workflow: this.active?.workflow ?? null,
       activeStage: this.active?.stage ?? null,
       summary: `room=${this.store.room.roomId} mode=${this.delegationMode} capacity=configured/observed`,
@@ -2867,6 +3432,11 @@ export class RoomApplication {
           lastTurnTokens: entry.lastTurnTokens,
           capacitySource: entry.capacitySource,
           authStatus: this.providerStatus[name]?.authStatus ?? 'not-verified',
+          providerVersion: this.providerStatus[name]?.providerVersion ?? null,
+          trustStatus: this.providerStatus[name]?.trustStatus ?? 'unknown',
+          canRead: this.providerStatus[name]?.canRead !== false,
+          canWrite: this.providerStatus[name]?.canWrite !== false,
+          supportsResume: this.providerStatus[name]?.supportsResume !== false,
           model: this.config[name].model ?? 'default',
           effort: this.config[name].effort ?? 'default',
           profile: name === 'codex'
@@ -2897,36 +3467,35 @@ export class RoomApplication {
     };
   }
 
+  async persistUserConfig() {
+    if (this.options.persistConfig === false) return;
+    this.globalConfig = await saveConfig(this.globalConfig, {
+      env: this.options.env,
+      configPath: this.options.configPath,
+      storageRoot: this.globalConfig.storageRoot,
+    });
+  }
+
   async updateWeight(provider, value) {
     setProviderWeight(this.ledger, provider, value);
     this.config.weights[provider] = value;
+    this.globalConfig.weights[provider] = value;
     await this.persistRuntimeState();
-    if (this.options.persistConfig !== false) {
-      await saveConfig(this.config, {
-        env: this.options.env,
-        configPath: this.options.configPath,
-        storageRoot: this.config.storageRoot,
-      });
-    }
+    await this.persistUserConfig();
     await this.appendSystem(`${actorFor(provider)} scheduling weight set to ${value}.`);
   }
 
   async updateModel(provider, model) {
     const selectedModel = model ?? null;
     this.config[provider].model = selectedModel;
+    this.globalConfig[provider].model = selectedModel;
     const adapter = this.providers[provider];
     if (typeof adapter?.setModel === 'function') {
       adapter.setModel(selectedModel);
     } else if (adapter) {
       adapter.model = selectedModel;
     }
-    if (this.options.persistConfig !== false) {
-      await saveConfig(this.config, {
-        env: this.options.env,
-        configPath: this.options.configPath,
-        storageRoot: this.config.storageRoot,
-      });
-    }
+    await this.persistUserConfig();
     await this.appendSystem(
       `${actorFor(provider)} model set to ${selectedModel ?? 'provider default'}.`,
     );
@@ -2935,19 +3504,14 @@ export class RoomApplication {
   async updateEffort(provider, effort) {
     const selectedEffort = normalizeProviderEffort(provider, effort);
     this.config[provider].effort = selectedEffort;
+    this.globalConfig[provider].effort = selectedEffort;
     const adapter = this.providers[provider];
     if (typeof adapter?.setEffort === 'function') {
       adapter.setEffort(selectedEffort);
     } else if (adapter) {
       adapter.effort = selectedEffort;
     }
-    if (this.options.persistConfig !== false) {
-      await saveConfig(this.config, {
-        env: this.options.env,
-        configPath: this.options.configPath,
-        storageRoot: this.config.storageRoot,
-      });
-    }
+    await this.persistUserConfig();
     await this.appendSystem(
       `${actorFor(provider)} effort set to ${selectedEffort ?? 'provider default'}.`,
     );
@@ -2969,13 +3533,8 @@ export class RoomApplication {
     }
 
     this.config.modeProviders[canonicalLane] = canonicalProvider;
-    if (this.options.persistConfig !== false) {
-      await saveConfig(this.config, {
-        env: this.options.env,
-        configPath: this.options.configPath,
-        storageRoot: this.config.storageRoot,
-      });
-    }
+    this.globalConfig.modeProviders[canonicalLane] = canonicalProvider;
+    await this.persistUserConfig();
     await this.appendSystem(
       canonicalProvider === 'auto'
         ? `${canonicalLane.toUpperCase()} provider affinity reset to auto.`
@@ -3004,8 +3563,10 @@ export class RoomApplication {
 
     if (canonicalProvider === 'auto') {
       this.config.modeProviders[canonicalStage] = 'auto';
+      this.globalConfig.modeProviders[canonicalStage] = 'auto';
       for (const providerName of PROVIDER_NAMES) {
         this.config.stageProfiles[canonicalStage][providerName] = { model: null, effort: null };
+        this.globalConfig.stageProfiles[canonicalStage][providerName] = { model: null, effort: null };
       }
     } else {
       const selectedModel = typeof model === 'string' && model.trim() ? model.trim() : null;
@@ -3014,19 +3575,18 @@ export class RoomApplication {
         throw new Error(`Unsupported ${canonicalProvider} effort for ${canonicalStage}.`);
       }
       this.config.modeProviders[canonicalStage] = canonicalProvider;
+      this.globalConfig.modeProviders[canonicalStage] = canonicalProvider;
       this.config.stageProfiles[canonicalStage][canonicalProvider] = {
+        model: selectedModel,
+        effort: selectedEffort,
+      };
+      this.globalConfig.stageProfiles[canonicalStage][canonicalProvider] = {
         model: selectedModel,
         effort: selectedEffort,
       };
     }
 
-    if (this.options.persistConfig !== false) {
-      await saveConfig(this.config, {
-        env: this.options.env,
-        configPath: this.options.configPath,
-        storageRoot: this.config.storageRoot,
-      });
-    }
+    await this.persistUserConfig();
     await this.appendSystem(
       canonicalProvider === 'auto'
         ? `${canonicalStage.toUpperCase()} stage profile reset to auto.`
@@ -3054,6 +3614,9 @@ export class RoomApplication {
     this.delegationMode = normalizeDelegationMode(delegationMode);
     this.turnCounter = 0;
     this.contextEvents = [];
+    this.roomMemory = null;
+    this.projectMemory = await this.store.loadProjectMemory();
+    this.memoryError = null;
     await this.persistRuntimeState();
     await this.appendSystem(`Started room ${this.store.room.roomId}.`);
   }
@@ -3074,6 +3637,12 @@ export class RoomApplication {
     await this.detectProviders();
     await this.persistRuntimeState();
     await this.replayTranscript();
+    try {
+      await this.refreshMemory();
+      this.memoryError = null;
+    } catch (error) {
+      this.memoryError = errorMessage(error);
+    }
   }
 
   async cancel(reason = {}) {

@@ -8,6 +8,17 @@ function stableStringify(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function utf8Prefix(value, maxBytes) {
+  const buffer = Buffer.from(String(value ?? ''), 'utf8');
+  let end = Math.min(buffer.length, Math.max(0, maxBytes));
+  while (end > 0) {
+    const prefix = buffer.subarray(0, end).toString('utf8');
+    if (!prefix.endsWith('\uFFFD')) return prefix;
+    end -= 1;
+  }
+  return '';
+}
+
 function truncateUtf8(value, maxBytes) {
   if (byteLength(value) <= maxBytes) {
     return value;
@@ -17,13 +28,7 @@ function truncateUtf8(value, maxBytes) {
     return '.'.repeat(Math.max(0, maxBytes));
   }
 
-  let text = value;
-
-  while (text.length > 0 && byteLength(`${text}...`) > maxBytes) {
-    text = text.slice(0, -1);
-  }
-
-  return `${text}...`;
+  return `${utf8Prefix(value, maxBytes - 3)}...`;
 }
 
 function normalizeExtra(extra, capBytes) {
@@ -32,13 +37,7 @@ function normalizeExtra(extra, capBytes) {
   }
 
   const value = {};
-  let truncated = false;
   const handoffKeys = ['leadResult', 'helperFindings', 'planResult'];
-  const handoffCount = handoffKeys.filter((key) => typeof extra[key] === 'string').length;
-  const sharedHandoffBudget = Math.max(128, Math.floor(capBytes * 0.4));
-  const resultFieldCap = handoffCount > 0
-    ? Math.max(64, Math.min(24 * 1024, Math.floor(sharedHandoffBudget / handoffCount)))
-    : 0;
 
   for (const [key, entry] of Object.entries(extra)) {
     if (isSensitiveMetadataKey(key)) {
@@ -47,9 +46,7 @@ function normalizeExtra(extra, capBytes) {
       handoffKeys.includes(key) &&
       typeof entry === 'string'
     ) {
-      const redacted = redactSensitiveText(entry);
-      value[key] = truncateUtf8(redacted, resultFieldCap);
-      truncated ||= value[key] !== redacted;
+      value[key] = redactSensitiveText(entry);
     } else {
       value[key] = sanitizeMetadata(entry, {
         maxStringLength: 2048,
@@ -58,7 +55,46 @@ function normalizeExtra(extra, capBytes) {
     }
   }
 
-  return { value, truncated };
+  return { value, truncated: false };
+}
+
+function trimHandoffResults(packet, capBytes) {
+  const handoffKeys = ['leadResult', 'helperFindings', 'planResult']
+    .filter((key) => typeof packet.extra?.[key] === 'string');
+  if (handoffKeys.length === 0 || byteLength(stableStringify(packet)) <= capBytes) {
+    return false;
+  }
+
+  const originals = Object.fromEntries(handoffKeys.map((key) => [key, packet.extra[key]]));
+  packet.truncated = true;
+  packet.truncation = {
+    ...(packet.truncation ?? {}),
+    synthesisResultsTrimmed: true,
+  };
+
+  let low = 0;
+  let high = Math.max(...handoffKeys.map((key) => byteLength(originals[key])));
+  let best = Object.fromEntries(handoffKeys.map((key) => [key, '']));
+
+  while (low <= high) {
+    const fieldCap = Math.floor((low + high) / 2);
+    const candidate = Object.fromEntries(
+      handoffKeys.map((key) => [key, truncateUtf8(originals[key], fieldCap)]),
+    );
+    const candidatePacket = {
+      ...packet,
+      extra: { ...packet.extra, ...candidate },
+    };
+    if (byteLength(stableStringify(candidatePacket)) <= capBytes) {
+      best = candidate;
+      low = fieldCap + 1;
+    } else {
+      high = fieldCap - 1;
+    }
+  }
+
+  Object.assign(packet.extra, best);
+  return true;
 }
 
 function normalizeTranscriptEntry(entry) {
@@ -80,7 +116,7 @@ function normalizeTranscriptEntry(entry) {
  * @returns {{packet: object, text: string, bytes: number, truncated: boolean}}
  */
 export function buildContextPacket(input = {}) {
-  const capBytes = Number.isFinite(input.capBytes) ? input.capBytes : 64 * 1024;
+  const capBytes = Number.isFinite(input.capBytes) ? input.capBytes : 256 * 1024;
   const transcript = Array.isArray(input.transcript) ? input.transcript.map(normalizeTranscriptEntry) : [];
   const safetyConstraints = Array.isArray(input.safetyConstraints)
     ? input.safetyConstraints.map((entry) => redactSensitiveText(entry))
@@ -135,6 +171,10 @@ export function buildContextPacket(input = {}) {
       ...(packet.truncation ?? {}),
       droppedTranscriptEvents: low,
     };
+    text = stableStringify(packet);
+  }
+
+  if (byteLength(text) > capBytes && trimHandoffResults(packet, capBytes)) {
     text = stableStringify(packet);
   }
 

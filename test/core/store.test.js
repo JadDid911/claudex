@@ -12,6 +12,12 @@ import {
   normalizeWorkspacePath,
   resumeRoomStore,
 } from '../../src/core/store.js';
+import {
+  PROJECT_MEMORY_VERSION,
+  ROOM_MEMORY_VERSION,
+  buildRoomMemory,
+  mergeProjectMemory,
+} from '../../src/core/memory.js';
 
 const fakeOpenAiKey = ['sk', 'test_123456789'].join('-');
 
@@ -109,6 +115,97 @@ test('room store appends canonical events and resumes state', async (context) =>
 
   assert.ok(resumed);
   assert.equal(resumed.state.nextSequence, 2);
+  assert.equal(resumed.paths.roomMemoryPath.endsWith('room-memory.json'), true);
+  assert.equal(resumed.paths.projectMemoryPath.endsWith('project-memory.json'), true);
+});
+
+test('room store lazily loads optional memory artifacts and fails closed on malformed documents', async (context) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'room-store-memory-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await fs.mkdir(workspacePath, { recursive: true });
+
+  const store = await createRoomStore({
+    workspacePath,
+    storageRoot: path.join(tempRoot, 'state'),
+    roomId: 'memory-room',
+    now: '2026-08-15T12:00:00.000Z',
+  });
+
+  assert.equal(await store.loadRoomMemory(), null);
+  assert.equal(await store.loadProjectMemory(), null);
+
+  await fs.writeFile(store.paths.roomMemoryPath, '{invalid json', 'utf8');
+  await fs.writeFile(
+    store.paths.projectMemoryPath,
+    `${JSON.stringify({ version: 999, kind: 'project-memory', workspaceHash: store.room.workspaceHash }, null, 2)}\n`,
+    'utf8',
+  );
+  const roomBefore = await fs.readFile(store.paths.roomMemoryPath, 'utf8');
+  const projectBefore = await fs.readFile(store.paths.projectMemoryPath, 'utf8');
+
+  const resumed = await resumeRoomStore({
+    workspacePath,
+    storageRoot: path.join(tempRoot, 'state'),
+    roomId: 'memory-room',
+    now: '2026-08-15T12:05:00.000Z',
+  });
+
+  assert.equal(await resumed.loadRoomMemory(), null);
+  assert.equal(await resumed.loadProjectMemory(), null);
+  assert.equal(await fs.readFile(store.paths.roomMemoryPath, 'utf8'), roomBefore);
+  assert.equal(await fs.readFile(store.paths.projectMemoryPath, 'utf8'), projectBefore);
+});
+
+test('room store saves and reloads room/project memory artifacts', async (context) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'room-store-memory-save-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await fs.mkdir(workspacePath, { recursive: true });
+
+  const store = await createRoomStore({
+    workspacePath,
+    storageRoot: path.join(tempRoot, 'state'),
+    roomId: 'memory-save-room',
+    now: '2026-08-15T12:00:00.000Z',
+  });
+
+  await store.appendEvent({
+    actor: 'YOU',
+    turnId: 'turn-1',
+    content: 'Implement the daily driver memory core',
+    metadata: { code: 'user-turn' },
+  });
+  await store.appendEvent({
+    actor: 'SYSTEM',
+    type: 'warning',
+    turnId: 'turn-1',
+    content: 'One warning only.',
+    metadata: { code: 'provider-warning' },
+  });
+
+  const recovery = await store.replayEvents();
+  const roomMemory = buildRoomMemory({
+    room: store.room,
+    events: recovery.events,
+    now: '2026-08-16T00:00:00.000Z',
+  });
+  const projectMemory = mergeProjectMemory({
+    workspaceHash: store.room.workspaceHash,
+    roomMemory,
+    now: '2026-08-16T00:01:00.000Z',
+  });
+
+  await store.saveRoomMemory(roomMemory);
+  await store.saveProjectMemory(projectMemory);
+
+  const loadedRoomMemory = await store.loadRoomMemory();
+  const loadedProjectMemory = await store.loadProjectMemory();
+
+  assert.equal(loadedRoomMemory.version, ROOM_MEMORY_VERSION);
+  assert.equal(loadedProjectMemory.version, PROJECT_MEMORY_VERSION);
+  assert.deepEqual(loadedRoomMemory, roomMemory);
+  assert.deepEqual(loadedProjectMemory, projectMemory);
 });
 
 test('room store hardens owned POSIX descendants without chmodding a custom root', {
@@ -139,6 +236,19 @@ test('room store hardens owned POSIX descendants without chmodding a custom root
     store.paths.statePath,
     store.paths.eventsPath,
   ];
+  const roomMemory = buildRoomMemory({
+    room: store.room,
+    events: [],
+    now: '2026-08-16T00:00:00.000Z',
+  });
+  const projectMemory = mergeProjectMemory({
+    workspaceHash: store.room.workspaceHash,
+    roomMemory,
+    now: '2026-08-16T00:01:00.000Z',
+  });
+  await store.saveRoomMemory(roomMemory);
+  await store.saveProjectMemory(projectMemory);
+  files.push(store.paths.roomMemoryPath, store.paths.projectMemoryPath);
 
   assert.equal((await fs.stat(storageRoot)).mode & 0o777, 0o755);
 

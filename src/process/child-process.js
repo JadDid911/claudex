@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { TextDecoder } from 'node:util';
 
-const DEFAULT_MAX_LINE_BYTES = 256 * 1024;
+const DEFAULT_MAX_LINE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_DIAGNOSTICS = 32;
 
 function normalizeError(error) {
@@ -20,11 +20,16 @@ function createLineDecoder({ onLine, onOverflow, maxLineBytes }) {
   const decoder = new TextDecoder('utf-8', { fatal: false });
   let buffered = '';
   let overflowed = false;
+  let discardingOverflowedLine = false;
 
   function drain(complete) {
     const lines = buffered.split(/\r?\n/u);
     buffered = lines.pop() ?? '';
     for (const line of lines) {
+      if (discardingOverflowedLine) {
+        discardingOverflowedLine = false;
+        continue;
+      }
       if (Buffer.byteLength(line, 'utf8') > maxLineBytes) {
         overflowed = true;
         onOverflow(line.slice(0, Math.min(line.length, 2048)));
@@ -33,14 +38,17 @@ function createLineDecoder({ onLine, onOverflow, maxLineBytes }) {
       }
     }
 
-    if (Buffer.byteLength(buffered, 'utf8') > maxLineBytes) {
+    if (discardingOverflowedLine) {
+      buffered = '';
+    } else if (Buffer.byteLength(buffered, 'utf8') > maxLineBytes) {
       const preview = buffered.slice(0, Math.min(buffered.length, 2048));
       buffered = '';
       overflowed = true;
+      discardingOverflowedLine = true;
       onOverflow(preview);
     }
 
-    if (complete && buffered.length > 0) {
+    if (complete && !discardingOverflowedLine && buffered.length > 0) {
       if (Buffer.byteLength(buffered, 'utf8') > maxLineBytes) {
         overflowed = true;
         onOverflow(buffered.slice(0, Math.min(buffered.length, 2048)));
@@ -49,6 +57,7 @@ function createLineDecoder({ onLine, onOverflow, maxLineBytes }) {
       }
       buffered = '';
     }
+    if (complete) discardingOverflowedLine = false;
   }
 
   return {

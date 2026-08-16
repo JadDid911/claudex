@@ -36,6 +36,14 @@ test('normalized provider events bound nested metadata and text', () => {
   assert.equal(event.nested.a.b.c, '[truncated]');
 });
 
+test('normalized provider response events preserve long visible text', () => {
+  const text = `LONG_RESPONSE:${'x'.repeat(10_000)}:END`;
+  const event = BaseProvider.createEvent('text.message', { text });
+
+  assert.equal(event.text, text);
+  assert.doesNotMatch(event.text, /\[truncated\]$/u);
+});
+
 test('normalized provider events redact structured credential fields', () => {
   const event = BaseProvider.createEvent('usage', {
     usage: {
@@ -57,4 +65,37 @@ test('capacity classifier recognizes common provider failure shapes', () => {
   assert.equal(isCapacityMessage('HTTP 429 too many requests'), true);
   assert.equal(isCapacityMessage('Usage limit reached; resets at 04:00'), true);
   assert.equal(isCapacityMessage('ordinary tool failure'), false);
+});
+
+test('buildResult separates multiple text.message events instead of merging them together', () => {
+  const result = BaseProvider.buildResult({
+    provider: 'fixture',
+    access: 'read',
+    status: 'completed',
+    events: [
+      { type: 'text.message', text: 'First complete answer.' },
+      { type: 'text.message', text: 'Second complete answer.' },
+    ],
+    sideEffectsPossible: false,
+    raw: {},
+  });
+
+  assert.match(result.text, /First complete answer\.\s+Second complete answer\./u);
+  assert.notEqual(result.text, 'First complete answer.Second complete answer.');
+});
+
+test('buildResult concatenates text.delta fragments without inserting separators', () => {
+  const result = BaseProvider.buildResult({
+    provider: 'fixture',
+    access: 'read',
+    status: 'completed',
+    events: [
+      { type: 'text.delta', text: 'Trace' },
+      { type: 'text.delta', text: 'back' },
+    ],
+    sideEffectsPossible: false,
+    raw: {},
+  });
+
+  assert.equal(result.text, 'Traceback');
 });

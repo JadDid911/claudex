@@ -55,9 +55,9 @@ test('provider prompt budgeting preserves Supermode handoffs ahead of transcript
   const codexPrompt = buildCodexPrompt(providerInstruction, { context, maxBytes });
 
   for (const prompt of [claudePrompt, codexPrompt]) {
-    assert.ok(Buffer.byteLength(prompt, 'utf8') <= maxBytes);
     assert.match(prompt, /PLAN_HANDOFF_SENTINEL/u);
     assert.match(prompt, /Question for you:/u);
+    assert.doesNotMatch(prompt, /\[context truncated\]/u);
   }
 });
 
@@ -126,6 +126,38 @@ test('synthesis results keep useful detail and report bounded truncation', () =>
   assert.equal(bounded.truncated, true);
   assert.equal(bounded.packet.truncation.synthesisResultsTrimmed, true);
   assert.ok(bounded.bytes <= 4 * 1024);
+});
+
+test('synthesis handoffs use the available packet budget instead of a forty-percent pre-cap', () => {
+  const result = buildContextPacket({
+    objective: 'synthesize',
+    extra: {
+      leadResult: `LEAD:${'L'.repeat(20_000)}:END`,
+      helperFindings: `HELPER:${'H'.repeat(20_000)}:END`,
+    },
+    capBytes: 64 * 1024,
+  });
+
+  assert.equal(result.truncated, false);
+  assert.match(result.packet.extra.leadResult, /:END$/u);
+  assert.match(result.packet.extra.helperFindings, /:END$/u);
+});
+
+test('provider prompt caps apply to shared context without cutting serialized context a second time', () => {
+  const maxBytes = 4 * 1024;
+  const context = {
+    payload: 'x'.repeat(maxBytes - 256),
+    tailSentinel: 'CONTEXT_TAIL_SURVIVES',
+  };
+
+  const claudePrompt = buildClaudePrompt('Review it.', context, maxBytes);
+  const codexPrompt = buildCodexPrompt('Review it.', { context, maxBytes });
+
+  for (const prompt of [claudePrompt, codexPrompt]) {
+    assert.match(prompt, /CONTEXT_TAIL_SURVIVES/u);
+    assert.doesNotMatch(prompt, /\[context truncated\]/u);
+    assert.match(prompt, /Question for you:/u);
+  }
 });
 
 test('three large supermode handoffs retain a bounded artifact from every stage', () => {

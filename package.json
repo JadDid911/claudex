@@ -1,5 +1,5 @@
 {
-  "name": "claudex",
+  "name": "@jaddid911/claudex",
   "version": "0.4.0",
   "description": "One visible, delegation-first terminal room for Codex and Claude.",
   "author": "JadDid911",
@@ -12,6 +12,21 @@
     "url": "https://github.com/JadDid911/claudex/issues"
   },
   "type": "module",
+  "files": [
+    "bin",
+    "src",
+    "docs",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    "./config": "./src/config.js",
+    "./orchestrator": "./src/orchestrator.js",
+    "./providers": "./src/providers/index.js"
+  },
   "bin": {
     "claudex": "./bin/claudex.js"
   },
@@ -20,10 +35,17 @@
     "demo": "node ./bin/claudex.js --demo",
     "check": "node ./scripts/check.js",
     "test": "node --test --test-reporter spec \"test/**/*.test.js\"",
-    "verify": "npm run check && npm test"
+    "verify": "npm run check && npm test",
+    "pack:dry-run": "npm pack --dry-run --json",
+    "verify:release": "npm run check && npm test",
+    "prepack": "npm run verify:release",
+    "prepublishOnly": "npm run verify:release"
   },
   "engines": {
     "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "claudex",
@@ -33,6 +55,5 @@
     "delegation",
     "tui"
   ],
-  "license": "MIT",
-  "private": true
+  "license": "MIT"
 }
