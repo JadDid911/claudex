@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { buildCommandPalette } from '../../src/ui/command-palette.js';
+import { parseInputLine } from '../../src/ui/commands.js';
 
 const context = {
   roomId: 'room-42',
@@ -78,12 +79,38 @@ test('model palette drills into provider and locally available models', () => {
 
   assert.deepEqual(providers.items.map((item) => item.label), ['codex', 'claude']);
   assert.deepEqual(models.items.map((item) => item.label), ['gpt-current', 'default', 'gpt-fast', 'gpt-5.6-sol']);
-  assert.deepEqual(filtered.items.map((item) => item.value), ['/model codex gpt-fast']);
+  assert.deepEqual(filtered.items.map((item) => item.value), ['/model codex gpt-fast ']);
   assert.deepEqual(claudeFamily.items.map((item) => item.value), [
-    '/model claude opus',
-    '/model claude claude-opus-5',
-    '/model claude claude-opus-4-5',
+    '/model claude opus ',
+    '/model claude claude-opus-5 ',
+    '/model claude claude-opus-4-5 ',
   ]);
+});
+
+test('model picker continues into provider effort without leaving auto mode', () => {
+  const modelChoices = buildCommandPalette('/model codex ', context);
+  const effortChoices = buildCommandPalette('/model codex gpt-5.6-sol ', context);
+
+  assert.equal(context.delegationMode, 'auto');
+  assert.ok(modelChoices.items.every((item) => item.value.endsWith(' ')));
+  assert.deepEqual(
+    effortChoices.items.map((item) => item.value),
+    [
+      '/model codex gpt-5.6-sol high',
+      '/model codex gpt-5.6-sol xhigh',
+      '/model codex gpt-5.6-sol max',
+      '/model codex gpt-5.6-sol ultra',
+      '/model codex gpt-5.6-sol default',
+    ],
+  );
+  assert.deepEqual(parseInputLine('/model codex gpt-5.6-sol ultra'), {
+    kind: 'command',
+    name: 'model',
+    provider: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+    raw: '/model codex gpt-5.6-sol ultra',
+  });
 });
 
 test('weight and resume palettes expose contextual choices', () => {

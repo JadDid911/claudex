@@ -1560,6 +1560,19 @@ test('model and effort commands persist provider selections across room restarts
   assert.equal(harness.claude.effort, 'max');
 });
 
+test('combined model picker selection saves effort without changing auto routing', async (context) => {
+  const harness = await createHarness(context, {}, { persistConfig: true });
+
+  await harness.app.dispatch(parseInputLine('/model codex gpt-5.6-sol ultra'));
+
+  const loaded = await loadConfig({ storageRoot: harness.config.storageRoot });
+  assert.equal(harness.app.store.state.delegationMode, 'auto');
+  assert.equal(loaded.codex.model, 'gpt-5.6-sol');
+  assert.equal(loaded.codex.effort, 'ultra');
+  assert.equal(harness.codex.model, 'gpt-5.6-sol');
+  assert.equal(harness.codex.effort, 'ultra');
+});
+
 test('concurrent dispatch is rejected while an active turn owns the lease', async (context) => {
   const harness = await createHarness(context, {
     codex: { waitForAbort: true },

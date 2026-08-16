@@ -55,6 +55,9 @@ const context = {
   },
 };
 
+const HIDE_CURSOR = '\u001B[?25l';
+const SHOW_CURSOR = '\u001B[?25h';
+
 async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
 }
@@ -466,6 +469,51 @@ test('busy animation follows provider activity through completion and clears its
 
   await prompt.stop();
   assert.equal(clearCount, 1);
+});
+
+test('busy repaints keep the terminal caret hidden until it returns to the input row', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  let timerCallback;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    isBusy: () => true,
+    getContext: () => ({
+      ...context,
+      activeProcess: 'codex execute (turn-9)',
+      activeStage: 'execute',
+    }),
+    setAnimationTimer(callback) {
+      timerCallback = callback;
+      return { unref() {} };
+    },
+    clearAnimationTimer() {},
+  });
+
+  await prompt.start();
+  const repaintStart = output.writes.length;
+  timerCallback();
+  const repaintWrites = output.writes.slice(repaintStart);
+  let cursorVisible = true;
+  let visibleMovement = false;
+
+  for (const chunk of repaintWrites) {
+    if (chunk.includes(HIDE_CURSOR)) cursorVisible = false;
+    if (/\u001B\[[0-9;]*[ABCDGHfK]/u.test(chunk) && cursorVisible) {
+      visibleMovement = true;
+    }
+    if (chunk.includes(SHOW_CURSOR)) cursorVisible = true;
+  }
+
+  assert.equal(repaintWrites[0], HIDE_CURSOR);
+  assert.equal(repaintWrites.at(-1), SHOW_CURSOR);
+  assert.equal(visibleMovement, false);
+  assert.equal(cursorVisible, true);
+
+  await prompt.stop();
+  assert.equal(output.writes.at(-1), SHOW_CURSOR);
 });
 
 test('interactive prompt keeps provider models and shared context in the footer below the composer', async () => {

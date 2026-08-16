@@ -13,6 +13,8 @@ import { sanitizeVisibleText } from './renderer.js';
 const CYAN = '\u001B[36m';
 const DIM = '\u001B[2m';
 const RESET = '\u001B[0m';
+const HIDE_CURSOR = '\u001B[?25l';
+const SHOW_CURSOR = '\u001B[?25h';
 const LOADING_FRAMES = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
 const MAX_MENU_ITEMS = 7;
 const DEFAULT_PROMPT_LABEL = 'claudex';
@@ -131,12 +133,16 @@ class InteractivePrompt {
 
   hide() {
     if (!this.visible) return;
-    this.clearFrame();
+    this.withHiddenCursor(() => this.clearFrame());
     this.visible = false;
   }
 
   render() {
     if (!this.visible) return;
+    this.withHiddenCursor(() => this.renderFrame());
+  }
+
+  renderFrame() {
     this.clearFrame();
 
     const reportedColumns = Number(this.output.columns);
@@ -187,6 +193,17 @@ class InteractivePrompt {
     this.renderedInputIndex = inputIndex;
     this.renderedCursorColumn = Math.max(0, cursorColumn);
     this.syncAnimationTimer();
+  }
+
+  withHiddenCursor(callback) {
+    let cursorHidden = false;
+    try {
+      this.output.write(HIDE_CURSOR);
+      cursorHidden = true;
+      return callback();
+    } finally {
+      if (cursorHidden) this.output.write(SHOW_CURSOR);
+    }
   }
 
   async handleKeypress(text, key = {}) {

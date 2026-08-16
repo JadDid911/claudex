@@ -823,6 +823,9 @@ export class RoomApplication {
     } else if (command.name === 'model') {
       if (command.provider) {
         await this.updateModel(command.provider, command.model);
+        if (Object.hasOwn(command, 'effort')) {
+          await this.updateEffort(command.provider, command.effort);
+        }
       } else {
         this.emitStatus(this.getStatus());
       }

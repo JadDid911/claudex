@@ -197,8 +197,35 @@ function buildModelPalette(argumentText, context) {
   }
 
   const provider = parsed.tokens[0]?.toLowerCase();
-  if (!PROVIDER_NAMES.includes(provider) || parsed.tokens.length > 2) {
+  if (!PROVIDER_NAMES.includes(provider) || parsed.tokens.length > 3) {
     return buildProviderPalette('model', provider ?? '', context);
+  }
+
+  if (parsed.tokens.length === 3 || (parsed.tokens.length === 2 && parsed.trailingSpace)) {
+    const model = parsed.tokens[1];
+    const fragment = parsed.tokens[2] ?? '';
+    const status = providerStatus(context, provider);
+    const items = effortChoicesForProvider(context, provider, model)
+      .filter((choice) => choice.value.startsWith(fragment.toLowerCase()))
+      .map((choice) => ({
+        id: `model-effort:${provider}:${model}:${choice.value}`,
+        label: choice.value,
+        detail: choice.value === String(status?.effort ?? '')
+          ? 'Current provider-wide effort.'
+          : choice.description,
+        value: `/model ${provider} ${model} ${choice.value}`,
+      }));
+
+    if ('default'.startsWith(fragment.toLowerCase())) {
+      items.push({
+        id: `model-effort:${provider}:${model}:default`,
+        label: 'default',
+        detail: 'Use the provider default effort.',
+        value: `/model ${provider} ${model} default`,
+      });
+    }
+
+    return palette(`${provider.toUpperCase()} ${model} effort`, dedupePaletteItems(items));
   }
 
   const fragment = parsed.tokens[1] ?? '';
@@ -216,7 +243,7 @@ function buildModelPalette(argumentText, context) {
       id: `model:${provider}:${model.id}`,
       label: model.id,
       detail: model.description ?? 'Model selection.',
-      value: `/model ${provider} ${model.id}`,
+      value: `/model ${provider} ${model.id} `,
     }));
 
   if (fragment && items.length === 0) {
@@ -224,7 +251,7 @@ function buildModelPalette(argumentText, context) {
       id: `model:${provider}:custom`,
       label: fragment,
       detail: 'Use this custom model ID.',
-      value: `/model ${provider} ${fragment}`,
+      value: `/model ${provider} ${fragment} `,
     });
   }
 

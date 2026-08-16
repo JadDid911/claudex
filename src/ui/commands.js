@@ -267,10 +267,10 @@ export function parseInputLine(input) {
       };
     }
 
-    const [targetToken, modelToken, ...extra] = rest;
+    const [targetToken, modelToken, effortToken, ...extra] = rest;
     const target = targetToken?.toLowerCase();
     if (!target || !PROVIDER_TARGETS.has(target) || !modelToken || extra.length > 0) {
-      return commandError('Usage: /model <codex|claude> <model|default>');
+      return commandError('Usage: /model <codex|claude> <model|default> [effort|default]');
     }
 
     const model = ['default', 'null'].includes(modelToken.toLowerCase()) ? null : modelToken;
@@ -278,11 +278,21 @@ export function parseInputLine(input) {
       return commandError('Model IDs must be 1-128 characters without spaces or control characters.');
     }
 
+    const effort = effortToken == null
+      ? undefined
+      : ['default', 'null'].includes(effortToken.toLowerCase())
+        ? null
+        : normalizeProviderEffort(target, effortToken, null);
+    if (effortToken != null && effort == null && !['default', 'null'].includes(effortToken.toLowerCase())) {
+      return commandError('Usage: /model <codex|claude> <model|default> [effort|default]');
+    }
+
     return {
       kind: 'command',
       name,
       provider: target,
       model,
+      ...(effortToken == null ? {} : { effort }),
       raw: input,
     };
   }
