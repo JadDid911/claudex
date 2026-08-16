@@ -12,6 +12,7 @@ import {
   normalizeConfig,
   saveConfig,
 } from '../src/config.js';
+import { getDefaultStorageRoot } from '../src/core/store.js';
 
 function createEmptyStageProfiles() {
   return {
@@ -43,10 +44,7 @@ test('default configuration stays non-secret and uses safe provider profiles', (
   const env = process.platform === 'win32'
     ? { LOCALAPPDATA: stateRoot }
     : { XDG_STATE_HOME: stateRoot };
-  const storageRoot = path.join(
-    stateRoot,
-    process.platform === 'win32' ? 'codex-claude-room' : 'claudex',
-  );
+  const storageRoot = getDefaultStorageRoot(env);
   const config = createDefaultConfig({ env });
 
   assert.equal(config.storageRoot, storageRoot);
