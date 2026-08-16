@@ -31,11 +31,13 @@ class FakeOutput extends EventEmitter {
     this.columns = 100;
     this.text = '';
     this.writes = [];
+    this.records = [];
   }
 
   write(chunk) {
     this.text += chunk;
     this.writes.push(String(chunk));
+    this.records.push({ chunk: String(chunk), columns: this.columns });
     return true;
   }
 }
@@ -78,19 +80,159 @@ function cursorRow(output) {
   return row;
 }
 
+function emulateWrappedTerminal(records) {
+  let columns = Math.max(1, Number(records[0]?.columns) || 80);
+  let rows = [{ cells: [], soft: false }];
+  let row = 0;
+  let column = 0;
+  let pendingWrap = false;
+
+  const ensureRow = (index, soft = false) => {
+    while (rows.length <= index) rows.push({ cells: [], soft });
+    return rows[index];
+  };
+  const rowText = (entry) => {
+    const length = entry.cells.length;
+    let value = '';
+    for (let index = 0; index < length; index += 1) value += entry.cells[index] ?? ' ';
+    return value;
+  };
+  const resize = (nextColumns) => {
+    const width = Math.max(1, Number(nextColumns) || columns);
+    if (width === columns) return;
+
+    const groups = [];
+    let current = null;
+    let cursorGroup = 0;
+    let cursorOffset = column;
+    for (let index = 0; index < rows.length; index += 1) {
+      if (!current || !rows[index].soft) {
+        current = { rows: [], text: '' };
+        groups.push(current);
+      }
+      current.rows.push(index);
+      if (index === row) {
+        cursorGroup = groups.length - 1;
+        cursorOffset = current.text.length + column;
+      }
+      const continues = Boolean(rows[index + 1]?.soft);
+      const text = rowText(rows[index]);
+      current.text += continues ? text.padEnd(columns) : text;
+    }
+
+    const nextRows = [];
+    let nextCursorRow = 0;
+    let nextCursorColumn = 0;
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+      const group = groups[groupIndex];
+      const material = group.text || '';
+      const chunks = material.length > 0
+        ? Array.from({ length: Math.ceil(material.length / width) }, (_, index) => (
+            material.slice(index * width, (index + 1) * width)
+          ))
+        : [''];
+      const groupStart = nextRows.length;
+      for (let index = 0; index < chunks.length; index += 1) {
+        nextRows.push({ cells: [...chunks[index]], soft: index > 0 });
+      }
+      if (groupIndex === cursorGroup) {
+        nextCursorRow = groupStart + Math.floor(cursorOffset / width);
+        nextCursorColumn = cursorOffset % width;
+        if (nextCursorRow >= nextRows.length) {
+          nextRows.push({ cells: [], soft: true });
+        }
+      }
+    }
+
+    rows = nextRows;
+    row = nextCursorRow;
+    column = nextCursorColumn;
+    columns = width;
+    pendingWrap = false;
+    ensureRow(row);
+  };
+
+  const moveVertical = (amount) => {
+    row = Math.max(0, row + amount);
+    ensureRow(row);
+    pendingWrap = false;
+  };
+
+  for (const record of records) {
+    resize(record.columns);
+    const tokens = record.chunk.match(/\u001B\[[0-?]*[ -/]*[@-~]|\r\n|[\r\n]|[^\u001B\r\n]/gu) ?? [];
+    for (const token of tokens) {
+      if (token === '\r\n') {
+        column = 0;
+        pendingWrap = false;
+        row += 1;
+        ensureRow(row).soft = false;
+        continue;
+      }
+      if (token === '\r') {
+        column = 0;
+        pendingWrap = false;
+        continue;
+      }
+      if (token === '\n') {
+        row += 1;
+        ensureRow(row).soft = false;
+        pendingWrap = false;
+        continue;
+      }
+      if (token.startsWith('\u001B[')) {
+        const match = token.match(/^\u001B\[([0-9;?]*)([@-~])$/u);
+        if (!match) continue;
+        const amount = Number(match[1].split(';')[0]) || 1;
+        if (match[2] === 'A') moveVertical(-amount);
+        if (match[2] === 'B') moveVertical(amount);
+        if (match[2] === 'C') column += amount;
+        if (match[2] === 'D') column = Math.max(0, column - amount);
+        if (match[2] === 'G') column = Math.max(0, amount - 1);
+        if (match[2] === 'K') {
+          rows[row].cells = [];
+          rows[row].soft = false;
+        }
+        pendingWrap = false;
+        continue;
+      }
+
+      if (pendingWrap) {
+        row += 1;
+        ensureRow(row).soft = true;
+        column = 0;
+        pendingWrap = false;
+      }
+      const currentRow = ensureRow(row);
+      currentRow.cells[column] = token;
+      if (column === columns - 1) pendingWrap = true;
+      else column += 1;
+    }
+  }
+
+  return {
+    columns,
+    cursorRow: row,
+    cursorColumn: column,
+    lines: rows.map((entry) => rowText(entry).trimEnd()),
+  };
+}
+
 function latestPromptFrame(output) {
   return output.writes.findLast((chunk) => chunk.includes('  › ')) ?? '';
 }
 
-function startupGraphicFacts(output) {
-  const frame = sanitizeVisibleText(latestPromptFrame(output));
-  const inputIndex = frame.indexOf('  › ');
-  const beforeInput = inputIndex < 0 ? '' : frame.slice(0, inputIndex);
+function composerFacts(output) {
+  const lines = sanitizeVisibleText(latestPromptFrame(output)).split(/\r?\n/u);
+  const inputIndex = lines.findIndex((line) => line.startsWith('  › '));
+  const fullWidthRule = '─'.repeat(output.columns);
   return {
-    hasProduct: /CLAUDEX/u.test(beforeInput),
-    hasProviders: /CODEX/u.test(beforeInput) && /CLAUDE/u.test(beforeInput),
-    hasRail: /[│┃║┆┊]/u.test(beforeInput),
-    hasThreeLineGraphic: beforeInput.split(/\r?\n/u).filter(Boolean).length >= 4,
+    lines,
+    inputIndex,
+    upperRule: lines[inputIndex - 1] ?? '',
+    lowerRule: lines[inputIndex + 1] ?? '',
+    footer: lines[inputIndex + 2] ?? '',
+    fullWidthRule,
   };
 }
 
@@ -311,7 +453,6 @@ test('busy animation follows provider activity through completion and clears its
   });
 
   await prompt.start();
-  for (let frame = 0; frame < 7; frame += 1) timerCallback();
   output.text = '';
   timerCallback();
   assert.match(visibleText(output), /waiting for CLAUDE execute output/u);
@@ -327,7 +468,7 @@ test('busy animation follows provider activity through completion and clears its
   assert.equal(clearCount, 1);
 });
 
-test('interactive prompt shows current provider models and the shared context cap in the live room prompt', async () => {
+test('interactive prompt keeps provider models and shared context in the footer below the composer', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const prompt = createInteractivePrompt({
@@ -339,12 +480,11 @@ test('interactive prompt shows current provider models and the shared context ca
 
   await prompt.start();
 
-  const promptLine = sanitizeVisibleText(latestPromptFrame(output))
-    .split(/\r?\n/u)
-    .find((line) => /CODEX default/u.test(line)) ?? '';
-  assert.match(promptLine, /CODEX default/u);
-  assert.match(promptLine, /CLAUDE sonnet/u);
-  assert.match(promptLine, /ctx 64 KiB/u);
+  const { inputIndex, footer, lines } = composerFacts(output);
+  assert.match(footer, /CODEX default/u);
+  assert.match(footer, /CLAUDE sonnet/u);
+  assert.match(footer, /ctx 64 KiB/u);
+  assert.doesNotMatch(lines.slice(0, inputIndex).join('\n'), /CODEX|CLAUDE|ctx 64 KiB/u);
 
   await prompt.stop();
 });
@@ -506,21 +646,14 @@ test('interactive prompt requires a raw-capable TTY input and TTY output', () =>
 test('ordinary raw TTY characters repaint in place without line-feed scrolling', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
-  let animationTick;
   const prompt = createInteractivePrompt({
     input,
     output,
     color: false,
-    setAnimationTimer(callback) {
-      animationTick = callback;
-      return { unref() {} };
-    },
-    clearAnimationTimer() {},
   });
 
   try {
     await prompt.start();
-    for (let frame = 0; frame < 7; frame += 1) animationTick();
     const initialRow = cursorRow(output.text);
 
     for (const character of 'abc') {
@@ -540,17 +673,43 @@ test('ordinary raw TTY characters repaint in place without line-feed scrolling',
   }
 });
 
-test('startup reveal stays within a narrow pane without wrapped graphic rows', async () => {
+test('live composer uses full-width rules and a footer below the input at 32 columns', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
-  output.columns = 18;
-  let animationTick;
+  output.columns = 32;
   const prompt = createInteractivePrompt({
     input,
     output,
     color: false,
-    setAnimationTimer(callback) {
-      animationTick = callback;
+    getContext: () => ({
+      ...context,
+      roomId: '15865433205Z',
+      delegationMode: 'auto',
+    }),
+  });
+
+  try {
+    await prompt.start();
+    const facts = composerFacts(output);
+    assert.equal(facts.upperRule, facts.fullWidthRule);
+    assert.equal(facts.lowerRule, facts.fullWidthRule);
+    assert.match(facts.footer, /15865433205Z.*auto/u);
+    assert.ok(facts.lines.every((line) => line.length <= output.columns));
+  } finally {
+    await prompt.stop();
+  }
+});
+
+test('idle prompt starts no animation timer or moving provider rail', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  let timerStarts = 0;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    setAnimationTimer() {
+      timerStarts += 1;
       return { unref() {} };
     },
     clearAnimationTimer() {},
@@ -558,44 +717,15 @@ test('startup reveal stays within a narrow pane without wrapped graphic rows', a
 
   try {
     await prompt.start();
-    const startupFrame = sanitizeVisibleText(latestPromptFrame(output));
-    assert.doesNotMatch(startupFrame, /[\u256d\u256e\u2570\u256f]/u);
-    assert.ok(startupFrame.split(/\r?\n/u).every((line) => line.length <= output.columns));
-
-    for (let frame = 0; frame < 7; frame += 1) animationTick();
-    const initialRow = cursorRow(output.text);
-    input.emit('keypress', 'a', { name: undefined });
-
-    assert.equal(cursorRow(output.text), initialRow);
+    const visible = sanitizeVisibleText(latestPromptFrame(output));
+    assert.equal(timerStarts, 0);
+    assert.doesNotMatch(visible, /one room · two models|◆━|━◆/u);
   } finally {
     await prompt.stop();
   }
 });
 
-test('empty Enter and Escape dismiss the startup reveal with an immediate repaint', async () => {
-  for (const name of ['enter', 'escape']) {
-    const input = new FakeInput();
-    const output = new FakeOutput();
-    const prompt = createInteractivePrompt({ input, output, color: false });
-
-    try {
-      await prompt.start();
-      const writesBeforeDismissal = output.writes.length;
-      input.emit('keypress', undefined, { name });
-      await settle();
-
-      assert.ok(output.writes.length > writesBeforeDismissal, `${name} should repaint`);
-      assert.doesNotMatch(
-        sanitizeVisibleText(latestPromptFrame(output)),
-        /CLAUDEX|one room \u00b7 two models/u,
-      );
-    } finally {
-      await prompt.stop();
-    }
-  }
-});
-
-test('reduced-motion startup renders the static final branded graphic without a timer', async () => {
+test('reduced-motion keeps the same static composer and starts no idle timer', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   let timerStarts = 0;
@@ -613,17 +743,10 @@ test('reduced-motion startup renders the static final branded graphic without a 
 
   try {
     await prompt.start();
-
-    assert.deepEqual({
-      timerStarts,
-      ...startupGraphicFacts(output),
-    }, {
-      timerStarts: 0,
-      hasProduct: true,
-      hasProviders: true,
-      hasRail: true,
-      hasThreeLineGraphic: true,
-    });
+    const facts = composerFacts(output);
+    assert.equal(timerStarts, 0);
+    assert.equal(facts.upperRule, facts.fullWidthRule);
+    assert.equal(facts.lowerRule, facts.fullWidthRule);
   } finally {
     await prompt.stop();
   }
@@ -635,13 +758,12 @@ test('interactive prompt defaults to the claudex product label without room cont
   const prompt = createInteractivePrompt({ input, output, color: false });
 
   await prompt.start();
-  const lines = sanitizeVisibleText(latestPromptFrame(output)).split(/\r?\n/u);
-  assert.ok(lines.includes('claudex'));
-  assert.match(lines.at(-1) ?? '', /^\s+›\s*$/u);
+  const { footer } = composerFacts(output);
+  assert.match(footer, /claudex/u);
   await prompt.stop();
 });
 
-test('interactive prompt shows compact current workflow context in the live room prompt', async () => {
+test('interactive prompt shows compact current routing context in the footer below the composer', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   output.columns = 40;
@@ -658,13 +780,201 @@ test('interactive prompt shows compact current workflow context in the live room
   });
 
   await prompt.start();
-  const promptLine = sanitizeVisibleText(latestPromptFrame(output))
-    .split(/\r?\n/u)
-    .find((line) => /b197b276…378Z/u.test(line)) ?? '';
-  assert.match(promptLine, /b197b276…378Z/u);
-  assert.match(promptLine, /\bux→CLAUDE\b/u);
-  assert.ok(promptLine.length <= output.columns);
+  const { footer } = composerFacts(output);
+  assert.match(footer, /b197b276…378Z/u);
+  assert.match(footer, /\bux→CLAUDE\b/u);
+  assert.ok(footer.length <= output.columns);
   await prompt.stop();
+});
+
+test('active supermode workflow overrides auto delegation in the footer below the composer', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 120;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    getContext: () => ({
+      roomId: '15865433205Z',
+      workflow: 'supermode',
+      delegationMode: 'auto',
+      contextCapBytes: 64 * 1024,
+      providers: [
+        { name: 'codex', model: 'gpt-5.6-sol', modelContextTokens: 272_000 },
+        { name: 'claude', model: 'opus', modelContextTokens: 1_000_000 },
+      ],
+    }),
+  });
+
+  try {
+    await prompt.start();
+    const {
+      footer,
+      inputIndex,
+      lines,
+      upperRule,
+      lowerRule,
+      fullWidthRule,
+    } = composerFacts(output);
+    assert.equal(upperRule, fullWidthRule);
+    assert.equal(lowerRule, fullWidthRule);
+    assert.match(
+      footer,
+      /15865433205Z · supermode · CODEX gpt-5\.6-sol \(ctx 272K\) · CLAUDE opus \(ctx 1M\) · ctx 64 KiB/u,
+    );
+    assert.doesNotMatch(footer, /· auto ·/u);
+    assert.doesNotMatch(lines.slice(0, inputIndex).join('\n'), /CODEX|CLAUDE|272K|1M|64 KiB/u);
+  } finally {
+    await prompt.stop();
+  }
+});
+
+test('78-column composer wraps complete supermode metadata only below the lower rule', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 78;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    getContext: () => ({
+      roomId: '15865433205Z',
+      workflow: 'supermode',
+      delegationMode: 'auto',
+      contextCapBytes: 64 * 1024,
+      providers: [
+        { name: 'codex', model: 'gpt-5.6-sol', modelContextTokens: 272_000 },
+        { name: 'claude', model: 'opus', modelContextTokens: 1_000_000 },
+      ],
+    }),
+  });
+
+  try {
+    await prompt.start();
+    const { lines, inputIndex, fullWidthRule } = composerFacts(output);
+    const lowerRuleIndex = lines.indexOf(fullWidthRule, inputIndex + 1);
+    const footerLines = lines.slice(lowerRuleIndex + 1).filter(Boolean);
+    const footer = footerLines.join(' ');
+
+    assert.ok(lowerRuleIndex > inputIndex, lines.join('\n'));
+    assert.match(footer, /15865433205Z/u);
+    assert.match(footer, /supermode/u);
+    assert.match(footer, /CODEX gpt-5\.6-sol \(ctx 272K\)/u);
+    assert.match(footer, /CLAUDE opus \(ctx 1M\)/u);
+    assert.match(footer, /ctx 64 KiB/u);
+    assert.ok(footerLines.every((line) => line.length <= output.columns), footerLines.join('\n'));
+    assert.doesNotMatch(
+      lines.slice(0, inputIndex).join('\n'),
+      /15865433205Z|supermode|CODEX|CLAUDE|272K|1M|64 KiB/u,
+    );
+  } finally {
+    await prompt.stop();
+  }
+});
+
+test('clarification footer retains its owner and normal supermode metadata below the composer', async () => {
+  for (const columns of [78, 120]) {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = columns;
+    const prompt = createInteractivePrompt({
+      input,
+      output,
+      color: false,
+      getContext: () => ({
+        roomId: '15865433205Z',
+        workflow: 'supermode',
+        delegationMode: 'auto',
+        contextCapBytes: 64 * 1024,
+        providers: [
+          { name: 'codex', model: 'gpt-5.6-sol', modelContextTokens: 272_000 },
+          { name: 'claude', model: 'opus', modelContextTokens: 1_000_000 },
+        ],
+        pendingClarifications: [{
+          id: 'turn-9-claude-review',
+          provider: 'claude',
+          model: 'opus',
+          effort: 'max',
+          question: 'Which target should I review?',
+          options: ['The current workspace', 'A separate folder'],
+        }],
+      }),
+    });
+
+    try {
+      await prompt.start();
+      const { lines, inputIndex, fullWidthRule } = composerFacts(output);
+      const lowerRuleIndex = lines.indexOf(fullWidthRule, inputIndex + 1);
+      const contentBelow = lines.slice(lowerRuleIndex + 1).filter(Boolean);
+      const footer = contentBelow.join(' ');
+
+      assert.ok(lowerRuleIndex > inputIndex, `${columns}: ${lines.join('\n')}`);
+      assert.ok(contentBelow.some((line) => /^CLAUDE asks(?:\s|$)/u.test(line)), footer);
+      assert.match(footer, /15865433205Z/u);
+      assert.match(footer, /supermode/u);
+      assert.match(footer, /CODEX gpt-5\.6-sol \(ctx 272K\)/u);
+      assert.match(footer, /CLAUDE opus \(ctx 1M\)/u);
+      assert.match(footer, /ctx 64 KiB/u);
+      assert.ok(contentBelow.every((line) => line.length <= columns), footer);
+      assert.doesNotMatch(
+        lines.slice(0, inputIndex).join('\n'),
+        /CLAUDE asks|15865433205Z|supermode|CODEX|CLAUDE|272K|1M|64 KiB/u,
+      );
+    } finally {
+      await prompt.stop();
+    }
+  }
+});
+
+test('resizing through a wrapped narrow frame leaves one clean wide composer and stable input cursor', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 120;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    getContext: () => ({
+      roomId: '15865433205Z',
+      workflow: 'supermode',
+      delegationMode: 'auto',
+      contextCapBytes: 64 * 1024,
+      providers: [
+        { name: 'codex', model: 'gpt-5.6-sol', modelContextTokens: 272_000 },
+        { name: 'claude', model: 'opus', modelContextTokens: 1_000_000 },
+      ],
+    }),
+  });
+
+  try {
+    await prompt.start();
+    output.columns = 40;
+    output.emit('resize');
+    output.columns = 120;
+    output.emit('resize');
+    input.emit('keypress', 'abc', { name: undefined });
+    await settle();
+
+    const terminal = emulateWrappedTerminal(output.records);
+    const expectedLines = sanitizeVisibleText(latestPromptFrame(output))
+      .split(/\r?\n/u)
+      .map((line) => line.trimEnd())
+      .filter(Boolean);
+    const visibleLines = terminal.lines.filter(Boolean);
+    const inputRow = terminal.lines.findIndex((line) => line.startsWith('  › abc'));
+    const currentRule = '─'.repeat(output.columns);
+
+    assert.deepEqual(visibleLines, expectedLines);
+    assert.ok(inputRow >= 0, terminal.lines.join('\n'));
+    assert.equal(terminal.cursorRow, inputRow);
+    assert.equal(terminal.cursorColumn, '  › abc'.length);
+    assert.equal(visibleLines.filter((line) => line === currentRule).length, 2);
+    assert.equal(terminal.columns, output.columns);
+    assert.doesNotMatch(output.text, /(?<!\r)\n/u);
+  } finally {
+    await prompt.stop();
+  }
 });
 
 test('slash palette keeps only the selected command detail visible on narrow terminals', async () => {

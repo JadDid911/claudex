@@ -84,18 +84,6 @@ function latestPromptFrame(output) {
   return output.writes.findLast((chunk) => chunk.includes('  › ')) ?? '';
 }
 
-function startupGraphicFacts(output) {
-  const frame = sanitizeVisibleText(latestPromptFrame(output));
-  const inputIndex = frame.indexOf('  › ');
-  const beforeInput = inputIndex < 0 ? '' : frame.slice(0, inputIndex);
-  return {
-    hasProduct: /CLAUDEX/u.test(beforeInput),
-    hasProviders: /CODEX/u.test(beforeInput) && /CLAUDE/u.test(beforeInput),
-    hasRail: /[│┃║┆┊]/u.test(beforeInput),
-    hasThreeLineGraphic: beforeInput.split(/\r?\n/u).filter(Boolean).length >= 4,
-  };
-}
-
 test('parseArgv defaults workspace to cwd and handles resume', () => {
   assert.deepEqual(parseArgv([], 'C:/repo'), {
     help: false,
@@ -427,11 +415,12 @@ test('runCli uses the TTY command picker and restores raw mode on exit', async (
   assert.doesNotMatch(stdout.read(), /\u001B\[(?:3[0-7]|90)m/u);
 });
 
-test('real TTY startup renders a branded reveal before the live input prompt', async () => {
+test('real TTY startup prints the persistent identity card before the static live composer', async () => {
   const stdin = new FakeTtyInput();
   const stdout = new FakeTtyOutput();
+  stdout.columns = 120;
   const stderr = createOutput(false);
-  let animationTick;
+  let animationTimers = 0;
 
   const runPromise = runCli({
     argv: ['--workspace', 'C:/repo'],
@@ -445,8 +434,8 @@ test('real TTY startup renders a branded reveal before the live input prompt', a
     interactivePromptFactory(options) {
       return createInteractivePrompt({
         ...options,
-        setAnimationTimer(callback) {
-          animationTick = callback;
+        setAnimationTimer() {
+          animationTimers += 1;
           return { unref() {} };
         },
         clearAnimationTimer() {},
@@ -457,15 +446,36 @@ test('real TTY startup renders a branded reveal before the live input prompt', a
         start() {
           return {
             roomId: 'room-tty-brand',
-            providers: [{ name: 'codex', status: 'available' }],
+            providers: [
+              {
+                name: 'codex',
+                status: 'available',
+                model: 'gpt-5.6-sol',
+                effort: 'ultra',
+                modelContextTokens: 272_000,
+              },
+              {
+                name: 'claude',
+                status: 'available',
+                model: 'opus',
+                effort: 'max',
+                modelContextTokens: 1_000_000,
+              },
+            ],
             routingMode: 'auto',
             safetyMode: 'single-writer',
+            contextCapBytes: 64 * 1024,
           };
         },
         getStatus() {
           return {
             roomId: 'room-tty-brand',
-            providers: [{ name: 'codex', model: 'default', weight: 1 }],
+            delegationMode: 'auto',
+            contextCapBytes: 64 * 1024,
+            providers: [
+              { name: 'codex', model: 'gpt-5.6-sol', modelContextTokens: 272_000, weight: 1 },
+              { name: 'claude', model: 'opus', modelContextTokens: 1_000_000, weight: 1 },
+            ],
           };
         },
         isBusy() { return false; },
@@ -477,21 +487,18 @@ test('real TTY startup renders a branded reveal before the live input prompt', a
 
   try {
     await new Promise((resolve) => setImmediate(resolve));
-    const initialFrame = sanitizeVisibleText(latestPromptFrame(stdout));
-    const initialFacts = startupGraphicFacts(stdout);
+    const visible = sanitizeVisibleText(stdout.read());
+    const inputIndex = visible.indexOf('  › ');
+    const cardIndex = visible.indexOf('CLAUDEX 1.2.3');
+    const frame = sanitizeVisibleText(latestPromptFrame(stdout));
 
-    stdout.writes = [];
-    animationTick();
-    const nextFrame = sanitizeVisibleText(latestPromptFrame(stdout));
-
-    assert.deepEqual(initialFacts, {
-      hasProduct: true,
-      hasProviders: true,
-      hasRail: true,
-      hasThreeLineGraphic: true,
-    });
-    assert.notEqual(nextFrame, initialFrame, 'expected the startup graphic to advance a frame');
-    assert.deepEqual(startupGraphicFacts(stdout), initialFacts);
+    assert.ok(cardIndex >= 0 && cardIndex < inputIndex, 'identity card should precede input');
+    assert.match(visible.slice(0, inputIndex), /CODEX.*gpt-5\.6-sol.*ultra.*available/iu);
+    assert.match(visible.slice(0, inputIndex), /CLAUDE.*opus.*max.*available/iu);
+    assert.match(visible.slice(0, inputIndex), /JadDid911.*github\.com\/JadDid911\/claudex/u);
+    assert.match(frame, /─{120}\r?\n  › \r?\n─{120}/u);
+    assert.equal(animationTimers, 0);
+    assert.doesNotMatch(frame, /one room · two models|◆━|━◆/u);
   } finally {
     stdin.emit('keypress', '/exit', { name: undefined });
     stdin.emit('keypress', undefined, { name: 'enter' });

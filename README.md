@@ -64,7 +64,7 @@ Non-TTY output stays deterministic for logs and automation.
 
 The interactive terminal keeps normal scrollback while compressing transient work into one animated activity line. Durable provider responses remain in distinct Codex and Claude colors, routine tool lifecycle events stay compact, and a second plain-text turn entered while work is active is queued until the current writer lease is released. `/cancel`, `Esc` on an empty busy prompt, and the first `Ctrl+C` stop active work; `/exit` discards queued turns and exits.
 
-Claudex opens with a short, interruptible terminal-native reveal. Set `CLAUDEX_REDUCED_MOTION=1` to keep the final branded frame static and disable prompt animation.
+Claudex opens with one durable, outlined identity card showing the Claudex version, both provider models and effort levels, availability, workspace, routing, context, safety policy, author, and repository. The card caps itself at 88 columns and reflows instead of dropping details in narrower panes. The live composer places the editable input between full-pane rules and keeps its room, active mode, provider models, and context footer below the input; that footer wraps into additional rows when needed. A pending clarification adds its provider ownership line without replacing those room details. Pane resizes redraw only this ephemeral composer region, leaving normal scrollback intact. Startup is static; set `CLAUDEX_REDUCED_MOTION=1` to disable the live prompt's transient working animation as well.
 
 ## Commands
 

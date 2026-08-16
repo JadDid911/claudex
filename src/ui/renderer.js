@@ -58,29 +58,8 @@ class TranscriptRenderer {
 
   renderStartup(snapshot = {}) {
     if (this.isTTY) {
-      const summary = [
-        sanitizeVisibleText(snapshot.version ?? '').trim(),
-        compactRoomId(snapshot.roomId),
-        sanitizeVisibleText(snapshot.routingMode ?? 'auto'),
-        sanitizeVisibleText(snapshot.workspace ?? process.cwd()),
-      ].filter(Boolean).join(' \u00b7 ');
-      const safety = compactSafetyLabel(snapshot.safetyMode);
-      const context = formatByteSize(snapshot.contextCapBytes);
-      const lines = [
-        summary,
-        `${formatCompactProviderSummary(snapshot.providers)}${context ? ` \u00b7 ctx ${context}` : ''} \u00b7 ${safety}`,
-      ];
-      const identity = [
-        sanitizeVisibleText(snapshot.author ?? '').trim(),
-        sanitizeVisibleText(snapshot.repository ?? '').trim(),
-      ].filter(Boolean).join(' \u00b7 ');
-      if (identity) {
-        lines.push(identity);
-      }
-      if (snapshot.resumeLabel) {
-        lines.push(sanitizeVisibleText(snapshot.resumeLabel));
-      }
-      this.writeRoomLines(lines.join('\n'), PRODUCT_HEADER);
+      const columns = Math.max(8, Number(this.output.columns) || 100);
+      this.writeIdentityCard(formatStartupIdentityCard(snapshot, columns, this.color));
       return;
     }
 
@@ -499,6 +478,23 @@ class TranscriptRenderer {
     this.atLineStart = true;
   }
 
+  writeIdentityCard(lines) {
+    this.suspendEphemeral();
+    this.flushPendingBodyStream();
+    if (!this.atLineStart) {
+      this.output.write('\n');
+    }
+    if (!this.firstBlock) {
+      this.output.write('\n');
+    }
+    for (const line of lines) {
+      this.output.write(`${line}\n`);
+    }
+    this.firstBlock = false;
+    this.blockKey = null;
+    this.atLineStart = true;
+  }
+
   writeProviderWarning(actor, body) {
     this.suspendEphemeral();
     const normalizedActor = normalizeActor(actor);
@@ -619,26 +615,107 @@ function formatProviderSummary(providers) {
     .join(', ');
 }
 
-function formatCompactProviderSummary(providers) {
-  if (!Array.isArray(providers) || providers.length === 0) return 'providers unknown';
-  return providers
-    .map((provider) => {
-      const name = sanitizeVisibleText(provider.name ?? 'provider').toUpperCase();
-      return [
-        `${name} ${providerState(provider)}`,
-        `model ${compactModelLabel(provider)}`,
-        `effort ${sanitizeVisibleText(provider.effort ?? 'default')}`,
-        `weight ${sanitizeVisibleText(provider.weight ?? 'n/a')}`,
-      ].join(' \u00b7 ');
-    })
-    .join(' \u00b7 ');
+function formatStartupIdentityCard(snapshot, columns, color) {
+  const width = Math.max(8, Math.min(88, Math.floor(columns)));
+  const contentWidth = Math.max(1, width - 4);
+  const version = singleLine(snapshot.version);
+  const context = formatByteSize(snapshot.contextCapBytes);
+  const content = [
+    ...wrapToWidth('▣  C × X · shared model room', contentWidth),
+  ];
+
+  const providers = Array.isArray(snapshot.providers) ? snapshot.providers : [];
+  if (providers.length === 0) {
+    content.push(...wrapToWidth('PROVIDERS · unknown', contentWidth));
+  } else {
+    for (const provider of providers) {
+      content.push(...formatIdentityProvider(provider, contentWidth));
+    }
+  }
+
+  content.push(...wrapToWidth(
+    `workspace · ${singleLine(snapshot.workspace ?? process.cwd())}`,
+    contentWidth,
+  ));
+  content.push(...wrapToWidth(
+    `room · ${singleLine(snapshot.roomId ?? 'pending')}`,
+    contentWidth,
+  ));
+  content.push(...wrapToWidth(
+    [
+      `route · ${singleLine(snapshot.routingMode ?? 'auto')}`,
+      context ? `context ${context}` : null,
+    ].filter(Boolean).join(' · '),
+    contentWidth,
+  ));
+  content.push(...wrapToWidth(
+    `safety · ${singleLine(snapshot.safetyMode ?? 'single-writer')}`,
+    contentWidth,
+  ));
+
+  const publicIdentity = [
+    singleLine(snapshot.author),
+    singleLine(snapshot.repository),
+  ].filter(Boolean).join(' · ');
+  if (publicIdentity) {
+    content.push(...wrapToWidth(publicIdentity, contentWidth));
+  }
+  if (snapshot.resumeLabel) {
+    content.push(...wrapToWidth(`resume · ${singleLine(snapshot.resumeLabel)}`, contentWidth));
+  }
+
+  const plainLines = [
+    formatIdentityBorder(
+      '╭',
+      '╮',
+      `${PRODUCT_HEADER}${version ? ` ${version}` : ''}`,
+      width,
+    ),
+    ...content.map((line) => `│ ${line.padEnd(contentWidth)} │`),
+    formatIdentityBorder('╰', '╯', '', width),
+  ];
+  if (!color) return plainLines;
+
+  return plainLines.map((line, index) => {
+    if (index === plainLines.length - 1) {
+      return `\u001B[90m${line}${RESET}`;
+    }
+    if (index === 0) {
+      const accentedTitle = line.replace(
+        /CLAUDEX(?:\s+\S+)?/u,
+        (title) => `\u001B[1;36m${title}\u001B[90m`,
+      );
+      return `\u001B[90m${accentedTitle}${RESET}`;
+    }
+    if (line.includes('C \u00d7 X')) return `\u001B[1;36m${line}${RESET}`;
+    if (line.includes(PRODUCT_HEADER)) return `\u001B[1;36m${line}${RESET}`;
+    if (/\bCODEX\b/u.test(line)) return applyColor('CODEX', line);
+    if (/\bCLAUDE\b/u.test(line)) return applyColor('CLAUDE', line);
+    return `\u001B[2m${line}${RESET}`;
+  });
 }
 
-function compactSafetyLabel(value) {
-  const safety = sanitizeVisibleText(value ?? 'single-writer');
-  if (/home workspace write-protected/iu.test(safety)) return 'single-writer \u00b7 home read-only';
-  if (/single-writer/iu.test(safety)) return 'single-writer';
-  return safety;
+function formatIdentityProvider(provider, width) {
+  const name = singleLine(provider?.name ?? 'provider').toUpperCase();
+  const model = compactModelLabel(provider);
+  const effort = singleLine(provider?.effort ?? 'default');
+  const status = singleLine(provider?.availability ?? provider?.status ?? 'unknown');
+  const facts = [name, model, effort, status];
+  const full = facts.join(' · ');
+  if (full.length <= width) return [full];
+
+  const identity = [name, model].join(' · ');
+  if (identity.length <= width) {
+    return [identity, ...wrapToWidth(`  ${effort} · ${status}`, width)];
+  }
+  return wrapToWidth(full, width);
+}
+
+function formatIdentityBorder(left, right, label, width) {
+  const innerWidth = Math.max(0, width - 2);
+  const visibleLabel = label ? ` ${singleLine(label)} ` : '';
+  const clippedLabel = visibleLabel.slice(0, innerWidth);
+  return `${left}${clippedLabel}${'─'.repeat(Math.max(0, innerWidth - clippedLabel.length))}${right}`;
 }
 
 function formatToolLine(event) {

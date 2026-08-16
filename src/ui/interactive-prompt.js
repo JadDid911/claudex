@@ -14,10 +14,8 @@ const CYAN = '\u001B[36m';
 const DIM = '\u001B[2m';
 const RESET = '\u001B[0m';
 const LOADING_FRAMES = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
-const STARTUP_FRAME_COUNT = 7;
 const MAX_MENU_ITEMS = 7;
 const DEFAULT_PROMPT_LABEL = 'claudex';
-const PROMPT_SUFFIX = ' \u203a ';
 const INPUT_PREFIX = '  \u203a ';
 const MENU_MARKER = '\u203a';
 const ELLIPSIS = '\u2026';
@@ -70,8 +68,9 @@ class InteractivePrompt {
     this.historyIndex = null;
     this.historyDraft = '';
     this.selectedIndex = 0;
-    this.renderedRows = 0;
-    this.rowsAboveInput = 0;
+    this.renderedFrameLines = [];
+    this.renderedInputIndex = -1;
+    this.renderedCursorColumn = 0;
     this.visible = false;
     this.started = false;
     this.pendingSubmissions = 0;
@@ -79,8 +78,6 @@ class InteractivePrompt {
     this.sigintArmed = false;
     this.previousRawMode = false;
     this.animationTimer = null;
-    this.startupVisible = false;
-    this.startupFrame = 0;
     this.busyFrame = 0;
     this.pendingSubmission = '';
     this.boundKeypress = (text, key) => {
@@ -110,7 +107,6 @@ class InteractivePrompt {
     this.input.setRawMode(true);
     this.input.resume?.();
     this.started = true;
-    this.beginStartupReveal();
     this.show();
     return true;
   }
@@ -157,24 +153,19 @@ class InteractivePrompt {
       this.selectedIndex = 0;
     }
 
-    const startupLines = this.startupVisible
-      ? formatStartupGraphic(this.startupFrame, columns, this.color)
-      : [];
-    const promptText = buildPromptText(context, columns);
-    const prompt = this.color ? `${CYAN}${promptText}${RESET}` : promptText;
-    const lines = [...startupLines, prompt];
-    const loadingLine = this.startupVisible
-      ? formatLoadingLine(startupLoadingMessage(this.startupFrame), this.startupFrame, columns, this.color)
-      : active
-        ? formatLoadingLine(
-            this.pendingSubmission || busyLoadingMessage(context),
-            this.busyFrame,
-            columns,
-            this.color,
-          )
-        : null;
-
-    lines.push(loadingLine ?? '');
+    const loadingLine = active
+      ? formatLoadingLine(
+          this.pendingSubmission || busyLoadingMessage(context),
+          this.busyFrame,
+          columns,
+          this.color,
+        )
+      : null;
+    const rule = '\u2500'.repeat(columns);
+    const visibleRule = this.color ? `${DIM}${rule}${RESET}` : rule;
+    const footerLines = buildPromptLines(context, columns)
+      .map((line) => this.color ? `${DIM}${line}${RESET}` : line);
+    const lines = loadingLine ? [loadingLine] : [];
 
     const window = inputWindow(this.buffer, this.cursor, columns - INPUT_PREFIX.length);
     const visibleInput = `${window.leading}${this.buffer.slice(window.start, window.end)}${window.trailing}`;
@@ -183,22 +174,23 @@ class InteractivePrompt {
       ? formatPalette(palette, this.selectedIndex, columns, this.color)
       : [];
 
-    lines.push(`${INPUT_PREFIX}${visibleInput}`);
+    const inputIndex = lines.length + 1;
+    lines.push(visibleRule, `${INPUT_PREFIX}${visibleInput}`, visibleRule, ...footerLines);
     for (const line of menuLines) {
       lines.push(line);
     }
     this.output.write(lines.join('\r\n'));
-    if (menuLines.length > 0) moveCursor(this.output, 0, -menuLines.length);
+    const rowsBelowInput = menuLines.length + footerLines.length + 1;
+    moveCursor(this.output, 0, -rowsBelowInput);
     cursorTo(this.output, Math.max(0, cursorColumn));
-    this.renderedRows = menuLines.length;
-    this.rowsAboveInput = startupLines.length + 2;
+    this.renderedFrameLines = lines.map((line) => sanitizeVisibleText(line));
+    this.renderedInputIndex = inputIndex;
+    this.renderedCursorColumn = Math.max(0, cursorColumn);
     this.syncAnimationTimer();
   }
 
   async handleKeypress(text, key = {}) {
     if (this.exiting) return;
-
-    if (this.startupVisible) this.dismissStartupReveal();
 
     if (key.ctrl && key.name === 'c') {
       await this.handleCancel();
@@ -313,7 +305,6 @@ class InteractivePrompt {
     this.historyDraft = '';
     this.selectedIndex = 0;
     this.sigintArmed = false;
-    this.startupVisible = false;
     this.startAnimationTimer();
     this.render();
 
@@ -516,39 +507,15 @@ class InteractivePrompt {
     return this.pendingSubmissions > 0 || Boolean(this.isBusy?.());
   }
 
-  beginStartupReveal() {
-    if (!this.started || this.startupVisible) return;
-    this.startupVisible = true;
-    this.startupFrame = this.reducedMotion ? STARTUP_FRAME_COUNT - 1 : 0;
-    if (!this.reducedMotion) this.startAnimationTimer();
-    this.render();
-  }
-
-  dismissStartupReveal() {
-    if (!this.startupVisible) return;
-    this.startupVisible = false;
-    this.startupFrame = 0;
-    if (!this.isActiveState()) this.stopAnimationTimer();
-    this.render();
-  }
-
   startAnimationTimer() {
-    if (this.reducedMotion || this.animationTimer || (!this.startupVisible && !this.isActiveState())) {
+    if (this.reducedMotion || this.animationTimer || !this.isActiveState()) {
       return;
     }
 
     this.animationTimer = this.setAnimationTimer(() => {
-      if (this.startupVisible) {
-        this.startupFrame += 1;
-        if (this.startupFrame >= STARTUP_FRAME_COUNT) {
-          this.startupVisible = false;
-          this.startupFrame = 0;
-        }
-      } else {
-        this.busyFrame += 1;
-      }
+      this.busyFrame += 1;
 
-      if (!this.startupVisible && !this.isActiveState()) {
+      if (!this.isActiveState()) {
         this.stopAnimationTimer();
         this.render();
         return;
@@ -565,7 +532,7 @@ class InteractivePrompt {
       return;
     }
 
-    if (this.startupVisible || this.isActiveState()) {
+    if (this.isActiveState()) {
       this.startAnimationTimer();
       return;
     }
@@ -579,25 +546,34 @@ class InteractivePrompt {
 
     this.clearAnimationTimer(this.animationTimer);
     this.animationTimer = null;
-    this.startupFrame = 0;
     this.busyFrame = 0;
   }
 
   clearFrame() {
-    cursorTo(this.output, 0);
-    clearLine(this.output, 0);
-    for (let row = 0; row < this.renderedRows; row += 1) {
-      moveCursor(this.output, 0, 1);
+    const columns = Math.max(1, Number(this.output.columns) || 80);
+    const physicalRows = this.renderedFrameLines.map((line, index) => {
+      const visibleRows = Math.max(1, Math.ceil(line.length / columns));
+      if (index !== this.renderedInputIndex) return visibleRows;
+      const cursorRows = Math.floor(this.renderedCursorColumn / columns) + 1;
+      return Math.max(visibleRows, cursorRows);
+    });
+    const cursorRow = physicalRows
+      .slice(0, Math.max(0, this.renderedInputIndex))
+      .reduce((total, rows) => total + rows, 0) +
+      Math.floor(this.renderedCursorColumn / columns);
+    const totalRows = physicalRows.reduce((total, rows) => total + rows, 0);
+
+    if (cursorRow > 0) moveCursor(this.output, 0, -cursorRow);
+    for (let row = 0; row < totalRows; row += 1) {
+      cursorTo(this.output, 0);
       clearLine(this.output, 0);
+      if (row < totalRows - 1) moveCursor(this.output, 0, 1);
     }
-    if (this.renderedRows > 0) moveCursor(this.output, 0, -this.renderedRows);
-    for (let row = 0; row < this.rowsAboveInput; row += 1) {
-      moveCursor(this.output, 0, -1);
-      clearLine(this.output, 0);
-    }
+    if (totalRows > 1) moveCursor(this.output, 0, -(totalRows - 1));
     cursorTo(this.output, 0);
-    this.renderedRows = 0;
-    this.rowsAboveInput = 0;
+    this.renderedFrameLines = [];
+    this.renderedInputIndex = -1;
+    this.renderedCursorColumn = 0;
   }
 }
 
@@ -648,17 +624,21 @@ function singleLine(value) {
   return sanitizeVisibleText(value).replace(/\s+/gu, ' ').trim();
 }
 
-function buildPromptText(context, columns) {
+function buildPromptLines(context, columns) {
   const clarification = context.pendingClarifications?.[0];
-  if (clarification) {
-    const provider = singleLine(clarification.provider).toUpperCase() || 'PROVIDER';
-    const total = context.pendingClarifications.length;
-    const label = total > 1 ? `${provider} asks 1/${total}` : `${provider} asks`;
-    return clip(label, Math.max(4, columns - 1));
-  }
+  const clarificationOwner = clarification
+    ? `${singleLine(clarification.provider).toUpperCase() || 'PROVIDER'} asks${
+      context.pendingClarifications.length > 1
+        ? ` 1/${context.pendingClarifications.length}`
+        : ''
+    }`
+    : null;
 
   const roomId = compactRoomId(context.roomId);
-  const rawMode = singleLine(context.delegationMode ?? context.routingMode ?? '');
+  const workflow = singleLine(context.workflow).toLowerCase();
+  const rawMode = workflow === 'supermode'
+    ? workflow
+    : singleLine(context.delegationMode ?? context.routingMode ?? '');
   const mode = rawMode.toLowerCase() === 'ui' ? 'ux' : rawMode.toLowerCase();
   const preferredProvider = singleLine(context.modeProviders?.[mode] ?? '').toLowerCase();
   const modeLabel = mode && preferredProvider && preferredProvider !== 'auto'
@@ -676,13 +656,54 @@ function buildPromptText(context, columns) {
       .join(' \u00b7 ')
     : '';
   const contextLimit = formatByteSize(context.contextCapBytes);
-  const label = [
+  const parts = [
     roomId || DEFAULT_PROMPT_LABEL,
     modeLabel,
     providerSummary,
     contextLimit ? `ctx ${contextLimit}` : null,
-  ].filter(Boolean).join(' \u00b7 ');
-  return clip(label, Math.max(4, columns - 1));
+  ].filter(Boolean);
+  const metadata = packFooterParts(parts, columns);
+  return clarificationOwner
+    ? [...wrapFooterText(clarificationOwner, columns), ...metadata]
+    : metadata;
+}
+
+function packFooterParts(parts, columns) {
+  const width = Math.max(4, columns);
+  const lines = [];
+  let current = '';
+
+  for (const part of parts) {
+    const visiblePart = singleLine(part);
+    if (!visiblePart) continue;
+    const candidate = current ? `${current} \u00b7 ${visiblePart}` : visiblePart;
+    if (candidate.length <= width) {
+      current = candidate;
+      continue;
+    }
+    if (current) lines.push(current);
+    const wrapped = wrapFooterText(visiblePart, width);
+    lines.push(...wrapped.slice(0, -1));
+    current = wrapped.at(-1) ?? '';
+  }
+
+  if (current) lines.push(current);
+  return lines.length > 0 ? lines : [DEFAULT_PROMPT_LABEL];
+}
+
+function wrapFooterText(value, columns) {
+  const width = Math.max(4, columns);
+  let remaining = singleLine(value);
+  if (!remaining) return [''];
+  const lines = [];
+  while (remaining.length > width) {
+    let boundary = remaining.lastIndexOf(' ', width);
+    if (boundary <= 0) boundary = width;
+    lines.push(remaining.slice(0, boundary));
+    remaining = remaining.slice(boundary).trimStart();
+  }
+  lines.push(remaining);
+  return lines;
 }
 
 function buildClarificationPalette(context) {
@@ -776,34 +797,6 @@ function formatLoadingLine(message, frame, columns, color) {
   const spinner = LOADING_FRAMES[frame % LOADING_FRAMES.length];
   const text = clip(`${spinner} ${singleLine(message)}`, Math.max(4, columns));
   return color ? `${CYAN}${text}${RESET}` : text;
-}
-
-function formatStartupGraphic(frame, columns, color) {
-  if (columns < 20) return [];
-  const width = Math.min(44, columns);
-  const innerWidth = width - 2;
-  const railWidth = Math.max(1, innerWidth - 'CODEX  CLAUDE'.length);
-  const progress = Math.min(1, Math.max(0, frame) / (STARTUP_FRAME_COUNT - 1));
-  const markerIndex = Math.min(railWidth - 1, Math.round(progress * (railWidth - 1)));
-  const rail = Array.from(
-    { length: railWidth },
-    (_, index) => index === markerIndex ? '\u25c6' : '\u2501',
-  ).join('');
-  const top = startupBorder('\u256d', '\u256e', '\u2500', ' CLAUDEX ', innerWidth);
-  const middle = `\u2502CODEX ${rail} CLAUDE\u2502`;
-  const bottom = startupBorder('\u2570', '\u256f', '\u2500', ' one room \u00b7 two models ', innerWidth);
-
-  if (!color) return [top, middle, bottom];
-  return [`${DIM}${top}${RESET}`, `${CYAN}${middle}${RESET}`, `${DIM}${bottom}${RESET}`];
-}
-
-function startupBorder(left, right, fill, label, innerWidth) {
-  const visibleLabel = clip(label, innerWidth);
-  return `${left}${visibleLabel}${fill.repeat(Math.max(0, innerWidth - visibleLabel.length))}${right}`;
-}
-
-function startupLoadingMessage(frame) {
-  return ['linking CODEX and CLAUDE', 'sharing room context', 'ready for delegation'][frame % 3];
 }
 
 function reducedMotionRequested(env = {}) {

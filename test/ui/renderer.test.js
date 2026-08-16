@@ -62,6 +62,17 @@ function rawLineContaining(rawOutput, visibleFragment) {
     .find((line) => sanitizeVisibleText(line).includes(visibleFragment)) ?? null;
 }
 
+function visibleLines(output) {
+  return visibleText(output).split('\n').filter(Boolean);
+}
+
+function assertOutlinedCard(lines, columns) {
+  assert.match(lines[0] ?? '', /^[\u250c\u256d\u2554].*[\u2510\u256e\u2557]$/u);
+  assert.match(lines.at(-1) ?? '', /^[\u2514\u2570\u255a].*[\u2518\u256f\u255d]$/u);
+  assert.ok(lines.slice(1, -1).every((line) => /^[\u2502\u2503\u2551].*[\u2502\u2503\u2551]$/u));
+  assert.ok(lines.every((line) => line.length <= columns), lines.join('\n'));
+}
+
 test('sanitizeVisibleText strips ansi and control bytes', () => {
   const value = '\u001B[31mCODEX\u001B[0m\u0007\nok';
   assert.equal(sanitizeVisibleText(value), 'CODEX\nok');
@@ -420,7 +431,7 @@ test('tty status surfaces the shared context cap, observed usage, and usage limi
   assert.match(visible, /usage limit allowed scope=monthly\s+resetsAt=2026-08-17T00:00:00Z retry 900s/u);
 });
 
-test('tty startup uses Claudex branding while showing mode, model, effort, and weight', () => {
+test('tty startup renders one outlined Claudex identity card with provider and room details', () => {
   const output = createOutput(true);
   output.columns = 120;
   const renderer = createTranscriptRenderer({ output, color: false });
@@ -428,37 +439,108 @@ test('tty startup uses Claudex branding while showing mode, model, effort, and w
   renderer.renderStartup({
     workspace: 'C:\\repo',
     roomId: 'room-1',
-    providers: [{ name: 'codex', status: 'available' }],
-    routingMode: 'plan',
-    safetyMode: 'single-writer lease; helpers read-only',
-    version: '0.2.0',
-  });
-  renderer.renderStatus({
-    roomId: 'room-1',
-    delegationMode: 'plan',
-    modeProviders: { plan: 'auto', code: 'codex', execute: 'auto', ux: 'claude' },
-    summary: 'room=room-1 mode=plan',
     providers: [{
       name: 'codex',
-      availability: 'available',
-      weight: 1,
-      cooldown: '0s',
-      failureStreak: 0,
-      observedTurns: 0,
-      observedTokens: 0,
-      capacitySource: 'configured',
-      model: 'gpt-5.6-terra',
-      effort: 'xhigh',
-      profile: 'configured',
-      authStatus: 'not-verified',
+      status: 'available',
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+    }, {
+      name: 'claude',
+      status: 'limited',
+      model: 'fable-5',
+      effort: 'max',
     }],
+    routingMode: 'supermode',
+    safetyMode: 'single-writer lease; helpers read-only',
+    contextCapBytes: 64 * 1024,
+    version: '1.2.3',
+    author: 'JadDid911',
+    repository: 'github.com/JadDid911/claudex',
   });
 
-  assert.match(output.read(), /CLAUDEX · 0\.2\.0.*plan.*C:\\repo/u);
-  assert.match(output.read(), /CODEX ready/u);
-  assert.match(output.read(), /CODEX.*ready.*gpt-5\.6-terra.*effort xhigh.*weight 1/u);
-  assert.match(output.read(), /lanes.*code→CODEX.*ux→CLAUDE/iu);
-  assert.doesNotMatch(output.read(), /room id:|availability=|capacity=|auth=/u);
+  const lines = visibleLines(output);
+  assertOutlinedCard(lines, output.columns);
+  assert.match(lines.join('\n'), /[▀▄█▌▐░▒▓▣]/u);
+  assert.match(lines.join('\n'), /\bC\s*[·×+]\s*X\b/u);
+  assert.match(lines.join('\n'), /CLAUDEX\s+1\.2\.3/u);
+  assert.match(lines.join('\n'), /CODEX.*gpt-5\.6-sol.*ultra.*available/iu);
+  assert.match(lines.join('\n'), /CLAUDE.*fable-5.*max.*limited/iu);
+  assert.match(lines.join('\n'), /C:\\repo/u);
+  assert.match(lines.join('\n'), /supermode/iu);
+  assert.match(lines.join('\n'), /64 KiB/u);
+  assert.match(lines.join('\n'), /single-writer/iu);
+  assert.match(lines.join('\n'), /JadDid911.*github\.com\/JadDid911\/claudex/u);
+  assert.doesNotMatch(output.read(), /\r\u001B\[2K/u);
+});
+
+test('tty startup card caps its width and promotes the product title on the border', () => {
+  const output = createOutput(true);
+  output.columns = 120;
+  const renderer = createTranscriptRenderer({ output, color: false });
+
+  renderer.renderStartup({
+    workspace: 'C:\\repo',
+    roomId: 'room-title-hierarchy',
+    providers: [
+      { name: 'codex', status: 'available', model: 'gpt-5.6-sol', effort: 'ultra' },
+      { name: 'claude', status: 'available', model: 'opus', effort: 'max' },
+    ],
+    routingMode: 'supermode',
+    safetyMode: 'single-writer lease; helpers read-only',
+    contextCapBytes: 64 * 1024,
+    version: '1.2.3',
+    author: 'JadDid911',
+    repository: 'github.com/JadDid911/claudex',
+  });
+
+  const lines = visibleLines(output);
+  const topIndex = lines.findIndex((line) => /^\s*[\u250c\u256d\u2554]/u.test(line));
+  const bottomIndex = lines.findIndex((line, index) => (
+    index > topIndex && /^\s*[\u2514\u2570\u255a]/u.test(line)
+  ));
+  const cardLines = lines.slice(topIndex, bottomIndex + 1);
+
+  assert.ok(topIndex >= 0 && bottomIndex > topIndex, lines.join('\n'));
+  assert.match(cardLines[0].trimStart(), /CLAUDEX\s+1\.2\.3/u);
+  assert.doesNotMatch(cardLines[0], /room-title-hierarchy/u);
+  assert.match(cardLines.slice(1).join('\n'), /room-title-hierarchy/u);
+  assert.ok(
+    cardLines.every((line) => line.trimStart().length <= 88),
+    cardLines.join('\n'),
+  );
+});
+
+test('tty startup card colors the Claudex mark cyan and keeps provider identity colors distinct', () => {
+  const output = createOutput(true);
+  output.columns = 88;
+  const renderer = createTranscriptRenderer({ output, color: true });
+
+  renderer.renderStartup({
+    workspace: 'C:\\repo',
+    roomId: 'room-color',
+    providers: [
+      { name: 'codex', status: 'available', model: 'gpt-5.6-sol', effort: 'ultra' },
+      { name: 'claude', status: 'available', model: 'opus', effort: 'max' },
+    ],
+    routingMode: 'supermode',
+    safetyMode: 'single-writer',
+    contextCapBytes: 64 * 1024,
+    version: '1.2.3',
+  });
+
+  const titleLine = rawLineContaining(output.read(), 'CLAUDEX 1.2.3');
+  const markLine = rawLineContaining(output.read(), 'C × X');
+  const codexLine = rawLineContaining(output.read(), 'CODEX');
+  const claudeLine = rawLineContaining(output.read(), 'CLAUDE ·');
+  const titleStart = titleLine?.indexOf('\u001B[1;36mCLAUDEX 1.2.3') ?? -1;
+  const neutralReturn = titleLine?.indexOf('\u001B[90m', titleStart + 1) ?? -1;
+  assert.match(titleLine ?? '', /^\u001B\[90m[\u250c\u256d\u2554]/u);
+  assert.ok(titleStart > 0, titleLine ?? 'missing title line');
+  assert.ok(neutralReturn > titleStart, titleLine ?? 'border did not return to neutral gray');
+  assert.match(titleLine ?? '', /[\u2510\u256e\u2557]\u001B\[0m$/u);
+  assert.match(markLine ?? '', /^\u001B\[1;36m.*C × X.*\u001B\[0m$/u);
+  assert.match(codexLine ?? '', /^\u001B\[1;32m.*CODEX.*\u001B\[0m$/u);
+  assert.match(claudeLine ?? '', /^\u001B\[1;35m.*CLAUDE.*\u001B\[0m$/u);
 });
 
 test('plain startup brands the command as claudex with its version', () => {
@@ -478,7 +560,7 @@ test('plain startup brands the command as claudex with its version', () => {
   assert.match(output.read(), /^  claudex 1\.2\.3$/mu);
 });
 
-test('tty Claudex startup branding stays within a narrow terminal', () => {
+test('tty Claudex identity card reflows rather than dropping details at 32 columns', () => {
   const output = createOutput(true);
   output.columns = 32;
   const renderer = createTranscriptRenderer({ output, color: false });
@@ -486,15 +568,28 @@ test('tty Claudex startup branding stays within a narrow terminal', () => {
   renderer.renderStartup({
     workspace: 'C:\\long-project-workspace',
     roomId: 'room-123456789',
-    providers: [{ name: 'codex', status: 'available' }],
-    routingMode: 'execute',
+    providers: [
+      { name: 'codex', status: 'available', model: 'gpt-5.6-sol', effort: 'ultra' },
+      { name: 'claude', status: 'available', model: 'opus-5', effort: 'max' },
+    ],
+    routingMode: 'supermode',
     safetyMode: 'single-writer',
+    contextCapBytes: 64 * 1024,
     version: '1.2.3',
+    author: 'JadDid911',
+    repository: 'github.com/JadDid911/claudex',
   });
 
-  for (const line of sanitizeVisibleText(output.read()).split('\n').filter(Boolean)) {
-    assert.ok(line.length <= output.columns, `${line.length}: ${line}`);
-  }
+  const lines = visibleLines(output);
+  assertOutlinedCard(lines, output.columns);
+  const visible = lines.join('\n');
+  assert.match(visible, /CLAUDEX.*1\.2\.3/u);
+  assert.match(visible, /CODEX.*gpt-5\.6-sol/iu);
+  assert.match(visible, /CLAUDE.*opus-5/iu);
+  assert.match(visible, /supermode/iu);
+  assert.match(visible, /64 KiB/u);
+  assert.match(visible, /JadDid911/u);
+  assert.match(visible, /github\.com\/JadDid911\/claudex/u);
 });
 
 test('tty startup and routing notices use compact ROOM labels instead of SYSTEM blocks', () => {
@@ -519,7 +614,7 @@ test('tty startup and routing notices use compact ROOM labels instead of SYSTEM 
   assert.doesNotMatch(visible, /\bSYSTEM\b/u);
 });
 
-test('tty ROOM notices compact long room ids and never wrap past the terminal width', () => {
+test('tty startup card preserves a complete long room id while reflowing within 52 columns', () => {
   const output = createOutput(true);
   output.columns = 52;
   const renderer = createTranscriptRenderer({ output, color: false });
@@ -535,8 +630,11 @@ test('tty ROOM notices compact long room ids and never wrap past the terminal wi
   renderer.finish();
 
   const lines = visibleText(output).trim().split('\n');
+  const reflowedCardText = lines
+    .map((line) => line.replace(/^\s*[\u2502\u2503\u2551]?/u, '').replace(/[\u2502\u2503\u2551]?\s*$/u, '').trim())
+    .join('');
   assert.ok(lines.every((line) => line.length <= output.columns));
-  assert.match(lines[0], /b197b276…378Z/u);
+  assert.match(reflowedCardText, /b197b27649cd-2026-08-15T14-29-28-378Z/u);
 });
 
 test('tty ROOM messages wrap without dropping long local answers', () => {
