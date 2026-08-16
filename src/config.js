@@ -13,6 +13,7 @@ import { getDefaultStorageRoot } from './core/store.js';
 const CONFIG_FILE = 'config.json';
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_CONTEXT_CAP_BYTES = 64 * 1024;
+const SAFE_CLAUDE_READ_TOOLS = new Set(['Read', 'Glob', 'Grep']);
 const REQUIRED_PROVIDER_ENVIRONMENT = new Set([
   'appdata',
   'claude_config_dir',
@@ -68,6 +69,24 @@ function stringList(value) {
     : [];
 }
 
+function safeClaudeReadTools(value, fallback) {
+  const safe = stringList(value).filter((tool) => SAFE_CLAUDE_READ_TOOLS.has(tool));
+  return safe.length > 0 ? safe : [...fallback];
+}
+
+function isApplicationConfigDirectory(directory) {
+  return ['claudex', 'codex-claude-room'].includes(path.basename(directory).toLowerCase());
+}
+
+async function hardenPrivatePath(targetPath, mode, platform = process.platform) {
+  if (platform === 'win32') return;
+  try {
+    await fs.chmod(targetPath, mode);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
 export function getConfigPath(options = {}) {
   const storageRoot = options.storageRoot ?? getDefaultStorageRoot(options.env);
   return path.join(storageRoot, CONFIG_FILE);
@@ -95,7 +114,7 @@ export function createDefaultConfig(options = {}) {
       effort: null,
       profile: null,
       configurationMode: 'configured',
-      ignoreRules: true,
+      ignoreRules: false,
       ignoreUserConfig: false,
     },
     claude: {
@@ -106,6 +125,7 @@ export function createDefaultConfig(options = {}) {
       safeMode: true,
       noChrome: true,
       disableSlashCommands: true,
+      readAllowedTools: ['Read', 'Glob', 'Grep'],
     },
   };
 }
@@ -119,6 +139,7 @@ export function normalizeConfig(input = {}, options = {}) {
   const profileMode = claude.profileMode === 'full' ? 'full' : 'lean';
 
   return {
+    ...input,
     storageRoot: optionalString(input.storageRoot) ?? defaults.storageRoot,
     timeoutMs: positiveNumber(input.timeoutMs, defaults.timeoutMs),
     contextCapBytes: positiveNumber(input.contextCapBytes, defaults.contextCapBytes),
@@ -131,16 +152,18 @@ export function normalizeConfig(input = {}, options = {}) {
       claude: nonNegativeNumber(weights.claude, defaults.weights.claude),
     },
     codex: {
+      ...codex,
       executable: optionalString(codex.executable),
       launcher: optionalString(codex.launcher),
       model: optionalString(codex.model),
       effort: normalizeProviderEffort('codex', codex.effort, defaults.codex.effort),
       profile: optionalString(codex.profile),
       configurationMode,
-      ignoreRules: codex.ignoreRules !== false,
+      ignoreRules: codex.ignoreRules === true,
       ignoreUserConfig: configurationMode === 'lean' || codex.ignoreUserConfig === true,
     },
     claude: {
+      ...claude,
       executable: optionalString(claude.executable),
       model: optionalString(claude.model),
       effort: normalizeProviderEffort('claude', claude.effort, defaults.claude.effort),
@@ -149,6 +172,10 @@ export function normalizeConfig(input = {}, options = {}) {
       noChrome: profileMode === 'lean' ? claude.noChrome !== false : Boolean(claude.noChrome),
       disableSlashCommands:
         profileMode === 'lean' ? claude.disableSlashCommands !== false : Boolean(claude.disableSlashCommands),
+      readAllowedTools: safeClaudeReadTools(
+        claude.readAllowedTools,
+        defaults.claude.readAllowedTools,
+      ),
     },
   };
 }
@@ -174,6 +201,10 @@ export async function loadConfig(options = {}) {
   let parsed = {};
 
   try {
+    if (isApplicationConfigDirectory(path.dirname(configPath))) {
+      await hardenPrivatePath(path.dirname(configPath), 0o700, options.platform);
+    }
+    await hardenPrivatePath(configPath, 0o600, options.platform);
     parsed = JSON.parse(await fs.readFile(configPath, 'utf8'));
   } catch (error) {
     if (error?.code !== 'ENOENT') {
@@ -198,8 +229,15 @@ export async function saveConfig(config, options = {}) {
     `.${path.basename(configPath)}.${process.pid}.${Date.now()}.tmp`,
   );
 
-  await fs.mkdir(directory, { recursive: true });
-  await fs.writeFile(temporaryPath, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+  const createdDirectory = await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  if (createdDirectory || isApplicationConfigDirectory(directory)) {
+    await hardenPrivatePath(directory, 0o700, options.platform);
+  }
+  await fs.writeFile(temporaryPath, `${JSON.stringify(normalized, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
   await fs.rename(temporaryPath, configPath);
+  await hardenPrivatePath(configPath, 0o600, options.platform);
   return normalized;
 }

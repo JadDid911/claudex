@@ -149,7 +149,7 @@ function buildProfilePalette(argumentText, context) {
       { id: 'default', description: 'Inherit the provider-wide model.' },
     ]);
     const items = candidates
-      .filter((model) => model.id.toLowerCase().startsWith(fragment.toLowerCase()))
+      .filter((model) => modelMatchesFragment(model.id, fragment, provider))
       .map((model) => ({
         id: `profile-model:${stage}:${provider}:${model.id}`,
         label: model.id,
@@ -203,7 +203,7 @@ function buildModelPalette(argumentText, context) {
 
   const fragment = parsed.tokens[1] ?? '';
   const current = providerStatus(context, provider)?.model;
-  const configured = current && current !== 'default'
+  const configured = current
     ? [{ id: current, description: 'Current selection.' }]
     : [];
   const catalog = Array.isArray(context.modelCatalog?.[provider])
@@ -211,7 +211,7 @@ function buildModelPalette(argumentText, context) {
     : [];
   const candidates = dedupeById([...configured, ...catalog]);
   const items = candidates
-    .filter((model) => model.id.toLowerCase().startsWith(fragment.toLowerCase()))
+    .filter((model) => modelMatchesFragment(model.id, fragment, provider))
     .map((model) => ({
       id: `model:${provider}:${model.id}`,
       label: model.id,
@@ -385,6 +385,17 @@ function dedupeById(models) {
     deduped.push({ ...model, id });
   }
   return deduped;
+}
+
+function modelMatchesFragment(modelId, fragment, provider) {
+  const query = String(fragment ?? '').toLowerCase();
+  if (!query) return true;
+  const id = String(modelId ?? '').toLowerCase();
+  if (id.startsWith(query)) return true;
+  const familyId = id
+    .replace(new RegExp(`^${provider}-`, 'u'), '')
+    .replace(/^gpt-/u, '');
+  return familyId.startsWith(query);
 }
 
 function effortChoicesForProvider(context, provider, modelId) {

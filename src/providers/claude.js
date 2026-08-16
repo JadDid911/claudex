@@ -15,13 +15,16 @@ import { runJsonlChild } from '../process/child-process.js';
 import { normalizeProviderEffort } from '../core/preferences.js';
 
 const DEFAULT_CONTEXT_BYTES = 64 * 1024;
+const SAFE_READ_TOOLS = new Set(['Read', 'Glob', 'Grep']);
 
 function permissionMode(access) {
   return access === 'write' ? 'acceptEdits' : 'dontAsk';
 }
 
-function allowedTools(access) {
-  return access === 'write' ? null : 'Read,Glob,Grep';
+function allowedTools(access, configuredTools) {
+  if (access === 'write') return null;
+  const safeTools = configuredTools.filter((tool) => SAFE_READ_TOOLS.has(tool));
+  return (safeTools.length > 0 ? safeTools : [...SAFE_READ_TOOLS]).join(',');
 }
 
 function isResumeFailure(message) {
@@ -245,6 +248,9 @@ export class ClaudeProvider extends BaseProvider {
     this.disableSlashCommands = options.disableSlashCommands ?? this.profileMode === 'lean';
     this.disableChrome = options.disableChrome ?? this.profileMode === 'lean';
     this.contextMaxBytes = options.contextMaxBytes ?? DEFAULT_CONTEXT_BYTES;
+    this.readAllowedTools = Array.isArray(options.readAllowedTools) && options.readAllowedTools.length > 0
+      ? options.readAllowedTools.map((tool) => String(tool)).filter(Boolean)
+      : ['Read', 'Glob', 'Grep'];
   }
 
   async resolve(workspace = process.cwd()) {
@@ -293,7 +299,7 @@ export class ClaudeProvider extends BaseProvider {
       '--permission-mode', permissionMode(access),
     ];
     if (access === 'write') args.push('--disallowedTools', 'AskUserQuestion');
-    const tools = allowedTools(access);
+    const tools = allowedTools(access, this.readAllowedTools);
     if (tools) args.push('--tools', tools);
     if (enforceReadIsolation || this.safeMode) args.push('--safe-mode');
     if (enforceReadIsolation || this.disableChrome) args.push('--no-chrome');

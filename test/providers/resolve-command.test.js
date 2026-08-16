@@ -138,3 +138,36 @@ test('createSpawnSpec prepends command-specific launcher args', () => {
     args: ['launcher.js', 'exec', '--json'],
   });
 });
+
+test('resolveCommand ignores non-executable files on POSIX PATH', async (context) => {
+  const tempRoot = await makeTempDir();
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const commandPath = path.join(tempRoot, 'claude');
+  await fs.writeFile(commandPath, '#!/bin/sh\nexit 0\n');
+  let executable = false;
+  const fsImpl = {
+    ...fs,
+    async access(filePath, mode) {
+      if (!executable) {
+        const error = new Error('not executable');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return fs.access(filePath, mode);
+    },
+  };
+
+  await assert.rejects(
+    resolveCommand({ command: 'claude', platform: 'linux', env: { PATH: tempRoot }, fs: fsImpl }),
+    /unable to resolve/iu,
+  );
+
+  executable = true;
+  const resolved = await resolveCommand({
+    command: 'claude',
+    platform: 'linux',
+    env: { PATH: tempRoot },
+    fs: fsImpl,
+  });
+  assert.equal(resolved.command, commandPath);
+});

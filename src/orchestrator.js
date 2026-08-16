@@ -1,5 +1,6 @@
 import { realpathSync } from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 
 import { createProviderEnvironment, loadConfig, saveConfig } from './config.js';
 import {
@@ -8,6 +9,7 @@ import {
   recordProviderFailure,
   recordProviderSuccess,
   recordProviderTurn,
+  recordProviderUsageLimit,
   setProviderAvailability,
   setProviderBusy,
   setProviderStickiness,
@@ -34,6 +36,8 @@ import { ROOM_CLARIFICATION_PREFIX } from './providers/base.js';
 const PROVIDER_NAMES = ['codex', 'claude'];
 const TERMINAL_SUCCESS = 'completed';
 const MAX_CONTEXT_EVENTS = 512;
+const MAX_CLARIFICATION_ROUNDS = 4;
+const MAX_PLAN_APPROVAL_ROUNDS = 4;
 
 function isoNow(now) {
   const value = now();
@@ -157,7 +161,13 @@ function readOnlyAssignmentPrompt(assignment, objective) {
     ].join('\n\n');
   }
 
-  return `${header} Provide concise findings for the lead.`;
+  return [
+    `${header} ${assignment.role === 'direct-turn' ? 'Answer the objective directly.' : 'Provide concise findings for the lead.'}`,
+    objectiveLine,
+    assignment.role === 'direct-turn'
+      ? 'Stay concise. Do not reframe the turn as a review, and do not modify the workspace.'
+      : 'Do not modify the workspace.',
+  ].join('\n\n');
 }
 
 function writeAssignmentPrompt(assignment, objective) {
@@ -222,7 +232,57 @@ function failureKind(result) {
   return result?.status ?? 'error';
 }
 
+function parseExplicitClarification(text) {
+  const prefix = ROOM_CLARIFICATION_PREFIX.toLowerCase();
+  const prefixIndex = text.toLowerCase().lastIndexOf(prefix);
+  const prefixBoundary = prefixIndex === 0 || (
+    prefixIndex > 0 && /(?:[.!][ \t]+|\r?\n+)\s*$/u.test(text.slice(0, prefixIndex))
+  );
+  if (!prefixBoundary) return null;
+
+  const remainder = text.slice(prefixIndex + ROOM_CLARIFICATION_PREFIX.length).trim();
+  const lines = remainder.split(/\r?\n/gu).map((line) => line.trim());
+  const questionIndex = lines.findIndex(Boolean);
+  if (questionIndex < 0) return null;
+  const question = lines[questionIndex];
+  if (!question.endsWith('?') || (question.match(/\?/gu) ?? []).length !== 1) return null;
+
+  const optionLines = lines.slice(questionIndex + 1);
+  const optionsHeading = optionLines.findIndex((line) => /^options?:$/iu.test(line));
+  const candidates = (optionsHeading >= 0 ? optionLines.slice(optionsHeading + 1) : optionLines)
+    .map((line) => line.match(/^(?:[-*]\s+|\d{1,2}[.)]\s+)(.+)$/u)?.[1]?.trim() ?? '')
+    .filter(Boolean)
+    .slice(0, 6);
+  const options = [...new Set(candidates)];
+
+  return { question, options };
+}
+
+function finalQuestionFrom(text) {
+  const paragraphs = text.split(/\n\s*\n/gu).map((part) => part.trim()).filter(Boolean);
+  const finalParagraph = paragraphs.at(-1) ?? '';
+  let start = 0;
+  for (const boundary of finalParagraph.matchAll(/(?:[.!][ \t]+|\r?\n+)/gu)) {
+    start = boundary.index + boundary[0].length;
+  }
+  return finalParagraph.slice(start).trim();
+}
+
+export function parseClarificationRequest(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+
+  const explicit = parseExplicitClarification(text);
+  if (explicit) return explicit;
+  if (!isLegacyClarificationRequest(text)) return null;
+  return { question: finalQuestionFrom(text), options: [] };
+}
+
 export function isClarificationRequest(value) {
+  return parseClarificationRequest(value) !== null;
+}
+
+function isLegacyClarificationRequest(value) {
   const text = String(value ?? '').trim();
   if (!text || !text.endsWith('?')) {
     return false;
@@ -394,6 +454,10 @@ function replayDisplayEvent(event) {
   };
 }
 
+function isDurableTranscriptEvent(event) {
+  return event?.type === 'message' || event?.type === 'warning';
+}
+
 function detectRoomQuery(prompt) {
   const text = String(prompt ?? '').trim();
   if (!text || text.length > 240) {
@@ -470,6 +534,7 @@ function buildDefaultProviders(config, sourceEnvironment) {
       safeMode: config.claude.safeMode,
       disableChrome: config.claude.noChrome,
       disableSlashCommands: config.claude.disableSlashCommands,
+      readAllowedTools: config.claude.readAllowedTools,
       contextMaxBytes: config.contextCapBytes,
     }),
   };
@@ -504,7 +569,7 @@ export class RoomApplication {
     this.config = options.config ?? null;
     this.store = null;
     this.ledger = null;
-    this.lease = new WriteLease();
+    this.lease = this.createWriteLease();
     this.active = null;
     this.turnCounter = 0;
     this.contextEvents = [];
@@ -543,6 +608,7 @@ export class RoomApplication {
     return {
       roomId: this.store?.room.roomId,
       workspace: this.store?.room.workspacePath ?? this.workspace,
+      contextCapBytes: this.config?.contextCapBytes ?? null,
       providers: PROVIDER_NAMES.map((name) => ({
         name,
         status: this.providerStatus[name]?.available ? 'available' : 'unavailable',
@@ -615,7 +681,18 @@ export class RoomApplication {
       this.store.room.roomId,
       Object.keys(state.activeTurns ?? {}),
     );
-    this.lease = new WriteLease(state.writeLease);
+    this.lease = this.createWriteLease(state.writeLease);
+  }
+
+  createWriteLease(initialState = {}) {
+    const workspaceLockPath = this.store?.paths?.workspaceRoot
+      ? path.join(this.store.paths.workspaceRoot, 'workspace-write.lock')
+      : null;
+    return new WriteLease(initialState, {
+      ...this.options.writeLeaseOptions,
+      lockPath: this.options.writeLeaseOptions?.lockPath ??
+        workspaceLockPath,
+    });
   }
 
   async detectProviders() {
@@ -644,8 +721,9 @@ export class RoomApplication {
       this.turnCounter,
       maximumTurnCounter(this.store.room.roomId, replay.events.map((event) => event.turnId)),
     );
-    this.contextEvents = replay.events.slice(-MAX_CONTEXT_EVENTS);
-    for (const event of replay.events) {
+    const transcriptEvents = replay.events.filter(isDurableTranscriptEvent);
+    this.contextEvents = transcriptEvents.slice(-MAX_CONTEXT_EVENTS);
+    for (const event of transcriptEvents) {
       this.emitEvent(replayDisplayEvent(event));
     }
     if (replay.repaired) {
@@ -717,7 +795,8 @@ export class RoomApplication {
       (command.name === 'profile' && !command.stage && !command.provider) ||
       (command.name === 'mode' && !command.mode && !command.lane && !command.provider)
     );
-    if (this.isBusy() && !observableWhileBusy) {
+    const clarificationAnswer = command.kind === 'turn' && this.isAwaitingInput();
+    if (this.isBusy() && !observableWhileBusy && !clarificationAnswer) {
       throw new Error('A provider turn is already active. Use /cancel before starting another.');
     }
 
@@ -725,6 +804,10 @@ export class RoomApplication {
       if (!command.prompt?.trim()) {
         const commandName = command.supermode ? 'supermode' : command.route;
         await this.appendSystem(`/${commandName} requires a prompt.`, 'warning');
+        return;
+      }
+      if (clarificationAnswer) {
+        await this.answerClarification(command.prompt.trim());
         return;
       }
       await this.runTurn(command);
@@ -781,13 +864,129 @@ export class RoomApplication {
     const turnId = `${this.store.room.roomId}-turn-${++this.turnCounter}`;
     const controller = new AbortController();
     const execution = this.executeTurn(command, turnId, controller);
-    this.active = { turnId, controller, promise: execution, providers: new Set() };
+    this.active = {
+      turnId,
+      controller,
+      promise: execution,
+      providers: new Set(),
+      clarifications: null,
+      clarificationRound: 0,
+    };
 
     try {
       await execution;
     } finally {
       if (this.active?.turnId === turnId) {
         this.active = null;
+      }
+    }
+  }
+
+  async answerClarification(answer) {
+    const queue = this.active?.clarifications;
+    const current = queue?.items?.[0];
+    if (!queue || !current) {
+      throw new Error('No provider clarification is waiting for an answer.');
+    }
+
+    queue.items.shift();
+    queue.answers.set(current.id, answer);
+    await this.appendEvent({
+      actor: 'YOU',
+      type: 'message',
+      turnId: this.active.turnId,
+      content: answer,
+      metadata: {
+        code: 'clarification-answer',
+        clarificationId: current.id,
+        provider: current.provider,
+        role: current.role,
+        model: current.model,
+        effort: current.effort,
+      },
+    });
+
+    if (queue.items.length === 0) {
+      queue.resolve(queue.answers);
+    }
+  }
+
+  async requestClarificationAnswers(turnId, requests, signal, workflow = null, stage = null) {
+    if (!requests.length || signal.aborted) return null;
+    if (!this.active || this.active.turnId !== turnId) {
+      throw new Error('Cannot request clarification without the active provider turn.');
+    }
+
+    const round = ++this.active.clarificationRound;
+    const allItems = requests.map((request, index) => {
+      const profile = this.resolveAssignmentProfile(request.assignment);
+      return {
+        id: `${turnId}-clarification-${round}-${index + 1}`,
+        provider: request.assignment.provider,
+        role: request.role,
+        model: profile.model,
+        effort: profile.effort,
+        question: request.clarification.question,
+        options: request.clarification.options,
+      };
+    });
+    let resolveAnswers;
+    const answerPromise = new Promise((resolve) => {
+      resolveAnswers = resolve;
+    });
+    const queue = {
+      items: structuredClone(allItems),
+      answers: new Map(),
+      resolve: resolveAnswers,
+      ready: false,
+    };
+    this.active.clarifications = queue;
+
+    const abort = () => queue.resolve(null);
+    signal.addEventListener('abort', abort, { once: true });
+    await this.markTurn(turnId, {
+      status: 'waiting-for-user',
+      waitingAt: isoNow(this.now),
+      ...(workflow ? { workflow } : {}),
+      ...(stage ? { pipelineStage: stage } : {}),
+    });
+    await this.appendEvent({
+      actor: 'SYSTEM',
+      type: 'message',
+      turnId,
+      content: allItems.length === 1
+        ? `${actorFor(allItems[0].provider)} needs your answer before continuing.`
+        : `${allItems.length} questions queued · ${actorFor(allItems[0].provider)} asks first.`,
+      metadata: {
+        code: 'waiting-for-user',
+        provider: allItems[0].provider,
+        providers: allItems.map((item) => item.provider),
+        questionCount: allItems.length,
+        ...(workflow ? { workflow } : {}),
+        ...(stage ? { stage } : {}),
+      },
+    });
+    queue.ready = true;
+
+    try {
+      const answers = await answerPromise;
+      if (!answers || signal.aborted) return null;
+      await this.markTurn(turnId, {
+        status: 'running',
+        resumedAt: isoNow(this.now),
+      });
+      await this.appendEvent({
+        actor: 'SYSTEM',
+        type: 'message',
+        turnId,
+        content: 'Answer received · resuming the paused provider work.',
+        metadata: { code: 'clarification-resumed' },
+      });
+      return answers;
+    } finally {
+      signal.removeEventListener('abort', abort);
+      if (this.active?.clarifications === queue) {
+        this.active.clarifications = null;
       }
     }
   }
@@ -942,37 +1141,33 @@ export class RoomApplication {
         );
       }
       let leadResult = await leadPromise;
-
-      if (
-        leadResult.status === TERMINAL_SUCCESS &&
-        isClarificationRequest(leadResult.text) &&
-        !controller.signal.aborted
-      ) {
-        helperController?.abort('waiting-for-user');
-        await helperOutcomePromise;
-        await this.markTurn(turnId, {
-          status: 'waiting-for-user',
-          waitingAt: isoNow(this.now),
-          writerSideEffectsPossible: Boolean(leadResult.sideEffectsPossible),
-        });
-        await this.appendEvent({
-          actor: 'SYSTEM',
-          type: 'message',
-          turnId,
-          content: 'Waiting for your answer.',
-          metadata: {
-            code: 'waiting-for-user',
-            provider: plan.lead.provider,
-          },
-        });
-        return;
-      }
-
       const helperOutcome = helperOutcomePromise ? await helperOutcomePromise : null;
       if (helperOutcome?.error) {
         throw helperOutcome.error;
       }
       let helperResult = helperOutcome?.result ?? null;
+
+      const clarified = await this.resolveClarificationResults(
+        [
+          {
+            assignment: plan.lead,
+            result: leadResult,
+            taskId,
+            role: 'lead',
+          },
+          ...(plan.helper && helperResult ? [{
+            assignment: plan.helper,
+            result: helperResult,
+            taskId: helperTaskId,
+            role: 'helper',
+          }] : []),
+        ],
+        providerObjective,
+        turnId,
+        controller.signal,
+      );
+      leadResult = clarified[0].result;
+      helperResult = clarified[1]?.result ?? null;
 
       if (this.canSafelyFallback(leadResult)) {
         const fallback = this.createFallbackAssignment(plan);
@@ -1020,6 +1215,20 @@ export class RoomApplication {
         }
       }
 
+      if (
+        leadResult.status === TERMINAL_SUCCESS &&
+        isClarificationRequest(leadResult.text) &&
+        !controller.signal.aborted
+      ) {
+        const [fallbackClarified] = await this.resolveClarificationResults(
+          [{ assignment: plan.lead, result: leadResult, taskId: `${turnId}-fallback`, role: 'lead' }],
+          providerObjective,
+          turnId,
+          controller.signal,
+        );
+        leadResult = fallbackClarified.result;
+      }
+
       let finalResult = leadResult;
       if (
         plan.helper &&
@@ -1041,6 +1250,20 @@ export class RoomApplication {
           `${turnId}-synthesis`,
           controller.signal,
         );
+        if (isClarificationRequest(finalResult.text) && !controller.signal.aborted) {
+          const [clarifiedSynthesis] = await this.resolveClarificationResults(
+            [{
+              assignment: { ...plan.lead, role: 'synthesis' },
+              result: finalResult,
+              taskId: `${turnId}-synthesis`,
+              role: 'synthesis',
+            }],
+            providerObjective,
+            turnId,
+            controller.signal,
+          );
+          finalResult = clarifiedSynthesis.result;
+        }
       }
 
       const status = controller.signal.aborted
@@ -1061,6 +1284,19 @@ export class RoomApplication {
         );
       } else if (status === 'cancelled') {
         await this.appendSystem('Turn cancelled; provider processes stopped.', 'warning', turnId);
+      } else {
+        const providerSummary = plan.helper
+          ? `${actorFor(plan.lead.provider)} led · ${actorFor(plan.helper.provider)} reviewed`
+          : `${actorFor(plan.lead.provider)} completed`;
+        const tokenTotal = [...new Set([leadResult, helperResult, finalResult].filter(Boolean))]
+          .reduce((total, result) => total + usageTokens(result.usage), 0);
+        await this.appendEvent({
+          actor: 'SYSTEM',
+          type: 'message',
+          turnId,
+          content: `Complete · ${providerSummary} · ${tokenTotal} observed tokens`,
+          metadata: { code: 'turn-summary', status: 'completed' },
+        });
       }
     } catch (error) {
       await this.markTurn(turnId, {
@@ -1190,7 +1426,7 @@ export class RoomApplication {
     let writerSideEffectsPossible = false;
     try {
       await this.beginSupermodeStage(turnId, 'plan', pipeline.planner);
-      const planning = await this.runSupermodeStage(
+      let planning = await this.runSupermodeStage(
         pipeline.planner,
         providerObjective,
         turnId,
@@ -1209,6 +1445,29 @@ export class RoomApplication {
       });
       if (outcome !== 'continue') return;
       if (controller.signal.aborted) throw new Error('Supermode cancelled between stages.');
+
+      if (pipeline.requiresWriteLease) {
+        const approval = await this.approveSupermodePlan(
+          planning,
+          providerObjective,
+          turnId,
+          controller.signal,
+        );
+        planning = approval.planning;
+        pipeline.planner = planning.assignment;
+        if (approval.outcome === 'cancelled') return;
+        if (approval.outcome !== 'approved') {
+          outcome = await this.settleSupermodeStage({
+            turnId,
+            stage: 'plan',
+            assignment: planning.assignment,
+            result: planning.result,
+            signal: controller.signal,
+            writerSideEffectsPossible,
+          });
+          if (outcome !== 'continue') return;
+        }
+      }
 
       if (pipeline.requiresWriteLease) {
         const acquisition = this.lease.acquire({
@@ -1316,12 +1575,32 @@ export class RoomApplication {
           sessionIdOverride: execution.result.sessionId ?? null,
         },
       );
-      writerSideEffectsPossible ||= Boolean(finalResult.sideEffectsPossible);
+      const [clarifiedSynthesis] = await this.resolveClarificationResults(
+        [{
+          assignment: { ...pipeline.executor, role: 'synthesis' },
+          result: finalResult,
+          taskId: `${turnId}-synthesis`,
+          role: 'synthesis',
+          handoffExtra: {
+            workflow: 'supermode',
+            pipelineStage: 'synthesis',
+            planResult: planning.result.text,
+            leadResult: execution.result.text,
+            helperFindings: review.result.text,
+          },
+        }],
+        providerObjective,
+        turnId,
+        controller.signal,
+        { workflow: 'supermode', stage: 'synthesis' },
+      );
+      const settledFinalResult = clarifiedSynthesis.result;
+      writerSideEffectsPossible ||= Boolean(settledFinalResult.sideEffectsPossible);
       outcome = await this.settleSupermodeStage({
         turnId,
         stage: 'synthesis',
         assignment: pipeline.executor,
-        result: finalResult,
+        result: settledFinalResult,
         signal: controller.signal,
         writerSideEffectsPossible,
       });
@@ -1335,6 +1614,16 @@ export class RoomApplication {
         writerSideEffectsPossible,
       });
       this.setActiveWorkflowStage(turnId, 'complete', null);
+      const tokenTotal = [planning.result, execution.result, review.result, settledFinalResult]
+        .reduce((total, result) => total + usageTokens(result?.usage), 0);
+      await this.appendEvent({
+        actor: 'SYSTEM',
+        type: 'message',
+        turnId,
+        content: `Complete · Supermode · ${actorFor(pipeline.executor.provider)} executed · ` +
+          `${actorFor(pipeline.reviewer.provider)} reviewed · ${tokenTotal} observed tokens`,
+        metadata: { code: 'turn-summary', status: 'completed', workflow: 'supermode' },
+      });
     } catch (error) {
       const status = controller.signal.aborted ? 'cancelled' : 'failed';
       const activeWriter = Boolean(
@@ -1370,6 +1659,96 @@ export class RoomApplication {
       }
       await this.persistRuntimeState();
     }
+  }
+
+  async approveSupermodePlan(planning, objective, turnId, signal) {
+    if (this.options.requirePlanApproval === false) {
+      return { outcome: 'approved', planning };
+    }
+
+    let current = planning;
+    for (let round = 1; round <= MAX_PLAN_APPROVAL_ROUNDS; round += 1) {
+      const answers = await this.requestClarificationAnswers(
+        turnId,
+        [{
+          assignment: current.assignment,
+          role: 'plan-approval',
+          clarification: {
+            question: 'Plan ready. Execute it, or type revision feedback?',
+            options: ['Execute this plan', 'Cancel Supermode'],
+          },
+        }],
+        signal,
+        'supermode',
+        'plan',
+      );
+      if (!answers || signal.aborted) {
+        return { outcome: 'cancelled', planning: current };
+      }
+
+      const answer = String(answers.values().next().value ?? '').trim();
+      if (/^(?:execute this plan|approve|approved|yes|y|go|proceed|continue|looks good|build it|start)$/iu.test(answer)) {
+        await this.appendEvent({
+          actor: 'SYSTEM',
+          type: 'message',
+          turnId,
+          content: 'Plan approved · starting execute.',
+          metadata: { code: 'supermode-plan-approved', workflow: 'supermode', stage: 'plan' },
+        });
+        return { outcome: 'approved', planning: current };
+      }
+
+      if (/^(?:cancel supermode|cancel|no|n|stop|decline)$/iu.test(answer)) {
+        await this.markTurn(turnId, {
+          status: 'cancelled',
+          workflow: 'supermode',
+          pipelineStage: 'plan',
+          completedAt: isoNow(this.now),
+          writerSideEffectsPossible: false,
+        });
+        await this.appendEvent({
+          actor: 'SYSTEM',
+          type: 'message',
+          turnId,
+          content: 'Plan declined · Supermode stopped before execute.',
+          metadata: { code: 'supermode-plan-declined', workflow: 'supermode', stage: 'plan' },
+        });
+        return { outcome: 'cancelled', planning: current };
+      }
+
+      await this.beginSupermodeStage(turnId, 'plan', current.assignment);
+      current = await this.runSupermodeStage(
+        current.assignment,
+        [
+          'Revise the implementation plan using the user feedback below.',
+          `Original objective: ${objective}`,
+          `User feedback: ${answer}`,
+        ].join('\n\n'),
+        turnId,
+        `${turnId}-plan-revision-${round}`,
+        signal,
+        {
+          pipelineStage: 'plan',
+          planResult: current.result.text,
+          planRevisionFeedback: answer,
+        },
+      );
+      if (current.result.status !== TERMINAL_SUCCESS || signal.aborted) {
+        return { outcome: 'terminal', planning: current };
+      }
+    }
+
+    return {
+      outcome: 'terminal',
+      planning: {
+        ...current,
+        result: {
+          ...current.result,
+          status: 'failed',
+          error: { message: `Plan approval exceeded ${MAX_PLAN_APPROVAL_ROUNDS} revision rounds.` },
+        },
+      },
+    };
   }
 
   async runSupermodeStage(
@@ -1453,6 +1832,21 @@ export class RoomApplication {
       }
     }
 
+    const [clarified] = await this.resolveClarificationResults(
+      [{
+        assignment: activeAssignment,
+        result,
+        taskId,
+        role: activeAssignment.label ?? activeAssignment.role,
+        handoffExtra,
+      }],
+      objective,
+      turnId,
+      signal,
+      { workflow: 'supermode', stage: activeAssignment.label },
+    );
+    result = clarified.result;
+
     return { assignment: activeAssignment, result };
   }
 
@@ -1520,29 +1914,6 @@ export class RoomApplication {
       return 'cancelled';
     }
 
-    if (result.status === TERMINAL_SUCCESS && isClarificationRequest(result.text)) {
-      await this.markTurn(turnId, {
-        status: 'waiting-for-user',
-        workflow: 'supermode',
-        pipelineStage: stage,
-        waitingAt: isoNow(this.now),
-        writerSideEffectsPossible,
-      });
-      await this.appendEvent({
-        actor: 'SYSTEM',
-        type: 'message',
-        turnId,
-        content: 'Waiting for your answer.',
-        metadata: {
-          code: 'waiting-for-user',
-          workflow: 'supermode',
-          stage,
-          provider: assignment.provider,
-        },
-      });
-      return 'waiting-for-user';
-    }
-
     if (result.status !== TERMINAL_SUCCESS) {
       await this.markTurn(turnId, {
         status: 'failed',
@@ -1572,7 +1943,83 @@ export class RoomApplication {
     this.active.currentProvider = provider;
   }
 
-  async runAssignment(assignment, objective, turnId, taskId, signal, handoffExtra = {}) {
+  async resolveClarificationResults(entries, objective, turnId, signal, options = {}) {
+    let current = entries;
+
+    for (let round = 1; round <= MAX_CLARIFICATION_ROUNDS; round += 1) {
+      const requests = current.flatMap((entry) => {
+        if (entry.result.status !== TERMINAL_SUCCESS) return [];
+        const clarification = parseClarificationRequest(entry.result.text);
+        return clarification ? [{ entry, clarification }] : [];
+      });
+      if (requests.length === 0 || signal.aborted) return current;
+
+      const answers = await this.requestClarificationAnswers(
+        turnId,
+        requests.map(({ entry, clarification }) => ({
+          assignment: entry.assignment,
+          role: entry.role,
+          clarification,
+        })),
+        signal,
+        options.workflow ?? null,
+        options.stage ?? null,
+      );
+      if (!answers || signal.aborted) return current;
+
+      current = await Promise.all(current.map(async (entry) => {
+        const requestIndex = requests.findIndex((request) => request.entry === entry);
+        if (requestIndex < 0) return entry;
+        const request = requests[requestIndex];
+        const clarificationId = `${turnId}-clarification-${this.active?.clarificationRound}-${requestIndex + 1}`;
+        const answer = answers.get(clarificationId);
+        const continuationObjective = [
+          'Continue the original objective from the paused provider session.',
+          `Original objective: ${objective}`,
+          `Clarification question: ${request.clarification.question}`,
+          `User answer: ${answer}`,
+        ].join('\n\n');
+        const result = await this.runAssignment(
+          entry.assignment,
+          continuationObjective,
+          turnId,
+          `${entry.taskId}-clarification-${round}`,
+          signal,
+          {
+            ...(entry.handoffExtra ?? {}),
+            clarificationQuestion: request.clarification.question,
+            clarificationAnswer: answer,
+            clarificationProvider: entry.assignment.provider,
+            priorProviderResult: entry.result.text,
+          },
+          { sessionIdOverride: entry.result.sessionId ?? null },
+        );
+        return { ...entry, result };
+      }));
+    }
+
+    return current.map((entry) => {
+      if (!parseClarificationRequest(entry.result.text)) return entry;
+      return {
+        ...entry,
+        result: {
+          ...entry.result,
+          status: 'failed',
+          error: { message: `Provider exceeded the ${MAX_CLARIFICATION_ROUNDS}-round clarification limit.` },
+        },
+      };
+    });
+  }
+
+  async runAssignment(
+    assignment,
+    objective,
+    turnId,
+    taskId,
+    signal,
+    handoffExtra = {},
+    runOptions = {},
+  ) {
     const provider = this.providers[assignment.provider];
     const access = assignment.mode === 'workspace-write' ? 'write' : 'read';
     const context = await this.contextPacket(objective, assignment.role, {
@@ -1595,9 +2042,11 @@ export class RoomApplication {
     const prompt = assignment.mode === 'workspace-write'
       ? writeAssignmentPrompt(assignment, objective)
       : readOnlyAssignmentPrompt(assignment, objective);
-    const sessionId = assignment.freshSession
-      ? null
-      : this.sessionFor(assignment.provider, access);
+    const sessionId = runOptions.sessionIdOverride !== undefined
+      ? runOptions.sessionIdOverride
+      : assignment.freshSession
+        ? null
+        : this.sessionFor(assignment.provider, access);
     const label = assignment.label ?? (
       assignment.role.includes('lead') || assignment.role === 'direct-turn'
         ? 'lead'
@@ -1608,8 +2057,15 @@ export class RoomApplication {
     setProviderBusy(this.ledger, assignment.provider, true);
     this.active?.providers.add(assignment.provider);
     let eventQueue = Promise.resolve();
+    let sawVisibleProviderText = false;
     const onEvent = (event) => {
       activity.pulse();
+      if (
+        (event?.type === 'text.delta' || event?.type === 'text.message') &&
+        String(event?.text ?? '').trim()
+      ) {
+        sawVisibleProviderText = true;
+      }
       eventQueue = eventQueue.then(() => this.appendProviderEvent(
         assignment.provider,
         event,
@@ -1651,6 +2107,14 @@ export class RoomApplication {
     } finally {
       activity.stop();
     }
+    await this.persistProviderResult(
+      assignment.provider,
+      result,
+      turnId,
+      taskId,
+      label,
+      { emit: !sawVisibleProviderText },
+    );
     await this.recordResult(assignment, result);
     return result;
   }
@@ -1698,8 +2162,15 @@ export class RoomApplication {
     const provider = this.providers[assignment.provider];
     const activity = this.createActivityWatch(assignment.provider, 'synthesis');
     let eventQueue = Promise.resolve();
+    let sawVisibleProviderText = false;
     const onEvent = (event) => {
       activity.pulse();
+      if (
+        (event?.type === 'text.delta' || event?.type === 'text.message') &&
+        String(event?.text ?? '').trim()
+      ) {
+        sawVisibleProviderText = true;
+      }
       eventQueue = eventQueue.then(() => this.appendProviderEvent(
         assignment.provider,
         event,
@@ -1755,6 +2226,14 @@ export class RoomApplication {
     } finally {
       activity.stop();
     }
+    await this.persistProviderResult(
+      assignment.provider,
+      result,
+      turnId,
+      taskId,
+      'synthesis',
+      { emit: !sawVisibleProviderText },
+    );
     await this.recordResult({ ...assignment, role: 'synthesis' }, result);
     return result;
   }
@@ -1869,10 +2348,53 @@ export class RoomApplication {
   }
 
   async appendProviderEvent(provider, normalizedEvent, turnId, taskId, label) {
+    if (
+      normalizedEvent?.type === 'activity' &&
+      String(normalizedEvent?.status ?? '').startsWith('rate_limit_')
+    ) {
+      const info = normalizedEvent.info ?? {};
+      recordProviderUsageLimit(this.ledger, provider, {
+        status: info.status ?? normalizedEvent.status.replace('rate_limit_', ''),
+        scope: info.scope ?? info.rate_limit_type ?? info.rateLimitType ?? null,
+        resetsAt: info.resets_at ?? info.reset_at ?? info.resetsAt ?? info.resetAt ?? null,
+        retryAfterSeconds: Number(
+          info.retry_after_seconds ?? info.retryAfterSeconds ?? Number.NaN,
+        ),
+        reportedAt: isoNow(this.now),
+      });
+    }
     const mapped = providerEventToCanonical(provider, normalizedEvent, turnId, taskId, label);
+    if (mapped.input.type !== 'warning') {
+      this.emitEvent(replayDisplayEvent(mapped.input));
+      return mapped.input;
+    }
     const event = await this.store.appendEvent(mapped.input, { timestamp: isoNow(this.now) });
     this.rememberEvent(event);
     this.emitEvent(replayDisplayEvent(event));
+    return event;
+  }
+
+  async persistProviderResult(provider, result, turnId, taskId, label, options = {}) {
+    const content = String(result?.text ?? '').trim();
+    if (!content) return null;
+    const event = await this.store.appendEvent({
+      actor: actorFor(provider),
+      type: 'message',
+      turnId,
+      taskId,
+      content,
+      metadata: {
+        code: 'provider-result-snapshot',
+        label,
+        providerEventType: 'result.snapshot',
+        status: result?.status ?? null,
+      },
+    }, { timestamp: isoNow(this.now) });
+    this.rememberEvent(event);
+    if (options.emit) {
+      this.emitEvent(replayDisplayEvent(event));
+    }
+    return event;
   }
 
   createActivityWatch(provider, label) {
@@ -1892,6 +2414,12 @@ export class RoomApplication {
       timer?.unref?.();
     };
 
+    this.emitEvent({
+      actor: actorFor(provider),
+      type: 'activity',
+      label,
+      text: 'Working...',
+    });
     schedule();
     return {
       pulse: schedule,
@@ -1915,6 +2443,7 @@ export class RoomApplication {
   }
 
   rememberEvent(event) {
+    if (!isDurableTranscriptEvent(event)) return;
     this.contextEvents.push(event);
     if (this.contextEvents.length > MAX_CONTEXT_EVENTS) {
       this.contextEvents.splice(0, this.contextEvents.length - MAX_CONTEXT_EVENTS);
@@ -2075,6 +2604,7 @@ export class RoomApplication {
     return {
       roomId: this.store.room.roomId,
       delegationMode: this.delegationMode,
+      contextCapBytes: this.config?.contextCapBytes ?? null,
       modeProviders: structuredClone(this.config.modeProviders),
       stageProfiles: structuredClone(this.config.stageProfiles),
       workflow: this.active?.workflow ?? null,
@@ -2090,6 +2620,7 @@ export class RoomApplication {
           failureStreak: entry.failureStreak,
           observedTurns: entry.observedTurns,
           observedTokens: entry.observedTokens,
+          lastTurnTokens: entry.lastTurnTokens,
           capacitySource: entry.capacitySource,
           authStatus: this.providerStatus[name]?.authStatus ?? 'not-verified',
           model: this.config[name].model ?? 'default',
@@ -2097,12 +2628,24 @@ export class RoomApplication {
           profile: name === 'codex'
             ? this.config.codex.configurationMode
             : this.config.claude.profileMode,
+          contextCapBytes: this.config?.contextCapBytes ?? null,
+          usageLimit: entry.usageReportedAt
+            ? {
+                status: entry.usageStatus,
+                scope: entry.usageScope,
+                resetsAt: entry.usageResetsAt,
+                retryAfterSeconds: entry.usageRetryAfterSeconds,
+                reportedAt: entry.usageReportedAt,
+              }
+            : null,
+          usageLimitSource: entry.usageReportedAt ? 'provider-reported' : 'not-exposed',
         };
       }),
       activeProcess: this.active
         ? `${(this.active.currentProvider ?? [...this.active.providers].join('+')) || 'starting'}` +
           `${this.active.stage ? ` ${this.active.stage}` : ''} (${this.active.turnId})`
         : null,
+      pendingClarifications: structuredClone(this.active?.clarifications?.items ?? []),
       lease: this.lease.snapshot().current
         ? `${this.lease.snapshot().current.ownerProvider} write`
         : 'free',
@@ -2262,7 +2805,7 @@ export class RoomApplication {
         this.providerStatus[name]?.available ? 'available' : 'unavailable',
       );
     }
-    this.lease = new WriteLease();
+    this.lease = this.createWriteLease();
     this.delegationMode = normalizeDelegationMode(delegationMode);
     this.turnCounter = 0;
     this.contextEvents = [];
@@ -2300,6 +2843,12 @@ export class RoomApplication {
 
   isBusy() {
     return Boolean(this.active);
+  }
+
+  isAwaitingInput() {
+    return Boolean(
+      this.active?.clarifications?.ready && this.active.clarifications.items?.length,
+    );
   }
 
   async close() {

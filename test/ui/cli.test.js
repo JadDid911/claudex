@@ -209,6 +209,7 @@ test('runCli boots interactive mode through injected application factory', async
     stdout,
     stderr,
     packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
     readlineFactory() {
       return rl;
     },
@@ -271,6 +272,7 @@ test('readline fallback queues a follow-up turn while the first dispatch is acti
     stdout,
     stderr,
     packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
     readlineFactory() {
       return rl;
     },
@@ -311,6 +313,7 @@ test('readline fallback queues a follow-up turn while the first dispatch is acti
   };
 
   await new Promise((resolve) => setImmediate(resolve));
+  await waitFor(() => rl.prompts > 0);
   rl.emit('line', 'Which file should I inspect?');
   await waitFor(() => dispatches.length === 1);
   rl.emit('line', 'Start with src/cli.js.');
@@ -402,6 +405,164 @@ test('runCli uses the TTY command picker and restores raw mode on exit', async (
   assert.deepEqual(stdin.rawModes, [true, false]);
   assert.equal(stderr.read(), '');
   assert.doesNotMatch(stdout.read(), /\u001B\[(?:3[0-7]|90)m/u);
+});
+
+for (const cancellationKey of [
+  { label: 'Ctrl+C', text: undefined, key: { ctrl: true, name: 'c' } },
+  { label: 'Escape', text: undefined, key: { name: 'escape' } },
+]) {
+  test(`real TTY ${cancellationKey.label} cancels an active turn without exiting`, async () => {
+    const stdin = new FakeTtyInput();
+    const stdout = new FakeTtyOutput();
+    const stderr = createOutput(false);
+    let active = true;
+    let cancels = 0;
+    let closed = false;
+    let settled = false;
+
+    const runPromise = runCli({
+      argv: ['--workspace', 'C:/repo'],
+      cwd: 'C:/repo',
+      stdin,
+      stdout,
+      stderr,
+      env: { NO_COLOR: '1' },
+      packageVersion: '1.2.3',
+      loadModelCatalog: async () => ({ codex: [], claude: [] }),
+      createRoomApplication() {
+        return {
+          start() {
+            return {
+              roomId: 'room-real-tty-cancel',
+              providers: [{ name: 'codex', status: 'available' }],
+              routingMode: 'auto',
+              safetyMode: 'single-writer',
+            };
+          },
+          getStatus() {
+            return {
+              roomId: 'room-real-tty-cancel',
+              providers: [{ name: 'codex', model: 'default', weight: 1 }],
+              activeProcess: active ? 'codex execute (turn-1)' : null,
+              activeStage: active ? 'execute' : null,
+            };
+          },
+          isBusy() { return active; },
+          async cancel() {
+            cancels += 1;
+            active = false;
+            return true;
+          },
+          async close() { closed = true; },
+        };
+      },
+    });
+    runPromise.finally(() => {
+      settled = true;
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+    stdin.emit('keypress', 'unfinished draft', { name: undefined });
+    stdin.emit('keypress', cancellationKey.text, cancellationKey.key);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(cancels, 1);
+    assert.equal(settled, false);
+    assert.equal(closed, false);
+    assert.deepEqual(stdin.rawModes, [true]);
+
+    stdin.emit('keypress', '/exit', { name: undefined });
+    stdin.emit('keypress', undefined, { name: 'enter' });
+    assert.equal(await runPromise, 0);
+    assert.equal(closed, true);
+  });
+}
+
+test('real TTY keypresses remain editable and queue a follow-up while a provider is active', async () => {
+  const stdin = new FakeTtyInput();
+  const stdout = new FakeTtyOutput();
+  const stderr = createOutput(false);
+  const dispatches = [];
+  const releases = [];
+  let active = false;
+
+  const runPromise = runCli({
+    argv: ['--workspace', 'C:/repo'],
+    cwd: 'C:/repo',
+    stdin,
+    stdout,
+    stderr,
+    env: { NO_COLOR: '1' },
+    packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
+    createRoomApplication() {
+      return {
+        start() {
+          return {
+            roomId: 'room-real-tty-queue',
+            providers: [{ name: 'codex', status: 'available' }],
+            routingMode: 'auto',
+            safetyMode: 'single-writer',
+          };
+        },
+        getStatus() {
+          return {
+            roomId: 'room-real-tty-queue',
+            providers: [
+              { name: 'codex', model: 'default', weight: 1 },
+              { name: 'claude', model: 'default', weight: 1 },
+            ],
+            activeProcess: active ? 'claude review (turn-1)' : null,
+            activeStage: active ? 'review' : null,
+          };
+        },
+        async dispatch(command) {
+          if (active) throw new Error('concurrent dispatch');
+          active = true;
+          dispatches.push(command);
+          await new Promise((resolve) => releases.push(resolve));
+          active = false;
+        },
+        isBusy() { return active; },
+        isAwaitingInput() { return false; },
+        async cancel() { return active; },
+        async close() {},
+      };
+    },
+  });
+
+  const waitFor = async (predicate) => {
+    const deadline = Date.now() + 1_000;
+    while (!predicate()) {
+      if (Date.now() >= deadline) throw new Error('Timed out waiting for CLI state.');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    stdin.emit('keypress', 'Inspect the parser.', { name: undefined });
+    stdin.emit('keypress', undefined, { name: 'enter' });
+    await waitFor(() => dispatches.length === 1);
+
+    stdin.emit('keypress', 'Start with src/cli.jx', { name: undefined });
+    stdin.emit('keypress', undefined, { name: 'backspace' });
+    stdin.emit('keypress', 's', { name: undefined });
+    stdin.emit('keypress', undefined, { name: 'enter' });
+    await waitFor(() => /queued/iu.test(stdout.read()));
+
+    assert.equal(dispatches.length, 1);
+    assert.match(stdout.read(), /waiting for CLAUDE review output/u);
+
+    releases.shift()?.();
+    await waitFor(() => dispatches.length === 2);
+    assert.equal(dispatches[1].prompt, 'Start with src/cli.js');
+  } finally {
+    releases.splice(0).forEach((release) => release());
+    stdin.emit('keypress', '/exit', { name: undefined });
+    stdin.emit('keypress', undefined, { name: 'enter' });
+    await runPromise;
+  }
 });
 
 test('interactive prompt keeps rotating activity above the live input line', async () => {
@@ -575,6 +736,175 @@ test('runCli queues a second plain TTY reply while the first dispatch is still p
   } finally {
     pendingDispatches.splice(0).forEach((release) => release());
     await Promise.allSettled([firstSubmit, secondSubmit]);
+    await promptDriver?.exit?.();
+    await runPromise;
+  }
+});
+
+test('runCli keeps an earlier follow-up queued when the active turn later requests clarification', async () => {
+  const stdin = new FakeTtyInput();
+  const stdout = new FakeTtyOutput();
+  const stderr = createOutput(false);
+  const dispatches = [];
+  let awaitingInput = false;
+  const releases = [];
+  let promptDriver;
+  let isPromptBusy;
+
+  const runPromise = runCli({
+    argv: ['--workspace', 'C:/repo'],
+    cwd: 'C:/repo',
+    stdin,
+    stdout,
+    stderr,
+    env: { NO_COLOR: '1' },
+    packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
+    interactivePromptFactory({ onSubmit, onExit, isBusy }) {
+      isPromptBusy = isBusy;
+      promptDriver = { submit: onSubmit, exit: onExit };
+      return {
+        async start() { return true; },
+        async stop() {},
+      };
+    },
+    createRoomApplication() {
+      let active = false;
+      return {
+        start() {
+          return {
+            roomId: 'room-tty-clarification',
+            providers: [{ name: 'codex', status: 'available' }],
+            routingMode: 'auto',
+            safetyMode: 'single-writer',
+          };
+        },
+        async dispatch(command) {
+          dispatches.push(command);
+          if (awaitingInput) {
+            awaitingInput = false;
+            releases.shift()?.();
+            return;
+          }
+          active = true;
+          await new Promise((resolve) => {
+            releases.push(() => {
+              active = false;
+              resolve();
+            });
+          });
+        },
+        isBusy() { return active; },
+        isAwaitingInput() { return awaitingInput; },
+        async cancel() { return active; },
+        async close() {},
+      };
+    },
+  });
+
+  const settleSoon = () => new Promise((resolve) => setImmediate(resolve));
+  try {
+    await settleSoon();
+    await promptDriver.submit('Inspect the parser.');
+    await settleSoon();
+    assert.equal(dispatches.length, 1);
+
+    await promptDriver.submit('Use src/orchestrator.js.');
+    awaitingInput = true;
+    assert.equal(isPromptBusy(), true);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    assert.equal(dispatches.length, 1);
+
+    await promptDriver.submit('Answer with src/cli.js.');
+    const deadline = Date.now() + 500;
+    while (dispatches.length < 3 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.equal(dispatches.length, 3);
+    assert.equal(dispatches[1].prompt, 'Answer with src/cli.js.');
+    assert.equal(dispatches[2].prompt, 'Use src/orchestrator.js.');
+  } finally {
+    releases.splice(0).forEach((release) => release());
+    await promptDriver?.exit?.();
+    await runPromise;
+  }
+});
+
+test('runCli immediately delivers input submitted while clarification is already active', async () => {
+  const stdin = new FakeTtyInput();
+  const stdout = new FakeTtyOutput();
+  const stderr = createOutput(false);
+  const dispatches = [];
+  let active = false;
+  let awaitingInput = false;
+  let releaseTurn;
+  let promptDriver;
+
+  const runPromise = runCli({
+    argv: ['--workspace', 'C:/repo'],
+    cwd: 'C:/repo',
+    stdin,
+    stdout,
+    stderr,
+    env: { NO_COLOR: '1' },
+    packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
+    interactivePromptFactory({ onSubmit, onExit }) {
+      promptDriver = { submit: onSubmit, exit: onExit };
+      return {
+        async start() { return true; },
+        async stop() {},
+      };
+    },
+    createRoomApplication() {
+      return {
+        start() {
+          return {
+            roomId: 'room-active-clarification',
+            providers: [{ name: 'codex', status: 'available' }],
+            routingMode: 'auto',
+            safetyMode: 'single-writer',
+          };
+        },
+        async dispatch(command) {
+          dispatches.push(command);
+          if (awaitingInput) {
+            awaitingInput = false;
+            active = false;
+            releaseTurn?.();
+            return;
+          }
+          active = true;
+          await new Promise((resolve) => {
+            releaseTurn = resolve;
+          });
+        },
+        isBusy() { return active; },
+        isAwaitingInput() { return awaitingInput; },
+        async cancel() { return active; },
+        async close() {},
+      };
+    },
+  });
+
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    await promptDriver.submit('Inspect the parser.');
+    await new Promise((resolve) => setImmediate(resolve));
+    awaitingInput = true;
+
+    await promptDriver.submit('Use src/orchestrator.js.');
+    const deadline = Date.now() + 250;
+    while (dispatches.length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.equal(dispatches.length, 2);
+    assert.equal(dispatches[1].prompt, 'Use src/orchestrator.js.');
+  } finally {
+    releaseTurn?.();
     await promptDriver?.exit?.();
     await runPromise;
   }

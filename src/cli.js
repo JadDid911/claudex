@@ -11,7 +11,10 @@ import {
   canUseInteractivePrompt,
   createInteractivePrompt,
 } from './ui/interactive-prompt.js';
-import { loadLocalModelCatalog } from './ui/model-catalog.js';
+import {
+  enrichStatusWithModelCatalog,
+  loadLocalModelCatalog,
+} from './ui/model-catalog.js';
 import { createTranscriptRenderer } from './ui/renderer.js';
 
 /**
@@ -54,7 +57,16 @@ export async function runCli(options = {}) {
   const readlineFactory = options.readlineFactory ?? defaultReadlineFactory;
   const interactivePromptFactory = options.interactivePromptFactory ?? createInteractivePrompt;
   const loadModelCatalog = options.loadModelCatalog ?? loadLocalModelCatalog;
-  const packageVersion = options.packageVersion ?? (await readPackageVersion());
+  const packageMetadata = options.packageMetadata ?? (
+    options.packageVersion
+      ? {
+          version: options.packageVersion,
+          author: 'JadDid911',
+          repository: 'github.com/JadDid911/claudex',
+        }
+      : await readPackageMetadata()
+  );
+  const packageVersion = options.packageVersion ?? packageMetadata.version;
   const args = parseArgv(argv, cwd);
 
   if (args.error) {
@@ -86,20 +98,30 @@ export async function runCli(options = {}) {
 
   const createRoomApplication =
     options.createRoomApplication ?? (await loadCreateRoomApplication());
+  const modelCatalog = await loadModelCatalog({ env });
 
   const app = await createRoomApplication({
     workspace: args.workspace,
     resumeRoomId: args.resumeRoomId,
     emitEvent: (event) => renderer.renderEvent(event),
-    emitStatus: (status) => renderer.renderStatus(status),
+    emitStatus: (status) => renderer.renderStatus(
+      enrichStatusWithModelCatalog(status, modelCatalog),
+    ),
     emitMessage: (actor, text, label = null) => renderer.renderMessage(actor, text, label),
     now: () => new Date(),
   });
 
   const startup = (await app.start?.()) ?? {};
-  renderer.renderStartup({
+  const enrichedStartup = enrichStatusWithModelCatalog({
     ...startup,
+    contextCapBytes: startup.contextCapBytes ?? null,
+    providers: startup.providers ?? [],
+  }, modelCatalog);
+  renderer.renderStartup({
+    ...enrichedStartup,
     version: startup.version ?? packageVersion,
+    author: startup.author ?? packageMetadata.author,
+    repository: startup.repository ?? packageMetadata.repository,
     workspace: startup.workspace ?? args.workspace,
     resumeLabel:
       startup.resumeLabel ?? (args.resumeRoomId ? `requested ${args.resumeRoomId}` : null),
@@ -110,7 +132,6 @@ export async function runCli(options = {}) {
       !options.readlineFactory && canUseInteractivePrompt({ input: stdin, output: stdout });
 
     if (useInteractivePrompt) {
-      const modelCatalog = await loadModelCatalog({ env });
       await runInteractivePromptLoop({
         app,
         renderer,
@@ -243,9 +264,19 @@ export async function handleLine({ app, renderer, line, stdout, stderr }) {
 }
 
 export async function readPackageVersion() {
+  return (await readPackageMetadata()).version;
+}
+
+export async function readPackageMetadata() {
   const packagePath = new URL('../package.json', import.meta.url);
   const packageJson = JSON.parse(await readFile(packagePath, 'utf8'));
-  return packageJson.version;
+  return {
+    version: packageJson.version,
+    author: packageJson.author ?? null,
+    repository: String(packageJson.repository?.url ?? packageJson.repository ?? '')
+      .replace(/^git\+https?:\/\//u, '')
+      .replace(/\.git$/u, '') || null,
+  };
 }
 
 async function loadCreateRoomApplication() {
@@ -363,10 +394,11 @@ async function runInteractivePromptLoop({
     input: stdin,
     output: stdout,
     color,
+    isBusy: () => Boolean(app.isBusy?.()),
     getContext: () => {
       let status = {};
       try {
-        status = app.getStatus?.() ?? {};
+        status = enrichStatusWithModelCatalog(app.getStatus?.() ?? {}, modelCatalog);
       } catch {
         status = {};
       }
@@ -380,7 +412,8 @@ async function runInteractivePromptLoop({
     onCancel: async () => {
       if (!app.isBusy?.()) return false;
       renderer.renderMessage('SYSTEM', 'Cancelling active turn…');
-      return app.cancel?.({ source: 'sigint' });
+      await app.cancel?.({ source: 'sigint' });
+      return false;
     },
     onExit: () => resolveExit(),
     onError: reportError,
@@ -401,6 +434,7 @@ function createSubmissionQueue({ app, renderer, stdout, stderr }) {
   let queuedLines = [];
   let draining = null;
   let queueVersion = 0;
+  const inFlight = new Set();
 
   const clearQueuedLines = () => {
     if (queuedLines.length === 0) return false;
@@ -410,8 +444,15 @@ function createSubmissionQueue({ app, renderer, stdout, stderr }) {
   };
 
   const waitForIdle = async (version) => {
-    while (queueVersion === version && app.isBusy?.()) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
+    while (queueVersion === version && app.isBusy?.() && !app.isAwaitingInput?.()) {
+      if (inFlight.size > 0) {
+        await Promise.race([
+          ...[...inFlight].map((pending) => pending.catch(() => {})),
+          new Promise((resolve) => setTimeout(resolve, 25)),
+        ]);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
     }
     return queueVersion === version;
   };
@@ -426,10 +467,29 @@ function createSubmissionQueue({ app, renderer, stdout, stderr }) {
           const ready = await waitForIdle(version);
           if (!ready) continue;
 
-          const line = queuedLines.shift();
-          if (!line) continue;
+          const awaitingInput = app.isAwaitingInput?.() === true;
+          const entryIndex = awaitingInput
+            ? queuedLines.findIndex((entry) => entry.answersClarification)
+            : 0;
+          if (entryIndex < 0) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            continue;
+          }
 
-          await handleLine({ app, renderer, line, stdout, stderr });
+          const [entry] = queuedLines.splice(entryIndex, 1);
+          if (!entry) continue;
+          const { line, answersClarification } = entry;
+          const pending = handleLine({ app, renderer, line, stdout, stderr });
+          inFlight.add(pending);
+          pending.finally(() => {
+            inFlight.delete(pending);
+            if (queuedLines.length > 0) drainQueuedLines();
+          });
+          if (answersClarification) {
+            await pending;
+          } else {
+            await Promise.resolve();
+          }
         }
       } finally {
         draining = null;
@@ -447,9 +507,12 @@ function createSubmissionQueue({ app, renderer, stdout, stderr }) {
       const command = parseInputLine(line);
 
       if (command.kind === 'turn') {
-        const alreadyBusy = app.isBusy?.() || queuedLines.length > 0 || draining != null;
-        queuedLines.push(line);
-        if (alreadyBusy) {
+        const answersClarification = app.isAwaitingInput?.() === true;
+        const alreadyBusy = (
+          app.isBusy?.() && !answersClarification
+        ) || queuedLines.length > 0 || draining != null;
+        queuedLines.push({ line, answersClarification });
+        if (alreadyBusy && !answersClarification) {
           renderer.renderMessage(
             'SYSTEM',
             'Queued · will send after the current turn finishes.',

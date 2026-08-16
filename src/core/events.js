@@ -38,12 +38,17 @@ const REDACTION_PATTERNS = [
       /\b(Bearer\s+)([A-Za-z0-9._~+/-]{8,})\b/giu,
     replacement: '$1[REDACTED:bearer-token]',
   },
-  {
-    pattern:
-      /(["']?)\b((?:api[-_ ]?key|token|secret|password|passwd|authorization|aws[-_ ]?(?:secret[-_ ]?access[-_ ]?key|session[-_ ]?token)|database[-_ ]?url|private[-_ ]?key|client[-_ ]?secret))\b\1(\s*[:=]\s*)(["']?)([^"'\s,;}]+)\4/giu,
-    replacement: '$1$2$1$3$4[REDACTED]$4',
-  },
 ];
+const LABELED_SECRET_KEY_SOURCE = String.raw`(?:api[-_ ]?(?:key|token)|access[-_ ]?token|refresh[-_ ]?token|token|secret|password|passwd|authorization|aws[-_ ]?(?:secret[-_ ]?access[-_ ]?key|session[-_ ]?token)|database[-_ ]?url|private[-_ ]?key|client[-_ ]?secret)`;
+const LABELED_SECRET_PREFIX_SOURCE = String.raw`(\b(?:const|let|var)\s+)?(["']?)\b(${LABELED_SECRET_KEY_SOURCE})\b\2(\s*(?<![=:])(?::(?!:)|=(?!=))\s*)`;
+const QUOTED_LABELED_SECRET_START_PATTERN = new RegExp(
+  String.raw`${LABELED_SECRET_PREFIX_SOURCE}(["'])`,
+  'giu',
+);
+const UNQUOTED_LABELED_SECRET_PATTERN = new RegExp(
+  String.raw`${LABELED_SECRET_PREFIX_SOURCE}(?!\s*["'])([^\r\n,;}]+)`,
+  'giu',
+);
 
 const DEFAULT_ACTOR = 'SYSTEM';
 const DEFAULT_TYPE = 'message';
@@ -85,7 +90,80 @@ export function redactSensitiveText(value) {
     text = text.replace(pattern, replacement);
   }
 
+  text = redactQuotedLabeledSecrets(text);
+
+  text = text.replace(
+    UNQUOTED_LABELED_SECRET_PATTERN,
+    (match, declaration, keyQuote, key, separator, secretValue) => {
+      if (!shouldRedactLabeledSecret(declaration, keyQuote, key, '', secretValue.trim())) {
+        return match;
+      }
+      return `${declaration ?? ''}${keyQuote}${key}${keyQuote}${separator}[REDACTED]`;
+    },
+  );
+
   return text;
+}
+
+function redactQuotedLabeledSecrets(text) {
+  let cursor = 0;
+  let redacted = '';
+
+  for (const match of text.matchAll(QUOTED_LABELED_SECRET_START_PATTERN)) {
+    if (match.index < cursor) {
+      continue;
+    }
+
+    const valueQuote = match[5];
+    const valueStart = match.index + match[0].length;
+    const closingQuote = findClosingSecretQuote(text, valueStart, valueQuote);
+    redacted += text.slice(cursor, match.index);
+    redacted += `${match[0]}[REDACTED]${valueQuote}`;
+
+    if (closingQuote < 0) {
+      cursor = text.length;
+      break;
+    }
+
+    cursor = closingQuote + 1;
+  }
+
+  return `${redacted}${text.slice(cursor)}`;
+}
+
+function findClosingSecretQuote(text, start, quote) {
+  for (let index = start; index < text.length; index += 1) {
+    if (text[index] === '\\' && index + 1 < text.length) {
+      index += 1;
+      continue;
+    }
+
+    if (text[index] !== quote) {
+      continue;
+    }
+
+    if (quote === "'" && text[index + 1] === "'") {
+      index += 1;
+      continue;
+    }
+
+    return index;
+  }
+
+  return -1;
+}
+
+function shouldRedactLabeledSecret(declaration, keyQuote, key, valueQuote, secretValue) {
+  const normalizedKey = String(key).toLowerCase().replace(/[^a-z0-9]/gu, '');
+  const genericKey = /^(?:token|secret|password|passwd|privatekey)$/u.test(normalizedKey);
+  const value = String(secretValue);
+  const codeIdentifier =
+    declaration &&
+    !keyQuote &&
+    !valueQuote &&
+    genericKey &&
+    /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*(?:\(\))?)*$/u.test(value);
+  return !codeIdentifier;
 }
 
 /**

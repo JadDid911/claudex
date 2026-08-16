@@ -50,6 +50,10 @@ const context = {
       { id: 'default', description: 'Provider default.', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
       { id: 'opus', description: 'Claude alias.', efforts: ['medium', 'high', 'xhigh', 'max'] },
       { id: 'fable', description: 'Planning specialist.', efforts: ['high', 'max'] },
+      { id: 'claude-opus-5', description: 'Versioned Opus 5.', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      { id: 'claude-opus-4-5', description: 'Versioned Opus 4.5.', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      { id: 'claude-sonnet-5', description: 'Versioned Sonnet 5.', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      { id: 'claude-haiku-4-5', description: 'Versioned Haiku 4.5.', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
     ],
   },
 };
@@ -70,10 +74,16 @@ test('model palette drills into provider and locally available models', () => {
   const providers = buildCommandPalette('/model ', context);
   const models = buildCommandPalette('/model codex ', context);
   const filtered = buildCommandPalette('/model codex gpt-f', context);
+  const claudeFamily = buildCommandPalette('/model claude op', context);
 
   assert.deepEqual(providers.items.map((item) => item.label), ['codex', 'claude']);
   assert.deepEqual(models.items.map((item) => item.label), ['gpt-current', 'default', 'gpt-fast', 'gpt-5.6-sol']);
   assert.deepEqual(filtered.items.map((item) => item.value), ['/model codex gpt-fast']);
+  assert.deepEqual(claudeFamily.items.map((item) => item.value), [
+    '/model claude opus',
+    '/model claude claude-opus-5',
+    '/model claude claude-opus-4-5',
+  ]);
 });
 
 test('weight and resume palettes expose contextual choices', () => {
@@ -137,8 +147,27 @@ test('profile palette drills through stage, provider, model, and effort choices'
     uiAliasProviders.items.map((item) => item.value),
     ['/profile ux auto', '/profile ux codex ', '/profile ux claude '],
   );
-  assert.deepEqual(reviewModels.items.map((item) => item.label), ['opus', 'default', 'fable']);
-  assert.deepEqual(filteredReviewModels.items.map((item) => item.value), ['/profile review claude opus ']);
+  assert.deepEqual(reviewModels.items.map((item) => item.label), [
+    'opus',
+    'default',
+    'fable',
+    'claude-opus-5',
+    'claude-opus-4-5',
+    'claude-sonnet-5',
+    'claude-haiku-4-5',
+  ]);
+  assert.deepEqual(filteredReviewModels.items.map((item) => item.value), [
+    '/profile review claude opus ',
+    '/profile review claude claude-opus-5 ',
+    '/profile review claude claude-opus-4-5 ',
+  ]);
+  assert.deepEqual(
+    buildCommandPalette('/profile review claude claude-opus-', context).items.map((item) => item.value),
+    [
+      '/profile review claude claude-opus-5 ',
+      '/profile review claude claude-opus-4-5 ',
+    ],
+  );
   assert.ok(executeEfforts.items.some((item) => item.value === '/profile execute codex gpt-5.6-sol ultra'));
   assert.ok(executeEfforts.items.some((item) => item.value === '/profile execute codex gpt-5.6-sol default'));
 });

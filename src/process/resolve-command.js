@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 
 const WINDOWS_DIRECT_EXTENSIONS = ['.exe', '.com'];
@@ -23,6 +24,16 @@ async function fileExists(fsImpl, filePath) {
   try {
     const stats = await fsImpl.stat(filePath);
     return stats.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function fileIsExecutable(fsImpl, filePath) {
+  if (!(await fileExists(fsImpl, filePath))) return false;
+  try {
+    await fsImpl.access(filePath, fsConstants.X_OK);
+    return true;
   } catch {
     return false;
   }
@@ -280,6 +291,9 @@ async function resolvePosixCommand({
         };
       }
 
+      if (!(await fileIsExecutable(fsImpl, absolutePath))) {
+        throw new Error(`Command "${command}" is not executable.`);
+      }
       return {
         command: absolutePath,
         argsPrefix: [],
@@ -293,7 +307,7 @@ async function resolvePosixCommand({
 
   for (const entry of splitPathEntries(getPathValue(env))) {
     const candidate = path.join(entry, command);
-    if (await fileExists(fsImpl, candidate)) {
+    if (await fileIsExecutable(fsImpl, candidate)) {
       return {
         command: candidate,
         argsPrefix: [],

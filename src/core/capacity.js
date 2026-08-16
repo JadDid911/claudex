@@ -33,6 +33,14 @@ function createProviderEntry(provider, options = {}) {
       ? options.observedHelperTurns
       : 0,
     observedTokens: Number.isInteger(options.observedTokens) ? options.observedTokens : 0,
+    lastTurnTokens: Number.isInteger(options.lastTurnTokens) ? options.lastTurnTokens : 0,
+    usageStatus: options.usageStatus ?? null,
+    usageScope: options.usageScope ?? null,
+    usageResetsAt: options.usageResetsAt ?? null,
+    usageRetryAfterSeconds: Number.isFinite(options.usageRetryAfterSeconds)
+      ? options.usageRetryAfterSeconds
+      : null,
+    usageReportedAt: options.usageReportedAt ?? null,
     capacitySource: options.capacitySource ?? 'configured',
     workspaceStickiness: Number.isInteger(options.workspaceStickiness)
       ? options.workspaceStickiness
@@ -124,8 +132,9 @@ export function isCapacityFailure(kind) {
 
 export function recordProviderTurn(ledger, provider, details = {}) {
   const entry = ensureEntry(ledger, provider);
+  entry.lastTurnTokens = Math.max(0, details.tokens ?? 0);
   entry.observedTurns += 1;
-  entry.observedTokens += Math.max(0, details.tokens ?? 0);
+  entry.observedTokens += entry.lastTurnTokens;
   entry.lastRole = details.role ?? 'lead';
   entry.lastLeadAt = details.role === 'lead' ? details.at ?? new Date().toISOString() : entry.lastLeadAt;
 
@@ -143,10 +152,25 @@ export function recordProviderTurn(ledger, provider, details = {}) {
   return entry;
 }
 
+export function recordProviderUsageLimit(ledger, provider, details = {}) {
+  const entry = ensureEntry(ledger, provider);
+  entry.usageStatus = details.status ? String(details.status).slice(0, 64) : null;
+  entry.usageScope = details.scope ? String(details.scope).slice(0, 128) : null;
+  entry.usageResetsAt = details.resetsAt ? String(details.resetsAt).slice(0, 128) : null;
+  entry.usageRetryAfterSeconds = Number.isFinite(details.retryAfterSeconds)
+    ? Math.max(0, details.retryAfterSeconds)
+    : null;
+  entry.usageReportedAt = details.reportedAt ?? new Date().toISOString();
+  ledger.updatedAt = entry.usageReportedAt;
+  return entry;
+}
+
 export function recordProviderSuccess(ledger, provider) {
   const entry = ensureEntry(ledger, provider);
   entry.failureStreak = 0;
   entry.lastFailureKind = null;
+  entry.cooldownMs = 0;
+  entry.cooldownUntil = null;
   ledger.updatedAt = new Date().toISOString();
   return entry;
 }
@@ -252,6 +276,10 @@ export class CapacityLedger {
    */
   recordTurn(provider, details = {}) {
     return recordProviderTurn(this.state, provider, details);
+  }
+
+  recordUsageLimit(provider, details = {}) {
+    return recordProviderUsageLimit(this.state, provider, details);
   }
 
   /**

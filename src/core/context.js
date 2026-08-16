@@ -93,8 +93,8 @@ export function buildContextPacket(input = {}) {
     role: redactSensitiveText(input.role ?? 'assistant'),
     dispatchSequence: input.dispatchSequence ?? null,
     safetyConstraints,
-    transcript,
     extra: normalizedExtra.value,
+    transcript,
     truncated: normalizedExtra.truncated,
     truncation: normalizedExtra.truncated ? { synthesisResultsTrimmed: true } : null,
   };

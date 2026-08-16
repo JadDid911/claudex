@@ -1,7 +1,8 @@
 {
   "name": "claudex",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "One visible, delegation-first terminal room for Codex and Claude.",
+  "author": "JadDid911",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/JadDid911/claudex.git"

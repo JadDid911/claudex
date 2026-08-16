@@ -7,6 +7,9 @@ import { createCanonicalEvent, isCanonicalEvent } from './events.js';
 import { normalizeDelegationMode } from './preferences.js';
 import { createWriteLeaseState, getWriteLeaseSnapshot, reconcilePersistedWriteLease } from './write-lease.js';
 
+const PRIVATE_DIRECTORY_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
 function timestamp(value) {
   if (typeof value === 'string') {
     return value;
@@ -33,16 +36,31 @@ function trimTrailingSeparator(value) {
   return value.replace(/[\\/]+$/u, '');
 }
 
-export function getLocalAppDataPath(env = process.env) {
-  if (env.LOCALAPPDATA) {
-    return env.LOCALAPPDATA;
+export function getLocalAppDataPath(env = process.env, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const pathImplementation = platform === 'win32' ? path.win32 : path.posix;
+  const homeDirectory = options.homeDirectory ?? os.homedir();
+  if (platform === 'win32') {
+    return absoluteEnvironmentPath(env.LOCALAPPDATA, pathImplementation) ??
+      pathImplementation.join(homeDirectory, 'AppData', 'Local');
   }
-
-  return path.join(os.homedir(), 'AppData', 'Local');
+  if (platform === 'darwin') {
+    return pathImplementation.join(homeDirectory, 'Library', 'Application Support');
+  }
+  return absoluteEnvironmentPath(env.XDG_STATE_HOME, pathImplementation) ??
+    pathImplementation.join(homeDirectory, '.local', 'state');
 }
 
-export function getDefaultStorageRoot(env = process.env) {
-  return path.join(getLocalAppDataPath(env), 'codex-claude-room');
+export function getDefaultStorageRoot(env = process.env, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const pathImplementation = platform === 'win32' ? path.win32 : path.posix;
+  const directoryName = platform === 'win32' ? 'codex-claude-room' : 'claudex';
+  return pathImplementation.join(getLocalAppDataPath(env, options), directoryName);
+}
+
+function absoluteEnvironmentPath(value, pathImplementation) {
+  const candidate = typeof value === 'string' ? value.trim() : '';
+  return candidate && pathImplementation.isAbsolute(candidate) ? candidate : null;
 }
 
 export function normalizeWorkspacePath(workspacePath) {
@@ -89,7 +107,35 @@ function validateRoomId(roomId) {
 }
 
 async function ensureDirectory(directoryPath) {
-  await fs.mkdir(directoryPath, { recursive: true });
+  await fs.mkdir(directoryPath, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+
+  if (process.platform !== 'win32') {
+    await fs.chmod(directoryPath, PRIVATE_DIRECTORY_MODE);
+  }
+}
+
+async function ensureStorageDirectories(workspacePaths, roomPath) {
+  if (workspacePaths.storageRootIsDefault) {
+    await ensureDirectory(workspacePaths.storageRoot);
+  } else {
+    await fs.mkdir(workspacePaths.storageRoot, { recursive: true });
+  }
+  await ensureDirectory(path.join(workspacePaths.storageRoot, 'workspaces'));
+  await ensureDirectory(workspacePaths.workspaceRoot);
+  await ensureDirectory(workspacePaths.roomsRoot);
+  await ensureDirectory(roomPath);
+}
+
+async function hardenFile(filePath) {
+  if (process.platform !== 'win32') {
+    try {
+      await fs.chmod(filePath, PRIVATE_FILE_MODE);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }
 }
 
 async function readJsonFile(filePath, fallback = null) {
@@ -114,8 +160,12 @@ async function writeJsonAtomically(filePath, value) {
   const contents = `${JSON.stringify(value, null, 2)}\n`;
 
   await ensureDirectory(directory);
-  await fs.writeFile(tempPath, contents, 'utf8');
+  await fs.writeFile(tempPath, contents, {
+    encoding: 'utf8',
+    mode: PRIVATE_FILE_MODE,
+  });
   await fs.rename(tempPath, filePath);
+  await hardenFile(filePath);
 }
 
 function createDefaultState(room, now = Date.now()) {
@@ -190,7 +240,11 @@ async function recoverEventsFile(eventsPath) {
     }
 
     if (repaired) {
-      await fs.writeFile(eventsPath, validPrefix, 'utf8');
+      await fs.writeFile(eventsPath, validPrefix, {
+        encoding: 'utf8',
+        mode: PRIVATE_FILE_MODE,
+      });
+      await hardenFile(eventsPath);
     }
 
     return {
@@ -244,12 +298,15 @@ function reconcileInterruptedState(state, now = Date.now()) {
 export function getWorkspaceStoragePaths(workspacePath, options = {}) {
   const normalizedWorkspacePath = normalizeWorkspacePath(workspacePath);
   const workspaceHash = hashWorkspacePath(normalizedWorkspacePath);
-  const storageRoot = options.storageRoot ?? getDefaultStorageRoot(options.env);
+  const defaultStorageRoot = getDefaultStorageRoot(options.env, options);
+  const storageRoot = options.storageRoot ?? defaultStorageRoot;
   const workspaceRoot = path.join(storageRoot, 'workspaces', workspaceHash);
   const roomsRoot = path.join(workspaceRoot, 'rooms');
 
   return {
     storageRoot,
+    storageRootIsDefault:
+      normalizeWorkspacePath(storageRoot) === normalizeWorkspacePath(defaultStorageRoot),
     workspaceHash,
     workspaceRoot,
     roomsRoot,
@@ -343,7 +400,11 @@ export class RoomStore {
         sequence: this.state.nextSequence,
         timestamp: timestamp(options.timestamp),
       });
-      await fs.appendFile(this.paths.eventsPath, `${JSON.stringify(event)}\n`, 'utf8');
+      await fs.appendFile(this.paths.eventsPath, `${JSON.stringify(event)}\n`, {
+        encoding: 'utf8',
+        mode: PRIVATE_FILE_MODE,
+      });
+      await hardenFile(this.paths.eventsPath);
       this.state.nextSequence += 1;
       this.state.updatedAt = event.timestamp;
       await writeJsonAtomically(this.paths.statePath, {
@@ -397,8 +458,7 @@ export async function createRoomStore(options) {
     eventsPath: path.join(roomPath, 'events.jsonl'),
   };
 
-  await ensureDirectory(roomPath);
-  await ensureDirectory(workspacePaths.workspaceRoot);
+  await ensureStorageDirectories(workspacePaths, roomPath);
 
   const existingRoom = await readJsonFile(paths.roomMetadataPath);
   const existingState = await readJsonFile(paths.statePath);
@@ -415,8 +475,16 @@ export async function createRoomStore(options) {
     writeLease: getWriteLeaseSnapshot(state.writeLease),
   });
 
-  await fs.appendFile(paths.eventsPath, '', 'utf8');
-  await fs.writeFile(workspacePaths.latestRoomPointer, `${roomMetadata.roomId}\n`, 'utf8');
+  await fs.appendFile(paths.eventsPath, '', {
+    encoding: 'utf8',
+    mode: PRIVATE_FILE_MODE,
+  });
+  await hardenFile(paths.eventsPath);
+  await fs.writeFile(workspacePaths.latestRoomPointer, `${roomMetadata.roomId}\n`, {
+    encoding: 'utf8',
+    mode: PRIVATE_FILE_MODE,
+  });
+  await hardenFile(workspacePaths.latestRoomPointer);
 
   return new RoomStore({
     room: roomMetadata,
@@ -461,6 +529,12 @@ export async function resumeRoomStore(options) {
   if (!room || !state) {
     return null;
   }
+
+  await ensureStorageDirectories(workspacePaths, roomPath);
+  await hardenFile(workspacePaths.latestRoomPointer);
+  await hardenFile(paths.roomMetadataPath);
+  await hardenFile(paths.statePath);
+  await hardenFile(paths.eventsPath);
 
   const hydratedState = {
     ...normalizePersistedState(state),

@@ -224,6 +224,18 @@ test('ClaudeProvider configured writers keep integrations while readers stay iso
   );
 });
 
+test('ClaudeProvider filters configured read tools to intrinsically read-only tools', () => {
+  const provider = createClaudeProvider({
+    readAllowedTools: ['Read', 'Glob', 'Grep', 'Bash(npm run verify:*)'],
+  });
+  const args = provider.buildArgs({ access: 'read' });
+
+  assert.deepEqual(
+    args.slice(args.indexOf('--tools'), args.indexOf('--tools') + 2),
+    ['--tools', 'Read,Glob,Grep'],
+  );
+});
+
 test('ClaudeProvider keeps prompt metacharacters off argv', async () => {
   const { provider, calls } = makeProvider('claude');
   await provider.runTurn({
@@ -541,7 +553,7 @@ test('ClaudeProvider write turns use a five-minute quiet-work watchdog by defaul
   assert.equal(overrideCalls[0].idleTimeoutMs, 42_000);
 });
 
-test('buildClaudePrompt ends with a non-interactive plain-text question contract for later room turns', async () => {
+test('buildClaudePrompt ends with a queued clarification contract for the same room turn', async () => {
   const { buildClaudePrompt } = await import('../../src/providers/claude.js');
 
   const built = buildClaudePrompt(
@@ -554,7 +566,7 @@ test('buildClaudePrompt ends with a non-interactive plain-text question contract
 
   assert.match(
     built,
-    /Never invoke interactive question tools[\s\S]*Ask exactly one plain-text question[\s\S]*wait for a later Room turn\.\s*$/iu,
+    /Never invoke interactive question tools[\s\S]*ask one text question[\s\S]*numbered options[\s\S]*wait for the answer in this Room turn\.\s*$/iu,
   );
   assert.match(built, /prefixed "Question for you: "/u);
 });

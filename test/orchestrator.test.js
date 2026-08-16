@@ -6,7 +6,11 @@ import { promises as fs } from 'node:fs';
 
 import { createDefaultConfig, loadConfig } from '../src/config.js';
 import { normalizeWorkspacePath } from '../src/core/store.js';
-import { createRoomApplication, isClarificationRequest } from '../src/orchestrator.js';
+import {
+  createRoomApplication,
+  isClarificationRequest,
+  parseClarificationRequest,
+} from '../src/orchestrator.js';
 import { parseInputLine } from '../src/ui/commands.js';
 
 class FakeProvider {
@@ -48,6 +52,7 @@ class FakeProvider {
 
     input.onEvent?.({ type: 'session', sessionId: `${this.name}-session` });
     input.onEvent?.({ type: 'activity', status: 'working' });
+    for (const event of this.options.events ?? []) input.onEvent?.(event);
     input.onEvent?.({ type: 'tool.start', tool: 'read', command: 'src/example.js' });
     input.onEvent?.({
       type: 'text.message',
@@ -97,7 +102,12 @@ async function createHarness(context, providerOptions = {}, applicationOptions =
   const claude = new FakeProvider('claude', providerOptions.claude, trace);
   let tick = 0;
   const now = () => new Date(Date.parse('2026-08-15T12:00:00.000Z') + tick++ * 1000);
-  const { protectWorkspaceAsHome = false, homeDirectory, ...roomOptions } = applicationOptions;
+  const {
+    protectWorkspaceAsHome = false,
+    homeDirectory,
+    requirePlanApproval = false,
+    ...roomOptions
+  } = applicationOptions;
   const app = createRoomApplication({
     workspace,
     config,
@@ -106,6 +116,7 @@ async function createHarness(context, providerOptions = {}, applicationOptions =
     emitStatus: (status) => statuses.push(status),
     now,
     persistConfig: false,
+    requirePlanApproval,
     homeDirectory: protectWorkspaceAsHome ? workspace : homeDirectory,
     ...roomOptions,
   });
@@ -229,12 +240,13 @@ test('a disposable same-provider review cannot replace the executor resume sessi
   setStageProfile(harness, 'execute', 'claude');
   setStageProfile(harness, 'review', 'claude');
 
-  await harness.app.dispatch({
+  const dispatch = harness.app.dispatch({
     kind: 'turn',
     route: 'auto',
     prompt: 'Implement the parser fix.',
     supermode: true,
   });
+  await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
 
   assert.equal(harness.claude.calls[1].access, 'read');
   assert.equal(harness.claude.calls[1].sessionId, null);
@@ -244,6 +256,8 @@ test('a disposable same-provider review cannot replace the executor resume sessi
     updatedAt: harness.app.store.state.providerSessions.claude.updatedAt,
   });
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'waiting-for-user');
+  await harness.app.cancel({ source: 'test' });
+  await dispatch;
 });
 
 test('supermode auto-delegates every unconfigured stage and returns synthesis to the executor', async (context) => {
@@ -283,7 +297,7 @@ test('default affinities keep Codex writing and Claude reviewing across observed
 });
 
 test('read-only supermode keeps execute and synthesis read-only and never acquires the writer lease', async (context) => {
-  const harness = await createHarness(context);
+  const harness = await createHarness(context, {}, { requirePlanApproval: true });
   let acquisitions = 0;
   const acquire = harness.app.lease.acquire.bind(harness.app.lease);
   harness.app.lease.acquire = (...args) => {
@@ -304,27 +318,83 @@ test('read-only supermode keeps execute and synthesis read-only and never acquir
   assert.equal(harness.app.lease.snapshot().current, null);
 });
 
+test('writable supermode pauses after planning until the user approves execution', { timeout: 1_000 }, async (context) => {
+  const harness = await createHarness(context, {}, { requirePlanApproval: true });
+
+  const dispatch = harness.app.dispatch({
+    kind: 'turn',
+    route: 'auto',
+    prompt: 'Build a polished mobile MOBA game.',
+    supermode: true,
+  });
+  await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
+
+  assert.deepEqual(harness.trace.map(traceStage), ['plan']);
+  assert.deepEqual(
+    harness.app.getStatus().pendingClarifications.map(({ role, options }) => ({ role, options })),
+    [{
+      role: 'plan-approval',
+      options: ['Execute this plan', 'Cancel Supermode'],
+    }],
+  );
+
+  await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'Execute this plan' });
+  await dispatch;
+
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute', 'review', 'synthesis']);
+  assert.equal(traceAccess(harness.trace[1]), 'write');
+  assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'completed');
+});
+
+test('read-only assignment prompts keep the user objective in the provider-visible prompt', async (context) => {
+  const harness = await createHarness(context, { claude: { available: false } });
+
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'codex',
+    prompt: 'Describe the scheduler boundary in plain language.',
+  });
+
+  assert.match(harness.codex.calls[0].prompt, /Describe the scheduler boundary in plain language\./u);
+});
+
 test('a plan-stage clarification pauses supermode before execute', async (context) => {
   const question = 'Question for you: Which parser file should I change?';
   const harness = await createHarness(context, {
-    claude: { eventText: question, result: { text: question } },
+    claude: {
+      eventText: question,
+      results: [
+        { text: question, sessionId: 'claude-plan-session' },
+        { text: 'PLAN_HANDOFF: update src/orchestrator.js.', sessionId: 'claude-plan-session' },
+      ],
+    },
   });
   setStageProfile(harness, 'plan', 'claude');
   setStageProfile(harness, 'execute', 'codex');
   setStageProfile(harness, 'review', 'claude');
 
-  await harness.app.dispatch({
+  const dispatch = harness.app.dispatch({
     kind: 'turn',
     route: 'auto',
     prompt: 'Implement the parser fix.',
     supermode: true,
   });
+  await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
 
   assert.deepEqual(harness.trace.map(traceStage), ['plan']);
   const turn = Object.values(harness.app.store.state.activeTurns)[0];
   assert.equal(turn.status, 'waiting-for-user');
   assert.equal(Object.hasOwn(turn, 'completedAt'), false);
   assert.equal(harness.app.lease.snapshot().current, null);
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'auto',
+    prompt: 'src/orchestrator.js',
+  });
+  await dispatch;
+  assert.deepEqual(harness.trace.map(traceStage), ['plan', 'plan', 'execute', 'review', 'synthesis']);
+  assert.equal(harness.claude.calls[1].sessionId, 'claude-plan-session');
+  assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'completed');
 });
 
 test('a supermode execute-stage pre-work requirement question waits for the user and skips review plus synthesis', async (context) => {
@@ -343,12 +413,13 @@ test('a supermode execute-stage pre-work requirement question waits for the user
   setStageProfile(harness, 'execute', 'claude');
   setStageProfile(harness, 'review', 'codex');
 
-  await harness.app.dispatch({
+  const dispatch = harness.app.dispatch({
     kind: 'turn',
     route: 'auto',
     prompt: 'Build a polished mobile-first game.',
     supermode: true,
   });
+  await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
 
   assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute']);
   assert.equal(harness.codex.calls.length, 1);
@@ -370,6 +441,9 @@ test('a supermode execute-stage pre-work requirement question waits for the user
   assert.equal(turn.status, 'waiting-for-user');
   assert.equal(turn.pipelineStage, 'execute');
   assert.equal(Object.hasOwn(turn, 'completedAt'), false);
+  assert.equal(harness.app.lease.snapshot().current?.ownerProvider, 'claude');
+  await harness.app.cancel({ source: 'test' });
+  await dispatch;
 });
 
 test('a supermode execute-stage clarification sentinel still blocks when preceded by a short preamble', async (context) => {
@@ -387,16 +461,19 @@ test('a supermode execute-stage clarification sentinel still blocks when precede
   setStageProfile(harness, 'execute', 'claude');
   setStageProfile(harness, 'review', 'codex');
 
-  await harness.app.dispatch({
+  const dispatch = harness.app.dispatch({
     kind: 'turn',
     route: 'auto',
     prompt: 'Build a polished mobile-first game.',
     supermode: true,
   });
+  await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
 
   assert.deepEqual(harness.trace.map(traceStage), ['plan', 'execute']);
   assert.equal(harness.codex.synthesisCalls.length, 0);
   assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'waiting-for-user');
+  await harness.app.cancel({ source: 'test' });
+  await dispatch;
 });
 
 test('a failed supermode writer skips review, synthesis, and provider replay', async (context) => {
@@ -631,52 +708,123 @@ test('automatic implementation persists lead/helper handoff and uses fresh Codex
   assert.equal(harness.app.store.state.providerSessions.claude.sessionId, 'claude-session');
 });
 
-test('a direct lead clarification question cancels the helper and waits for the user', { timeout: 1_000 }, async (context) => {
-  const question = 'What game should I build\u2014please specify its core action or genre, target player, visual tone, and whether it should be an installable web game or native app?';
+test('a provider clarification pauses the active turn and resumes the same session after an answer', { timeout: 1_000 }, async (context) => {
+  const question = [
+    'Question for you: Which target should I inspect first?',
+    '',
+    'Options:',
+    '1. src/cli.js',
+    '2. src/orchestrator.js',
+  ].join('\n');
   const harness = await createHarness(context, {
     codex: {
       eventText: question,
-      result: { text: question },
+      results: [
+        { text: question, sessionId: 'codex-question-session' },
+        { text: 'Inspection complete.', sessionId: 'codex-question-session' },
+      ],
     },
-    claude: {
-      waitForAbort: true,
-    },
+    claude: { available: false },
   });
+  harness.app.config.codex.model = 'gpt-5.6-sol';
+  harness.app.config.codex.effort = 'max';
+
+  const turn = harness.app.dispatch({
+    kind: 'turn',
+    route: 'codex',
+    prompt: 'Inspect the parser boundary.',
+  });
+  await waitUntil(() => harness.app.isAwaitingInput?.(), 500);
+
+  assert.equal(harness.codex.calls.length, 1);
+  assert.equal(harness.app.isBusy(), true);
+  assert.deepEqual(harness.app.getStatus().pendingClarifications, [{
+    id: harness.app.getStatus().pendingClarifications[0].id,
+    provider: 'codex',
+    role: 'lead',
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    question: 'Which target should I inspect first?',
+    options: ['src/cli.js', 'src/orchestrator.js'],
+  }]);
 
   await harness.app.dispatch({
     kind: 'turn',
     route: 'auto',
-    prompt: 'build a polished mobile-first game',
+    prompt: 'src/orchestrator.js',
+  });
+  await turn;
+
+  assert.equal(harness.codex.calls.length, 2);
+  assert.equal(harness.codex.calls[1].sessionId, 'codex-question-session');
+  assert.equal(harness.codex.calls[1].access, harness.codex.calls[0].access);
+  assert.equal(harness.codex.calls[1].modelOverride, 'gpt-5.6-sol');
+  assert.equal(harness.codex.calls[1].effortOverride, 'max');
+  assert.match(JSON.stringify(harness.codex.calls[1].context), /src\/orchestrator\.js/u);
+  assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'completed');
+  assert.equal(harness.app.isBusy(), false);
+  assert.ok((await harness.app.store.replayEvents()).events.some((event) =>
+    event.actor === 'YOU' &&
+    event.content === 'src/orchestrator.js' &&
+    event.metadata?.provider === 'codex',
+  ));
+  assert.ok((await harness.app.store.replayEvents()).events.some((event) =>
+    event.metadata?.code === 'clarification-answer' &&
+    event.metadata?.model === 'gpt-5.6-sol' &&
+    event.metadata?.effort === 'max',
+  ));
+});
+
+test('lead and helper clarification questions queue with provider ownership before synthesis', { timeout: 1_000 }, async (context) => {
+  const codexQuestion = 'Question for you: Which source file should I inspect?\n\nOptions:\n1. src/cli.js\n2. src/orchestrator.js';
+  const claudeQuestion = 'Question for you: Which verification depth should I use?\n\nOptions:\n1. Focused tests\n2. Full verification';
+  const harness = await createHarness(context, {
+    codex: {
+      results: [
+        { text: codexQuestion, sessionId: 'codex-question-session' },
+        { text: 'Codex continued.', sessionId: 'codex-question-session' },
+        { text: 'Combined answer.', sessionId: 'codex-question-session' },
+      ],
+    },
+    claude: {
+      results: [
+        { text: claudeQuestion, sessionId: 'claude-question-session' },
+        { text: 'Claude continued.', sessionId: 'claude-question-session' },
+      ],
+    },
   });
 
-  assert.equal(harness.codex.calls.length, 1);
-  assert.equal(harness.claude.calls.length, 1);
-  assert.equal(harness.claude.calls[0].signal.aborted, true);
-  assert.equal(harness.codex.synthesisCalls.length, 0);
+  const turn = harness.app.dispatch({
+    kind: 'turn',
+    route: 'both',
+    prompt: 'Review the parser boundary.',
+  });
+  await waitUntil(() => (
+    harness.app.isAwaitingInput?.() &&
+    harness.app.getStatus().pendingClarifications?.length === 2
+  ), 500);
 
-  const replay = await harness.app.store.replayEvents();
-  assert.ok(replay.events.some((event) => event.actor === 'CODEX' && event.content === question));
-  assert.equal(replay.events.some((event) => /handed findings/iu.test(event.content)), false);
-  assert.ok(replay.events.some(
-    (event) => event.actor === 'SYSTEM' &&
-      event.metadata?.code === 'waiting-for-user' &&
-      event.content === 'Waiting for your answer.',
-  ));
+  assert.deepEqual(
+    harness.app.getStatus().pendingClarifications.map(({ provider, role }) => [provider, role]),
+    [['codex', 'lead'], ['claude', 'helper']],
+  );
 
-  const turn = Object.values(harness.app.store.state.activeTurns)[0];
-  assert.equal(turn.status, 'waiting-for-user');
-  assert.equal(Object.hasOwn(turn, 'completedAt'), false);
-  assert.equal(harness.app.isBusy(), false);
+  await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'src/orchestrator.js' });
+  assert.deepEqual(
+    harness.app.getStatus().pendingClarifications.map(({ provider }) => provider),
+    ['claude'],
+  );
+  await harness.app.dispatch({ kind: 'turn', route: 'auto', prompt: 'Full verification' });
+  await turn;
 
-  const answer = 'Build an installable touch-first web game for casual players.';
-  harness.codex.options.eventText = 'Understood. I will use those requirements.';
-  harness.codex.options.result = { text: 'Understood. I will use those requirements.' };
-  await harness.app.dispatch({ kind: 'turn', route: 'codex', prompt: answer });
-
-  assert.equal(harness.codex.calls[1].prompt, answer);
-  assert.ok((await harness.app.store.replayEvents()).events.some(
-    (event) => event.actor === 'YOU' && event.content === answer,
-  ));
+  assert.equal(harness.codex.calls[1].sessionId, 'codex-question-session');
+  assert.equal(harness.claude.calls[1].sessionId, 'claude-question-session');
+  assert.equal(harness.codex.calls[1].access, harness.codex.calls[0].access);
+  assert.equal(harness.claude.calls[1].access, harness.claude.calls[0].access);
+  assert.match(JSON.stringify(harness.codex.calls[1].context), /src\/orchestrator\.js/u);
+  assert.match(JSON.stringify(harness.claude.calls[1].context), /Full verification/u);
+  assert.ok(harness.trace.some((entry) => entry.kind === 'turn' && entry.input.context?.role === 'synthesis'));
+  assert.equal(Object.values(harness.app.store.state.activeTurns)[0].status, 'completed');
 });
 
 test('assignment activity finishes after all queued provider events', async (context) => {
@@ -692,6 +840,71 @@ test('assignment activity finishes after all queued provider events', async (con
     (event) => event.actor === 'CODEX' && event.label === 'lead',
   );
   assert.equal(leadEvents.at(-1)?.type, 'activity.finish');
+});
+
+test('provider streaming activity stays live but persists one bounded result snapshot', async (context) => {
+  const harness = await createHarness(context, { claude: { available: false } });
+
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'codex',
+    prompt: 'Explain the current room state.',
+  });
+
+  assert.ok(harness.emitted.some((event) => event.actor === 'CODEX' && event.type === 'tool'));
+  assert.ok(harness.emitted.some((event) => event.actor === 'CODEX' && event.type === 'activity'));
+  const replay = await harness.app.store.replayEvents();
+  const persistedProviderEvents = replay.events.filter((event) => event.actor === 'CODEX');
+  assert.equal(persistedProviderEvents.length, 1);
+  assert.equal(persistedProviderEvents[0].type, 'message');
+  assert.equal(persistedProviderEvents[0].metadata?.code, 'provider-result-snapshot');
+  assert.equal(persistedProviderEvents[0].content, 'codex findings');
+});
+
+test('successful turns finish with a concise visible room summary', async (context) => {
+  const harness = await createHarness(context, { claude: { available: false } });
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'codex',
+    prompt: 'Explain the current room state.',
+  });
+
+  const summary = harness.emitted.find((event) => event.metadata?.code === 'turn-summary');
+  assert.equal(summary.actor, 'SYSTEM');
+  assert.match(summary.content, /Complete · CODEX completed · 5 observed tokens/u);
+});
+
+test('status exposes observed tokens and provider-reported account-limit telemetry', async (context) => {
+  const harness = await createHarness(context, {
+    codex: { available: false },
+    claude: {
+      events: [{
+        type: 'activity',
+        status: 'rate_limit_allowed',
+        info: {
+          status: 'allowed',
+          scope: 'five_hour',
+          resets_at: '2026-08-15T17:00:00.000Z',
+        },
+      }],
+    },
+  });
+
+  await harness.app.dispatch({
+    kind: 'turn',
+    route: 'claude',
+    prompt: 'Explain the current room state.',
+  });
+
+  const status = harness.app.getStatus();
+  const claude = status.providers.find((provider) => provider.name === 'claude');
+  const codex = status.providers.find((provider) => provider.name === 'codex');
+  assert.equal(claude.lastTurnTokens, 5);
+  assert.equal(claude.usageLimitSource, 'provider-reported');
+  assert.equal(claude.usageLimit.scope, 'five_hour');
+  assert.equal(claude.usageLimit.resetsAt, '2026-08-15T17:00:00.000Z');
+  assert.equal(codex.usageLimit, null);
+  assert.equal(codex.usageLimitSource, 'not-exposed');
 });
 
 test('a rhetorical question inside an ordinary lead answer still proceeds to synthesis', async (context) => {
@@ -772,6 +985,22 @@ test('the provider clarification prefix always marks one direct question as bloc
   }
 });
 
+test('provider clarification parser extracts bounded numbered choices without making custom text mandatory', () => {
+  assert.deepEqual(parseClarificationRequest([
+    'I need one required decision.',
+    '',
+    'Question for you: Which target should I use?',
+    '',
+    'Options:',
+    '1. src/cli.js',
+    '2) src/orchestrator.js',
+    '- Let Claudex choose',
+  ].join('\n')), {
+    question: 'Which target should I use?',
+    options: ['src/cli.js', 'src/orchestrator.js', 'Let Claudex choose'],
+  });
+});
+
 test('a concise unprefixed requirement question remains compatible with older provider output', () => {
   assert.equal(isClarificationRequest('Which file should I inspect?'), true);
 });
@@ -795,7 +1024,11 @@ test('an explicit Claude implementation turn runs Claude as the sole writer', as
   assert.equal(harness.codex.calls.length, 0);
   assert.equal(harness.app.lease.snapshot().current, null);
   const replay = await harness.app.store.replayEvents();
-  assert.ok(replay.events.some((event) => event.actor === 'CLAUDE' && /claude write result/iu.test(event.content)));
+  assert.ok(replay.events.some(
+    (event) => event.actor === 'CLAUDE' &&
+      event.metadata?.code === 'provider-result-snapshot' &&
+      /claude findings/iu.test(event.content),
+  ));
 });
 
 test('auto swaps an unavailable writer capability while keeping the helper read-only', async (context) => {
@@ -913,6 +1146,10 @@ test('status, model, weight, new, and resume commands retain room state', async 
 
   await harness.app.dispatch({ kind: 'command', name: 'new' });
   assert.notEqual(harness.app.store.room.roomId, firstRoomId);
+  assert.equal(
+    harness.app.lease.processLock.path,
+    path.join(harness.app.store.paths.workspaceRoot, 'workspace-write.lock'),
+  );
   await harness.app.dispatch({ kind: 'command', name: 'resume', roomId: firstRoomId });
   assert.equal(harness.app.store.room.roomId, firstRoomId);
   assert.equal(harness.app.ledger.providers.claude.weight, 3);

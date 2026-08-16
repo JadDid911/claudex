@@ -524,7 +524,33 @@ function chooseConfiguredStageProvider(snapshot, modeProviders, stage) {
  * fall back to the normal capacity-aware selection path.
  */
 export function createSupermodePlan(input = {}, ledger, options = {}) {
-  const classification = classifyTurn(input);
+  const initialClassification = classifyTurn(input);
+  const prompt = String(input.prompt ?? '');
+  const planOnly = [
+    /\b(?:plan only|only plan|only (?:produce|create|draft|return|give me) (?:a |the )?plan)\b/iu,
+    /\b(?:do not|don't|never)\s+(?:execute|implement|build|change|write|modify|edit)\b/iu,
+    /\b(?:no|without)\s+(?:workspace |code )?(?:changes?|edits?|modifications?)\b/iu,
+    /\bkeep\s+(?:this|it|the (?:task|turn|workspace))\s+read[- ]only\b/iu,
+    /\b(?:this|it|the (?:task|turn|workspace))\s+(?:must|should)\s+(?:remain|stay|be)\s+read[- ]only\b/iu,
+  ].some((pattern) => pattern.test(prompt));
+  const classification = planOnly
+    ? {
+        ...initialClassification,
+        kind: 'planning',
+        reason: 'explicit-read-only-supermode',
+        taskLane: 'plan',
+        helperWanted: true,
+        writerRequired: false,
+      }
+    : (!initialClassification.writerRequired && initialClassification.taskLane === 'plan')
+      ? {
+        ...initialClassification,
+        kind: 'implementation',
+        reason: 'supermode-plan-execution',
+        helperWanted: true,
+        writerRequired: true,
+      }
+      : initialClassification;
   const snapshot = getCapacitySnapshot(ledger, { now: options.now });
   const configuredExecutor = chooseConfiguredStageProvider(
     snapshot,

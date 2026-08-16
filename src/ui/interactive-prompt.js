@@ -13,9 +13,11 @@ import { sanitizeVisibleText } from './renderer.js';
 const CYAN = '\u001B[36m';
 const DIM = '\u001B[2m';
 const RESET = '\u001B[0m';
+const LOADING_FRAMES = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
 const MAX_MENU_ITEMS = 7;
 const DEFAULT_PROMPT_LABEL = 'claudex';
 const PROMPT_SUFFIX = ' \u203a ';
+const INPUT_PREFIX = '  \u203a ';
 const MENU_MARKER = '\u203a';
 const ELLIPSIS = '\u2026';
 
@@ -38,19 +40,27 @@ class InteractivePrompt {
     output = process.stdout,
     color = output.isTTY ?? false,
     getContext = () => ({}),
+    isBusy = () => false,
     onSubmit = async () => false,
     onCancel = async () => false,
     onExit = async () => {},
     onError = () => {},
+    setAnimationTimer = setInterval,
+    clearAnimationTimer = clearInterval,
+    animationIntervalMs = 90,
   } = {}) {
     this.input = input;
     this.output = output;
     this.color = prefersColor(color);
     this.getContext = getContext;
+    this.isBusy = isBusy;
     this.onSubmit = onSubmit;
     this.onCancel = onCancel;
     this.onExit = onExit;
     this.onError = onError;
+    this.setAnimationTimer = setAnimationTimer;
+    this.clearAnimationTimer = clearAnimationTimer;
+    this.animationIntervalMs = animationIntervalMs;
     this.buffer = '';
     this.cursor = 0;
     this.history = [];
@@ -58,12 +68,18 @@ class InteractivePrompt {
     this.historyDraft = '';
     this.selectedIndex = 0;
     this.renderedRows = 0;
+    this.rowsAboveInput = 0;
     this.visible = false;
     this.started = false;
-    this.submitting = false;
+    this.pendingSubmissions = 0;
     this.exiting = false;
     this.sigintArmed = false;
     this.previousRawMode = false;
+    this.animationTimer = null;
+    this.startupVisible = false;
+    this.startupFrame = 0;
+    this.busyFrame = 0;
+    this.pendingSubmission = '';
     this.boundKeypress = (text, key) => {
       Promise.resolve(this.handleKeypress(text, key)).catch((error) => this.onError(error));
     };
@@ -92,11 +108,13 @@ class InteractivePrompt {
     this.input.resume?.();
     this.started = true;
     this.show();
+    this.beginStartupReveal();
     return true;
   }
 
   async stop() {
     if (!this.started) return;
+    this.stopAnimationTimer();
     this.hide();
     this.input.off?.('keypress', this.boundKeypress);
     this.input.off?.('end', this.boundEnd);
@@ -122,45 +140,73 @@ class InteractivePrompt {
     if (!this.visible) return;
     this.clearFrame();
 
+    const columns = Math.max(40, Number(this.output.columns) || 80);
+    const context = this.getContext?.() ?? {};
+    const active = this.isActiveState();
     const palette = this.currentPalette();
-    if (palette) {
+
+    if (palette?.items.length) {
       this.selectedIndex = Math.min(this.selectedIndex, palette.items.length - 1);
     } else {
       this.selectedIndex = 0;
     }
 
-    const columns = Math.max(40, Number(this.output.columns) || 80);
-    const promptText = buildPromptText(this.getContext?.() ?? {}, columns);
-    const prompt = this.color ? `${CYAN}${promptText.trimEnd()}${RESET} ` : promptText;
-    const window = inputWindow(this.buffer, this.cursor, columns - promptText.length);
+    const promptText = buildPromptText(context, columns);
+    const prompt = this.color ? `${CYAN}${promptText}${RESET}` : promptText;
+    const lines = [prompt];
+    const loadingLine = this.startupVisible
+      ? formatLoadingLine(startupLoadingMessage(this.startupFrame), this.startupFrame, columns, this.color)
+      : active
+        ? formatLoadingLine(
+            this.pendingSubmission || busyLoadingMessage(context),
+            this.busyFrame,
+            columns,
+            this.color,
+          )
+        : null;
+
+    lines.push(loadingLine ?? '');
+
+    const window = inputWindow(this.buffer, this.cursor, columns - INPUT_PREFIX.length);
     const visibleInput = `${window.leading}${this.buffer.slice(window.start, window.end)}${window.trailing}`;
-    const cursorColumn = promptText.length + window.leading.length + this.cursor - window.start;
+    const cursorColumn = INPUT_PREFIX.length + window.leading.length + this.cursor - window.start;
     const menuLines = palette
       ? formatPalette(palette, this.selectedIndex, columns, this.color)
       : [];
 
-    this.output.write(`${prompt}${visibleInput}`);
+    lines.push(`${INPUT_PREFIX}${visibleInput}`);
     for (const line of menuLines) {
-      this.output.write(`\n${line}`);
+      lines.push(line);
     }
+    this.output.write(lines.join('\n'));
     if (menuLines.length > 0) moveCursor(this.output, 0, -menuLines.length);
     cursorTo(this.output, Math.max(0, cursorColumn));
     this.renderedRows = menuLines.length;
+    this.rowsAboveInput = 2;
+    this.syncAnimationTimer();
   }
 
   async handleKeypress(text, key = {}) {
     if (this.exiting) return;
 
+    if (this.startupVisible) {
+      this.startupVisible = false;
+      this.startupFrame = 0;
+      if (!this.isActiveState()) this.stopAnimationTimer();
+    }
+
     if (key.ctrl && key.name === 'c') {
       await this.handleCancel();
+      return;
+    }
+    if (key.name === 'escape') {
+      await this.handleEscape();
       return;
     }
     if (key.ctrl && key.name === 'd' && !this.buffer) {
       await this.requestExit();
       return;
     }
-    if (this.submitting) return;
-
     if (key.ctrl) {
       const palette = this.currentPalette();
       if (palette && (key.name === 'j' || key.name === 'n')) {
@@ -226,12 +272,6 @@ class InteractivePrompt {
       case 'delete':
         this.deleteForward();
         break;
-      case 'escape':
-        if (this.buffer) {
-          this.replaceBuffer('');
-          this.render();
-        }
-        break;
       default:
         this.insertText(text);
         break;
@@ -242,6 +282,9 @@ class InteractivePrompt {
     const palette = this.currentPalette();
     const selected = palette?.items[this.selectedIndex];
     const parsed = parseInputLine(this.buffer);
+    const clarificationChoice = Boolean(
+      palette?.kind === 'clarification' && selected && !this.buffer.trim(),
+    );
     const needsCompletion = Boolean(
       selected &&
         (parsed.kind === 'error' ||
@@ -253,19 +296,30 @@ class InteractivePrompt {
       this.accept(selected.value);
       return;
     }
-    if (parsed.kind === 'empty') return;
+    if (parsed.kind === 'empty' && !clarificationChoice) return;
 
-    const submitted = needsCompletion ? selected.value : this.buffer;
+    const submitted = clarificationChoice || needsCompletion ? selected.value : this.buffer;
     this.rememberHistory(submitted);
-    this.hide();
-    this.submitting = true;
+    this.pendingSubmissions += 1;
+    this.pendingSubmission = busySubmissionLabel(submitted, this.getContext?.() ?? {});
+    this.buffer = '';
+    this.cursor = 0;
+    this.historyIndex = null;
+    this.historyDraft = '';
+    this.selectedIndex = 0;
+    this.sigintArmed = false;
+    this.startupVisible = false;
+    this.startAnimationTimer();
+    this.render();
+
     let shouldExit = false;
     try {
       shouldExit = await this.onSubmit(submitted);
     } catch (error) {
       this.onError(error);
     } finally {
-      this.submitting = false;
+      this.pendingSubmissions = Math.max(0, this.pendingSubmissions - 1);
+      if (this.pendingSubmissions === 0) this.pendingSubmission = '';
     }
 
     if (shouldExit) {
@@ -273,23 +327,30 @@ class InteractivePrompt {
       return;
     }
 
-    this.buffer = '';
-    this.cursor = 0;
-    this.historyIndex = null;
-    this.historyDraft = '';
-    this.selectedIndex = 0;
-    this.sigintArmed = false;
     this.show();
+    this.render();
   }
 
   async handleCancel() {
-    if (this.submitting) {
-      if (this.sigintArmed) {
+    const busy = this.isActiveState();
+
+    if (busy) {
+      const hadDraft = Boolean(this.buffer);
+      if (hadDraft) {
+        this.replaceBuffer('');
+      }
+      if (!hadDraft && this.sigintArmed) {
         await this.requestExit();
         return;
       }
       this.sigintArmed = true;
-      await this.onCancel();
+      const shouldExit = await this.onCancel();
+      if (shouldExit) {
+        await this.requestExit();
+        return;
+      }
+      this.startAnimationTimer();
+      this.render();
       return;
     }
 
@@ -299,6 +360,27 @@ class InteractivePrompt {
       return;
     }
     await this.requestExit();
+  }
+
+  async handleEscape() {
+    const busy = this.isActiveState();
+    if (busy) {
+      if (this.buffer) {
+        this.replaceBuffer('');
+      }
+      const shouldExit = await this.onCancel();
+      if (shouldExit) {
+        await this.requestExit();
+        return;
+      }
+      this.startAnimationTimer();
+      this.render();
+      return;
+    }
+    if (this.buffer) {
+      this.replaceBuffer('');
+      this.render();
+    }
   }
 
   async requestExit() {
@@ -320,7 +402,7 @@ class InteractivePrompt {
 
   moveSelection(delta) {
     const palette = this.currentPalette();
-    if (!palette) return false;
+    if (!palette?.items.length) return false;
     this.selectedIndex = (this.selectedIndex + delta + palette.items.length) % palette.items.length;
     this.render();
     return true;
@@ -418,7 +500,69 @@ class InteractivePrompt {
   }
 
   currentPalette() {
-    return buildCommandPalette(this.buffer, this.getContext?.() ?? {});
+    const context = this.getContext?.() ?? {};
+    if (this.buffer.startsWith('/')) {
+      return buildCommandPalette(this.buffer, context);
+    }
+    return buildClarificationPalette(context) ?? buildCommandPalette(this.buffer, context);
+  }
+
+  isActiveState() {
+    return this.pendingSubmissions > 0 || Boolean(this.isBusy?.());
+  }
+
+  beginStartupReveal() {
+    if (!this.started || this.startupVisible) return;
+    this.startupVisible = true;
+    this.startupFrame = 0;
+    this.startAnimationTimer();
+    this.render();
+  }
+
+  startAnimationTimer() {
+    if (this.animationTimer || (!this.startupVisible && !this.isActiveState())) {
+      return;
+    }
+
+    this.animationTimer = this.setAnimationTimer(() => {
+      if (this.startupVisible) {
+        this.startupFrame += 1;
+        if (this.startupFrame >= 3) {
+          this.startupVisible = false;
+          this.startupFrame = 0;
+        }
+      } else {
+        this.busyFrame += 1;
+      }
+
+      if (!this.startupVisible && !this.isActiveState()) {
+        this.stopAnimationTimer();
+        this.render();
+        return;
+      }
+
+      this.render();
+    }, this.animationIntervalMs);
+    this.animationTimer?.unref?.();
+  }
+
+  syncAnimationTimer() {
+    if (this.startupVisible || this.isActiveState()) {
+      this.startAnimationTimer();
+      return;
+    }
+    this.stopAnimationTimer();
+  }
+
+  stopAnimationTimer() {
+    if (!this.animationTimer) {
+      return;
+    }
+
+    this.clearAnimationTimer(this.animationTimer);
+    this.animationTimer = null;
+    this.startupFrame = 0;
+    this.busyFrame = 0;
   }
 
   clearFrame() {
@@ -429,8 +573,14 @@ class InteractivePrompt {
       clearLine(this.output, 0);
     }
     if (this.renderedRows > 0) moveCursor(this.output, 0, -this.renderedRows);
+    for (let row = 0; row < this.rowsAboveInput; row += 1) {
+      moveCursor(this.output, 0, -1);
+      clearLine(this.output, 0);
+    }
+    if (this.rowsAboveInput > 0) moveCursor(this.output, 0, this.rowsAboveInput);
     cursorTo(this.output, 0);
     this.renderedRows = 0;
+    this.rowsAboveInput = 0;
   }
 }
 
@@ -440,7 +590,7 @@ function formatPalette(palette, selectedIndex, columns, color) {
     palette.items.length - MAX_MENU_ITEMS,
   ));
   const visible = palette.items.slice(start, start + MAX_MENU_ITEMS);
-  const title = singleLine(palette.title);
+  const title = clip(singleLine(palette.title), Math.max(1, columns - 2));
   const lines = [color ? `  ${DIM}${title}${RESET}` : `  ${title}`];
 
   for (let offset = 0; offset < visible.length; offset += 1) {
@@ -482,15 +632,65 @@ function singleLine(value) {
 }
 
 function buildPromptText(context, columns) {
+  const clarification = context.pendingClarifications?.[0];
+  if (clarification) {
+    const provider = singleLine(clarification.provider).toUpperCase() || 'PROVIDER';
+    const total = context.pendingClarifications.length;
+    const label = total > 1 ? `${provider} asks 1/${total}` : `${provider} asks`;
+    return clip(label, Math.max(4, columns - 1));
+  }
+
   const roomId = compactRoomId(context.roomId);
   const rawMode = singleLine(context.delegationMode ?? context.routingMode ?? '');
   const mode = rawMode.toLowerCase() === 'ui' ? 'ux' : rawMode.toLowerCase();
   const preferredProvider = singleLine(context.modeProviders?.[mode] ?? '').toLowerCase();
   const modeLabel = mode && preferredProvider && preferredProvider !== 'auto'
-    ? `${mode}→${preferredProvider.toUpperCase()}`
+    ? `${mode}\u2192${preferredProvider.toUpperCase()}`
     : mode;
-  const label = [roomId || DEFAULT_PROMPT_LABEL, modeLabel].filter(Boolean).join(' \u00b7 ');
-  return `${clip(label, Math.max(4, columns - PROMPT_SUFFIX.length - 1))}${PROMPT_SUFFIX}`;
+  const providerSummary = Array.isArray(context.providers)
+    ? context.providers
+      .map((provider) => {
+        const name = singleLine(provider?.name ?? 'provider').toUpperCase();
+        const model = singleLine(provider?.model ?? 'default');
+        const modelContext = formatModelContext(provider, context.modelCatalog);
+        return `${name} ${model}${modelContext ? ` (ctx ${modelContext})` : ''}`;
+      })
+      .filter(Boolean)
+      .join(' \u00b7 ')
+    : '';
+  const contextLimit = formatByteSize(context.contextCapBytes);
+  const label = [
+    roomId || DEFAULT_PROMPT_LABEL,
+    modeLabel,
+    providerSummary,
+    contextLimit ? `ctx ${contextLimit}` : null,
+  ].filter(Boolean).join(' \u00b7 ');
+  return clip(label, Math.max(4, columns - 1));
+}
+
+function buildClarificationPalette(context) {
+  const clarifications = Array.isArray(context.pendingClarifications)
+    ? context.pendingClarifications
+    : [];
+  const current = clarifications[0];
+  if (!current) return null;
+
+  const provider = singleLine(current.provider).toUpperCase() || 'PROVIDER';
+  const model = singleLine(current.model);
+  const effort = singleLine(current.effort);
+  const identity = [provider, model, effort].filter(Boolean).join(' \u00b7 ');
+  const question = singleLine(current.question) || 'What should I use?';
+  const options = Array.isArray(current.options) ? current.options : [];
+  return {
+    kind: 'clarification',
+    title: `${identity} asks \u00b7 ${question}`,
+    items: options.map((option, index) => ({
+      label: `${index + 1}. ${singleLine(option)}`,
+      detail: '',
+      value: singleLine(option),
+    })).filter((item) => item.value),
+    footer: `${clarifications.length > 1 ? `${clarifications.length} queued \u00b7 ` : ''}\u2191\u2193 select \u00b7 Enter answer \u00b7 or type your own answer`,
+  };
 }
 
 function compactRoomId(value) {
@@ -507,4 +707,93 @@ function clip(value, width) {
   if (width <= 0) return '';
   if (value.length <= width) return value;
   return width === 1 ? ELLIPSIS : `${value.slice(0, width - 1)}${ELLIPSIS}`;
+}
+
+function formatByteSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  if (value < 1024) return `${value} B`;
+
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let size = value / 1024;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  const rounded = size >= 10 || Number.isInteger(size)
+    ? Math.round(size)
+    : Math.round(size * 10) / 10;
+  return `${rounded} ${units[unitIndex]}`;
+}
+
+function formatModelContext(provider, modelCatalog) {
+  const explicit = Number(provider?.modelContextTokens);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return formatTokenCount(explicit);
+  }
+
+  const catalogEntry = Array.isArray(modelCatalog?.[provider?.name])
+    ? modelCatalog[provider.name].find((model) => model?.id === provider?.model)
+    : null;
+  return formatTokenCount(catalogEntry?.contextWindow ?? catalogEntry?.contextLimitTokens);
+}
+
+function formatTokenCount(tokens) {
+  const value = Number(tokens);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  if (value >= 1_000_000) {
+    const rounded = value / 1_000_000;
+    return `${Number.isInteger(rounded) ? rounded : Math.round(rounded * 10) / 10}M`;
+  }
+  if (value >= 1_000) {
+    const rounded = value / 1_000;
+    return `${Number.isInteger(rounded) ? rounded : Math.round(rounded * 10) / 10}K`;
+  }
+  return `${Math.round(value)}`;
+}
+
+function formatLoadingLine(message, frame, columns, color) {
+  const spinner = LOADING_FRAMES[frame % LOADING_FRAMES.length];
+  const text = clip(`${spinner} ${singleLine(message)}`, Math.max(4, columns));
+  return color ? `${CYAN}${text}${RESET}` : text;
+}
+
+function startupLoadingMessage(frame) {
+  return ['reading room context', 'checking provider selection', 'warming prompt'][frame % 3];
+}
+
+function busyLoadingMessage(context) {
+  const identity = activeActivityIdentity(context);
+  return `waiting for ${identity || 'provider'} output`;
+}
+
+function busySubmissionLabel(submitted, context) {
+  const activeIdentity = activeActivityIdentity(context);
+  if (activeIdentity) return `waiting for ${activeIdentity} output`;
+
+  const parsed = parseInputLine(submitted);
+  if (parsed.kind === 'turn') {
+    return parsed.route === 'auto'
+      ? 'starting turn'
+      : `waiting for ${singleLine(parsed.route).toUpperCase()} output`;
+  }
+  if (parsed.kind === 'command') {
+    return `running /${parsed.name}`;
+  }
+  return 'running turn';
+}
+
+function activeActivityIdentity(context) {
+  const stage = singleLine(context.activeStage);
+  const process = singleLine(context.activeProcess).replace(/\s+\([^)]*\)$/u, '');
+  const processProvider = stage && process.endsWith(` ${stage}`)
+    ? process.slice(0, -(stage.length + 1))
+    : process.split(/\s+/u)[0];
+  const provider = singleLine(
+    context.activeProvider ?? context.currentProvider ?? processProvider,
+  ).toUpperCase();
+  return [provider, stage].filter(Boolean).join(' ');
 }

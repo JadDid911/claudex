@@ -56,13 +56,13 @@ If you do not pass `--workspace`, Claudex uses the current directory.
 
 ## Command Palette
 
-In an interactive TTY, type `/` to open the command palette. Use Up/Down or `Ctrl+N`/`Ctrl+P` to move, `Tab` to complete, `Enter` to run, and `Esc` to clear.
+In an interactive TTY, type `/` to open the command palette. Use Up/Down or `Ctrl+N`/`Ctrl+P` to move, `Tab` to complete, and `Enter` to run. `Esc` clears an open picker or input buffer; with active provider work and an empty buffer, it cancels that work.
 
 Non-TTY output stays deterministic for logs and automation.
 
 `Ctrl+C` cancels the active turn first. Press it again to exit.
 
-The interactive terminal keeps normal scrollback while compressing transient work into one animated activity line. Durable provider responses remain in distinct Codex and Claude colors, routine tool lifecycle events stay compact, and a second plain-text turn entered while work is active is queued until the current writer lease is released. `/cancel` and `/exit` discard queued turns.
+The interactive terminal keeps normal scrollback while compressing transient work into one animated activity line. Durable provider responses remain in distinct Codex and Claude colors, routine tool lifecycle events stay compact, and a second plain-text turn entered while work is active is queued until the current writer lease is released. `/cancel`, `Esc` on an empty busy prompt, and the first `Ctrl+C` stop active work; `/exit` discards queued turns and exits.
 
 ## Commands
 
@@ -81,7 +81,7 @@ The interactive terminal keeps normal scrollback while compressing transient wor
 | `/mode <plan|code|execute|ux|review> <auto|codex|claude>` | Set the provider affinity for a stage. `review` controls review/checker work independently. |
 | `/profile` | Show saved stage profiles. |
 | `/profile <stage> auto` | Reset one stage profile to weighted auto routing. |
-| `/profile <stage> <provider> <model> <effort>` | Save a provider, model, and effort for `plan`, `code`, `execute`, `ux`, or `review`. |
+| `/profile <stage> <provider> <model> <effort>` | Delegate `plan`, `code`, `execute`, `ux`, or `review` to a specific provider, model version, and effort. |
 | `/model` | Show provider model settings. |
 | `/model <codex|claude> <model|default>` | Save or clear a provider model override. |
 | `/effort` | Show provider effort settings. |
@@ -130,18 +130,18 @@ Effort values accepted by the parser:
 - Codex: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`
 - Claude: `low`, `medium`, `high`, `xhigh`, `max`
 
-The model picker uses the local CLI model cache when available. It also accepts custom model IDs that match the parser rules.
+The Codex picker reads the local CLI model cache, including advertised context metadata, when available. The Claude picker includes family aliases plus versioned Fable, Opus, Sonnet, and Haiku choices and their published context windows. An alias such as `opus` follows the Claude CLI's current alias; a full ID such as `claude-opus-4-5` pins that model version. Custom model IDs are also accepted, and the provider ultimately decides whether the signed-in account can use them. Consult the official [OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model), [Claude model overview](https://platform.claude.com/docs/en/about-claude/models/overview), and [Claude model IDs and versioning](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions) when provider catalogs change.
 
 Stage profiles make the workflow fully swappable. For example:
 
 ```text
-/profile plan codex gpt-5.6-sol high
-/profile execute claude opus max
-/profile review codex gpt-5.6-sol ultra
+/profile plan claude claude-opus-5 max
+/profile execute codex gpt-5.6-sol max
+/profile review claude claude-opus-4-5 high
 /supermode Build the settings screen and verify it.
 ```
 
-This makes Codex plan, Claude execute, Codex review, and Claude synthesize. Synthesis always returns to the provider that actually executed and reuses that provider's execute-stage model and effort. Use `/profile <stage> auto` to restore weighted routing for a stage.
+This makes Opus 5 plan, GPT-5.6 Sol execute, Opus 4.5 review, and GPT-5.6 Sol synthesize. Synthesis always returns to the provider that actually executed and reuses that provider's execute-stage model and effort. Use `/profile <stage> auto` to restore weighted routing for a stage. Use `/model claude claude-sonnet-5` when you want a provider-wide default instead of a stage-specific override.
 
 ## Supermode
 
@@ -151,11 +151,11 @@ This makes Codex plan, Claude execute, Codex review, and Claude synthesize. Synt
 plan -> execute -> review -> synthesis
 ```
 
-For a mutating task, planning is read-only, execution gets the single writer lease, review runs fresh and read-only after execution, and synthesis returns to the executor. The lease remains held through review and synthesis so another writer cannot enter between implementation and post-review fixes. For a read-only task, every stage stays read-only.
+For a mutating task, planning is read-only. Claudex then shows the proposed plan and waits for `Execute this plan`, cancellation, or free-text revision feedback. Only after approval does execution get the single writer lease; review runs fresh and read-only after execution, and synthesis returns to the executor. The lease remains held through review and synthesis so another writer cannot enter between implementation and post-review fixes. For a read-only task, every stage stays read-only and no execution approval is needed.
 
 Each stage receives a bounded, sanitized handoff. Unconfigured stages use capacity-aware routing and automatic review prefers the provider other than the executor. A configured provider that is unavailable or cooling can fall back safely. The same provider reviews its own work only when explicitly configured or when no independent provider is eligible.
 
-One clarification question, a failure, or `/cancel` stops downstream stages. Claudex does not replay a writer after uncertain workspace changes.
+A clarification pauses the current stage without ending the workflow. Claudex labels the asking provider, offers any numbered choices it supplied, accepts a custom answer, resumes the same provider session and access level, then continues downstream. A failure or `/cancel` stops later stages. Claudex does not replay a writer after uncertain workspace changes.
 
 ## Workspace, trust, and storage
 
@@ -163,7 +163,7 @@ The current directory becomes the workspace unless you pass `--workspace`.
 
 Use a dedicated project directory. If the workspace resolves to your home directory, write-capable turns are blocked until you move to a project folder.
 
-Room data is stored outside the workspace under `%LOCALAPPDATA%\codex-claude-room`, namespaced by normalized workspace path. Claudex keeps its own room state there and does not write room metadata into your project tree.
+Room data is stored outside the workspace and namespaced by normalized workspace path. Windows retains `%LOCALAPPDATA%\codex-claude-room` for upgrade compatibility; macOS uses `~/Library/Application Support/claudex`; Linux uses `$XDG_STATE_HOME/claudex` or `~/.local/state/claudex`. Claudex does not write room metadata into your project tree.
 
 Claudex invokes the official CLIs directly, with no shell interpolation, and passes only a minimal allowlisted environment plus any explicit `environmentPassThrough` names.
 
@@ -173,7 +173,7 @@ See [docs/architecture.md](docs/architecture.md) for the runtime flow and intern
 
 Non-secret preferences live at `%LOCALAPPDATA%\codex-claude-room\config.json`. The legacy data-directory name is retained so existing Room profiles, transcripts, and resume handles continue to work after upgrading to Claudex.
 
-Defaults include a 30-minute turn timeout, a 64 KiB shared-context cap, equal provider weights, automatic stage affinities, configured Codex settings, and a lean Claude reader profile.
+Defaults include a 30-minute turn timeout, a 64 KiB shared-context cap, equal provider weights, automatic stage affinities, configured Codex settings that honor project `.rules`, and a lean Claude reader profile.
 
 Example:
 
@@ -205,11 +205,11 @@ Example:
 }
 ```
 
-Only explicitly named `environmentPassThrough` variables are added to the provider subprocess's minimal runtime environment. Do not put secret values in this JSON file.
+Only explicitly named `environmentPassThrough` variables are added to the provider subprocess's minimal runtime environment. Claude read stages are restricted to the intrinsically read-only `Read`, `Glob`, and `Grep` tools; shell commands are deliberately unavailable because repository scripts can mutate a workspace without a writer lease. Do not put secret values in this JSON file.
 
 ### Room files
 
-Each room stores an append-only sanitized `events.jsonl`, atomic `state.json`, and room metadata outside the project. `claudex --resume` restores the latest room for the current workspace. On restart, a torn event tail is repaired to its last valid record, and interrupted work is marked interrupted instead of silently replayed.
+Each room stores an append-only sanitized `events.jsonl`, atomic `state.json`, and room metadata outside the project. Transient deltas, tools, and spinner frames stay live-only; each provider stage persists one bounded result snapshot so streaming noise does not consume the next model's context. `claudex --resume` restores the latest room for the current workspace. On restart, a torn event tail is repaired to its last valid record, and interrupted work is marked interrupted instead of silently replayed.
 
 ## Authentication and privacy
 
@@ -252,7 +252,7 @@ Read turns are launched with read-only provider settings. Write turns use the pr
 - Claude readers use a restricted read-only tool envelope; Claude writers use `acceptEdits` without permission-bypass flags.
 - Prompts travel over child-process stdin with `shell: false`; executable discovery does not trust workspace-local command lookalikes.
 
-When a provider needs more input, it must ask exactly one plain-text question prefixed with `Question for you:`. Claudex treats that as waiting for user input and sends your next line as the answer.
+When a provider needs required input, it asks one plain-text question prefixed with `Question for you:` and may add 2-4 numbered options. Claudex turns that into an interactive choice list while still allowing any free-text answer. The card identifies the provider plus any configured model version and effort. The original workflow stays paused, and the answer returns to the same provider and read/write boundary; native sessions are reused where the provider can safely reassert that boundary, otherwise Claudex supplies a bounded continuation handoff. If Codex and Claude both need clarification, their questions queue in visible lead-then-helper order before synthesis continues.
 
 ## Troubleshooting
 
@@ -262,7 +262,7 @@ When a provider needs more input, it must ask exactly one plain-text question pr
 - `Write-protected workspace`: move the room to a dedicated project directory or pass `--workspace` explicitly.
 - `Rate limit`, `quota`, or `capacity`: wait for the provider to recover, inspect `/status`, or lower the provider weight with `/weight`.
 - `Timeout` or `idle-timeout`: split the task into smaller turns or retry with a narrower prompt.
-- `Question for you:`: answer the one question in the next room turn. Do not start a new topic until the question is answered.
+- `Question for you:`: choose an offered option or type a custom answer in the live prompt. Claudex resumes the paused workflow; it does not start an unrelated turn.
 
 ## Development and verification
 
@@ -281,9 +281,11 @@ npm run demo
 
 - Provider JSON event formats can change.
 - Startup does not prove provider account auth.
+- `/status` shows selected-model context windows, the smaller shared-room handoff cap, observed per-turn/room tokens, cooldowns, and provider-reported reset/scope data. Subscription balance percentages are shown only when a provider emits them; otherwise Claudex says the account limit is not exposed.
 - Capacity and quota are observed locally, not queried from a provider control plane.
 - Shared room context is bounded and sanitized, not a full merged provider history.
 - Provider subprocesses are one-shot and cannot open native interactive question dialogs.
+- Claude read-only reviewers inspect files without arbitrary shell execution. Keep verification in the write-capable executor stage, or run the documented project checks yourself after the turn.
 
 ## Contributing
 

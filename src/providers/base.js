@@ -2,7 +2,7 @@ import { isSensitiveMetadataKey, redactSensitiveText } from '../core/events.js';
 
 export const ROOM_CLARIFICATION_PREFIX = 'Question for you:';
 export const NON_INTERACTIVE_QUESTION_CONTRACT =
-  `Never invoke interactive question tools. If truly blocked, ask exactly one plain-text question prefixed "${ROOM_CLARIFICATION_PREFIX} " and wait for a later Room turn.`;
+  `Never invoke interactive question tools. If blocked, ask one text question prefixed "${ROOM_CLARIFICATION_PREFIX} ". Add 2-4 numbered options when useful; custom answers work. Wait for the answer in this Room turn.`;
 
 export const PROVIDER_STATUSES = Object.freeze([
   'completed',

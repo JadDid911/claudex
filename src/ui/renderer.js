@@ -65,7 +65,18 @@ class TranscriptRenderer {
         sanitizeVisibleText(snapshot.workspace ?? process.cwd()),
       ].filter(Boolean).join(' \u00b7 ');
       const safety = compactSafetyLabel(snapshot.safetyMode);
-      const lines = [summary, `${formatCompactProviderSummary(snapshot.providers)} \u00b7 ${safety}`];
+      const context = formatByteSize(snapshot.contextCapBytes);
+      const lines = [
+        summary,
+        `${formatCompactProviderSummary(snapshot.providers)}${context ? ` \u00b7 ctx ${context}` : ''} \u00b7 ${safety}`,
+      ];
+      const identity = [
+        sanitizeVisibleText(snapshot.author ?? '').trim(),
+        sanitizeVisibleText(snapshot.repository ?? '').trim(),
+      ].filter(Boolean).join(' \u00b7 ');
+      if (identity) {
+        lines.push(identity);
+      }
       if (snapshot.resumeLabel) {
         lines.push(sanitizeVisibleText(snapshot.resumeLabel));
       }
@@ -77,6 +88,8 @@ class TranscriptRenderer {
       `claudex ${snapshot.version ?? ''}`.trim(),
       `workspace: ${sanitizeVisibleText(snapshot.workspace ?? process.cwd())}`,
       `room id: ${sanitizeVisibleText(snapshot.roomId ?? 'pending')}`,
+      snapshot.author ? `author: ${sanitizeVisibleText(snapshot.author)}` : null,
+      snapshot.repository ? `repository: ${sanitizeVisibleText(snapshot.repository)}` : null,
       `providers: ${formatProviderSummary(snapshot.providers)}`,
       `routing: ${sanitizeVisibleText(snapshot.routingMode ?? 'auto')}`,
       `safety: ${sanitizeVisibleText(snapshot.safetyMode ?? 'single-writer')}`,
@@ -107,6 +120,10 @@ class TranscriptRenderer {
 
     if (Array.isArray(status.providers) && status.providers.length > 0) {
       for (const provider of status.providers) {
+        const contextLimit = formatByteSize(provider.sharedContextBytes ?? provider.contextCapBytes ?? status.contextCapBytes);
+        const modelContext = formatTokenCount(provider.modelContextTokens);
+        const usageSummary = formatUsageSummary(provider);
+        const usageLimitSummary = formatUsageLimitSummary(provider);
         lines.push(
           `${sanitizeVisibleText(provider.name)}: ` +
             [
@@ -120,8 +137,12 @@ class TranscriptRenderer {
               `model=${sanitizeVisibleText(provider.model ?? 'default')}`,
               `effort=${sanitizeVisibleText(provider.effort ?? 'default')}`,
               `profile=${sanitizeVisibleText(provider.profile ?? 'default')}`,
+              `modelContext=${sanitizeVisibleText(modelContext)}`,
+              contextLimit ? `context=${sanitizeVisibleText(contextLimit)}` : null,
+              usageSummary ? `usage=${sanitizeVisibleText(usageSummary)}` : null,
+              `usageLimit=${sanitizeVisibleText(usageLimitSummary)}`,
               `auth=${sanitizeVisibleText(provider.authStatus ?? 'not-verified')}`,
-            ].join(' ')
+            ].filter(Boolean).join(' ')
         );
       }
     }
@@ -147,6 +168,7 @@ class TranscriptRenderer {
   }
 
   renderCompactStatus(status = {}) {
+    const columns = Math.max(40, Number(this.output.columns) || 80);
     const room = compactRoomId(status.roomId ?? 'unknown');
     const mode = sanitizeVisibleText(status.delegationMode ?? 'auto');
     const processState = status.activeProcess
@@ -157,15 +179,27 @@ class TranscriptRenderer {
 
     for (const provider of Array.isArray(status.providers) ? status.providers : []) {
       const state = providerState(provider);
+      const modelContext = formatTokenCount(provider.modelContextTokens);
       const facts = [
         sanitizeVisibleText(provider.name ?? 'provider').toUpperCase(),
         state,
         compactModelLabel(provider),
+        `model ctx ${sanitizeVisibleText(modelContext)}`,
         `effort ${sanitizeVisibleText(provider.effort ?? 'default')}`,
         `weight ${sanitizeVisibleText(provider.weight ?? 'n/a')}`,
       ];
-      if (Number(provider.observedTurns) > 0) facts.push(`${provider.observedTurns} turns`);
-      if (Number(provider.observedTokens) > 0) facts.push(`${provider.observedTokens} tokens`);
+      const contextLimit = formatByteSize(provider.sharedContextBytes ?? provider.contextCapBytes ?? status.contextCapBytes);
+      const usageSummary = formatUsageSummary(provider);
+      const usageLimitSummary = formatUsageLimitSummary(provider);
+      if (columns >= 90 && contextLimit) facts.push(`context ${sanitizeVisibleText(contextLimit)}`);
+      if (provider.sharedContextBytes && columns >= 110) facts.push(`shared ${sanitizeVisibleText(formatByteSize(provider.sharedContextBytes))}`);
+      if (columns >= 110 && usageSummary) facts.push(`usage ${sanitizeVisibleText(usageSummary)}`);
+      if (columns >= 110) facts.push(`usage limit ${sanitizeVisibleText(usageLimitSummary)}`);
+      else {
+          if (Number(provider.observedTurns) > 0) facts.push(`${provider.observedTurns} turns`);
+          if (Number(provider.observedTokens) > 0) facts.push(`${provider.observedTokens} tokens`);
+          if (Number(provider.lastTurnTokens) > 0) facts.push(`last ${provider.lastTurnTokens} tokens`);
+        }
       if (provider.cooldown && provider.cooldown !== '0s') facts.push(`cooldown ${sanitizeVisibleText(provider.cooldown)}`);
       lines.push(facts.join(' \u00b7 '));
     }
@@ -590,7 +624,12 @@ function formatCompactProviderSummary(providers) {
   return providers
     .map((provider) => {
       const name = sanitizeVisibleText(provider.name ?? 'provider').toUpperCase();
-      return `${name} ${providerState(provider)}`;
+      return [
+        `${name} ${providerState(provider)}`,
+        `model ${compactModelLabel(provider)}`,
+        `effort ${sanitizeVisibleText(provider.effort ?? 'default')}`,
+        `weight ${sanitizeVisibleText(provider.weight ?? 'n/a')}`,
+      ].join(' \u00b7 ');
     })
     .join(' \u00b7 ');
 }
@@ -661,6 +700,87 @@ function providerState(provider = {}) {
 function compactModelLabel(provider = {}) {
   const explicit = sanitizeVisibleText(provider.model ?? provider.resolvedModel ?? '');
   return explicit || 'default';
+}
+
+function formatUsageSummary(provider = {}) {
+  const turns = Number(provider.observedTurns);
+  const tokens = Number(provider.observedTokens);
+  const lastTurnTokens = Number(provider.lastTurnTokens);
+  if (
+    (!Number.isFinite(turns) || turns <= 0) &&
+    (!Number.isFinite(tokens) || tokens <= 0) &&
+    (!Number.isFinite(lastTurnTokens) || lastTurnTokens <= 0)
+  ) {
+    return '';
+  }
+  const pieces = [];
+  if (Number.isFinite(turns) && turns > 0) pieces.push(`${Math.max(0, turns)} turns`);
+  if (Number.isFinite(tokens) && tokens > 0) pieces.push(`${Math.max(0, tokens)} tokens`);
+  if (Number.isFinite(lastTurnTokens) && lastTurnTokens > 0) {
+    pieces.push(`last ${Math.max(0, lastTurnTokens)} tokens`);
+  }
+  return pieces.join(' / ');
+}
+
+function formatUsageLimitSummary(provider = {}) {
+  const usageLimit = provider.usageLimit ?? null;
+  if (!usageLimit || typeof usageLimit !== 'object') {
+    const status = sanitizeVisibleText(provider.usageStatus ?? '').trim();
+    const scope = sanitizeVisibleText(provider.usageScope ?? '').trim();
+    const resetsAt = sanitizeVisibleText(provider.usageReset ?? provider.usageResetsAt ?? '').trim();
+    const pieces = [status, scope, resetsAt].filter(Boolean);
+    return pieces.length > 0 ? pieces.join(' / ') : 'provider-managed / not exposed';
+  }
+
+  const pieces = [];
+  const status = sanitizeVisibleText(usageLimit.status ?? provider.usageStatus ?? '');
+  const scope = sanitizeVisibleText(usageLimit.scope ?? provider.usageScope ?? '');
+  const resetsAt = sanitizeVisibleText(usageLimit.resetsAt ?? provider.usageResetsAt ?? '');
+  const retryAfterSeconds = Number(
+    usageLimit.retryAfterSeconds ?? provider.usageRetryAfterSeconds ?? Number.NaN,
+  );
+
+  if (status) pieces.push(status);
+  if (scope) pieces.push(`scope=${scope}`);
+  if (resetsAt) pieces.push(`resetsAt=${resetsAt}`);
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    pieces.push(`retry ${Math.ceil(retryAfterSeconds)}s`);
+  }
+
+  return pieces.length > 0 ? pieces.join(' ') : 'provider-managed / not exposed';
+}
+
+function formatTokenCount(tokens) {
+  const value = Number(tokens);
+  if (!Number.isFinite(value) || value <= 0) return 'n/a';
+  if (value >= 1_000_000) {
+    const rounded = value / 1_000_000;
+    return `${Number.isInteger(rounded) ? rounded : Math.round(rounded * 10) / 10}M`;
+  }
+  if (value >= 1_000) {
+    const rounded = value / 1_000;
+    return `${Number.isInteger(rounded) ? rounded : Math.round(rounded * 10) / 10}K`;
+  }
+  return `${Math.round(value)}`;
+}
+
+function formatByteSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  if (value < 1024) return `${Math.round(value)} B`;
+
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let size = value / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  const rounded = size >= 10 || Number.isInteger(size)
+    ? Math.round(size)
+    : Math.round(size * 10) / 10;
+  return `${rounded} ${units[unitIndex]}`;
 }
 
 function compactRoomId(value) {

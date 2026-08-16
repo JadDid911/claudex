@@ -28,6 +28,60 @@ test('redactSensitiveText removes likely credentials', () => {
   assert.match(output, /apiKey=\[REDACTED\]/iu);
 });
 
+test('redactSensitiveText preserves ordinary parser and authentication code', () => {
+  const source = [
+    'const token = parser.nextToken();',
+    'const password = expectedPassword;',
+    'return secret === storedSecret;',
+  ].join('\n');
+
+  assert.equal(redactSensitiveText(source), source);
+  assert.match(redactSensitiveText('API_TOKEN=fixture123456789'), /API_TOKEN=\[REDACTED\]/u);
+});
+
+test('redactSensitiveText redacts alphabetic values in labeled secret assignments', () => {
+  for (const [input, expected] of [
+    ['password=huntertwo', 'password=[REDACTED]'],
+    ['token=abcdefghij', 'token=[REDACTED]'],
+    ['secret=longalphabeticsecret', 'secret=[REDACTED]'],
+  ]) {
+    assert.equal(redactSensitiveText(input), expected);
+  }
+});
+
+test('redactSensitiveText fully redacts labeled secrets containing spaces and punctuation', () => {
+  const jsonValue = ['correct', 'horse', 'battery', 'staple'].join(' ');
+  const yamlValue = ['multi', 'word', 'secret!'].join(' ');
+  const singleQuotedValue = ['single', 'quoted', 'secret', 'value?'].join(' ');
+  for (const [input, expected] of [
+    [`{"password": "${jsonValue}"}`, '{"password": "[REDACTED]"}'],
+    [`client_secret: "${yamlValue}"`, 'client_secret: "[REDACTED]"'],
+    [`api_token: '${singleQuotedValue}'`, "api_token: '[REDACTED]'"],
+    [`password=${jsonValue}!`, 'password=[REDACTED]'],
+  ]) {
+    assert.equal(redactSensitiveText(input), expected);
+  }
+});
+
+test('redactSensitiveText fails closed for YAML escapes and unfinished quoted secrets', () => {
+  const yamlEscapedValue = `correct ''horse'' battery staple`;
+  const multilineValue = ['first line', 'second line!'].join('\n');
+  const unfinishedValue = ['unfinished secret', 'still secret'].join('\n');
+
+  assert.equal(
+    redactSensitiveText(`password: '${yamlEscapedValue}'`),
+    "password: '[REDACTED]'",
+  );
+  assert.equal(
+    redactSensitiveText(`client_secret: "${multilineValue}"`),
+    'client_secret: "[REDACTED]"',
+  );
+  assert.equal(
+    redactSensitiveText(`token: "${unfinishedValue}`),
+    'token: "[REDACTED]"',
+  );
+});
+
 test('redactSensitiveText covers cloud, URL, JWT, JSON, and private-key shapes', () => {
   const probes = [
     `AKIA${'A'.repeat(16)}`,

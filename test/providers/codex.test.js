@@ -71,14 +71,14 @@ test('CodexProvider writer mode uses approve-for-me without an explicit sandbox 
     output_tokens: 4,
     reasoning_output_tokens: 1,
   });
-  assert.deepEqual(calls[0].args.slice(0, 6), [
+  assert.deepEqual(calls[0].args.slice(0, 5), [
     'exec',
     '--json',
     '-C',
     process.cwd(),
     '--approve-for-me',
-    '--ignore-rules',
   ]);
+  assert.equal(calls[0].args.includes('--ignore-rules'), false);
   assert.equal(calls[0].args.includes('workspace-write'), false);
   assert.ok(calls[0].args.includes('--skip-git-repo-check'));
 });
@@ -503,7 +503,7 @@ test('CodexProvider write turns use a five-minute quiet-work watchdog by default
   assert.equal(overrideCalls[0].idleTimeoutMs, 42_000);
 });
 
-test('buildCodexPrompt ends with a non-interactive plain-text question contract for later room turns', async () => {
+test('buildCodexPrompt ends with a queued clarification contract for the same room turn', async () => {
   const { buildCodexPrompt } = await import('../../src/providers/codex.js');
 
   const built = buildCodexPrompt('Investigate the flaky turn handoff.', {
@@ -516,7 +516,7 @@ test('buildCodexPrompt ends with a non-interactive plain-text question contract 
 
   assert.match(
     built,
-    /Never invoke interactive question tools[\s\S]*Ask exactly one plain-text question[\s\S]*wait for a later Room turn\.\s*$/iu,
+    /Never invoke interactive question tools[\s\S]*ask one text question[\s\S]*numbered options[\s\S]*wait for the answer in this Room turn\.\s*$/iu,
   );
   assert.match(built, /prefixed "Question for you: "/u);
 });

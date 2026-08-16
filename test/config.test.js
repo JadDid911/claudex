@@ -43,13 +43,14 @@ test('default configuration stays non-secret and uses safe provider profiles', (
 
   assert.equal(config.storageRoot, 'C:\\Local\\codex-claude-room');
   assert.equal(getConfigPath({ env: { LOCALAPPDATA: 'C:\\Local' } }), 'C:\\Local\\codex-claude-room\\config.json');
-  assert.equal(config.codex.ignoreRules, true);
+  assert.equal(config.codex.ignoreRules, false);
   assert.equal(config.codex.configurationMode, 'configured');
   assert.equal(config.codex.ignoreUserConfig, false);
   assert.equal(config.claude.profileMode, 'lean');
   assert.equal(config.claude.safeMode, true);
   assert.equal(config.claude.noChrome, true);
   assert.equal(config.claude.disableSlashCommands, true);
+  assert.deepEqual(config.claude.readAllowedTools, ['Read', 'Glob', 'Grep']);
   assert.deepEqual(config.environmentPassThrough, []);
   assert.doesNotMatch(JSON.stringify(config), /token|password|apiKey/iu);
 });
@@ -75,10 +76,32 @@ test('normalization preserves configured Codex profiles and requires explicit fu
   assert.equal(config.claude.safeMode, false);
 });
 
+test('normalization preserves unknown future configuration keys', () => {
+  const config = normalizeConfig({
+    futureFeature: { enabled: true },
+    codex: { futureFlag: 'keep-me' },
+    claude: { futureFlag: 'keep-me-too' },
+  });
+
+  assert.deepEqual(config.futureFeature, { enabled: true });
+  assert.equal(config.codex.futureFlag, 'keep-me');
+  assert.equal(config.claude.futureFlag, 'keep-me-too');
+});
+
+test('normalization rejects shell tools from Claude read stages', () => {
+  const config = normalizeConfig({
+    claude: {
+      readAllowedTools: ['Read', 'Glob', 'Grep', 'Bash(npm run verify:*)'],
+    },
+  });
+  assert.deepEqual(config.claude.readAllowedTools, ['Read', 'Glob', 'Grep']);
+});
+
 test('load and save configuration atomically round-trip supported preferences', async (context) => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'room-config-'));
   context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
   const configPath = path.join(tempRoot, 'config.json');
+  if (process.platform !== 'win32') await fs.chmod(tempRoot, 0o755);
 
   const missing = await loadConfig({ configPath, storageRoot: tempRoot });
   assert.equal(missing.storageRoot, tempRoot);
@@ -98,6 +121,26 @@ test('load and save configuration atomically round-trip supported preferences', 
   assert.equal(loaded.codex.configurationMode, 'lean');
   assert.equal(loaded.codex.ignoreUserConfig, true);
   assert.equal(loaded.codex.profile, 'fast');
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(tempRoot)).mode & 0o777, 0o755);
+    assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
+  }
+});
+
+test('default-named config directories are private without chmodding custom parents', {
+  skip: process.platform === 'win32',
+}, async (context) => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'claudex-config-permissions-'));
+  context.after(() => fs.rm(parent, { recursive: true, force: true }));
+  await fs.chmod(parent, 0o755);
+  const storageRoot = path.join(parent, 'claudex');
+  const configPath = path.join(storageRoot, 'config.json');
+
+  await saveConfig(createDefaultConfig({ storageRoot }), { configPath, storageRoot });
+
+  assert.equal((await fs.stat(parent)).mode & 0o777, 0o755);
+  assert.equal((await fs.stat(storageRoot)).mode & 0o777, 0o700);
+  assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
 });
 
 test('default configuration exposes per-provider effort preferences', () => {

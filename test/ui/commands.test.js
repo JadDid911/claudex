@@ -248,6 +248,15 @@ test('profile command shows, resets, and configures saved stage profiles', () =>
     effort: 'max',
     raw: '/profile review claude opus max',
   });
+  assert.deepEqual(parseInputLine('/profile review claude claude-opus-4-5 high'), {
+    kind: 'command',
+    name: 'profile',
+    stage: 'review',
+    provider: 'claude',
+    model: 'claude-opus-4-5',
+    effort: 'high',
+    raw: '/profile review claude claude-opus-4-5 high',
+  });
   assert.deepEqual(parseInputLine('/profile ui claude default default'), {
     kind: 'command',
     name: 'profile',

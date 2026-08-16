@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { buildContextPacket } from '../../src/core/context.js';
+import { buildClaudePrompt } from '../../src/providers/claude.js';
+import { buildCodexPrompt } from '../../src/providers/codex.js';
 
 test('buildContextPacket preserves bounded transcript context', () => {
   const transcript = Array.from({ length: 10 }, (_, index) => ({
@@ -25,6 +27,38 @@ test('buildContextPacket preserves bounded transcript context', () => {
   assert.equal(result.truncated, true);
   assert.ok(result.packet.transcript.length < transcript.length);
   assert.ok(result.bytes <= 1024);
+});
+
+test('provider prompt budgeting preserves Supermode handoffs ahead of transcript history', () => {
+  const maxBytes = 64 * 1024;
+  const transcript = Array.from({ length: 512 }, (_, index) => ({
+    sequence: index + 1,
+    actor: index % 2 === 0 ? 'CODEX' : 'CLAUDE',
+    type: 'message',
+    content: `historical event ${index} ${'x'.repeat(32)}`,
+    metadata: {},
+  }));
+  const context = buildContextPacket({
+    workspace: 'C:\\repo',
+    objective: 'Implement the approved plan.',
+    role: 'execution-lead',
+    transcript,
+    extra: {
+      pipelineStage: 'execute',
+      planResult: 'PLAN_HANDOFF_SENTINEL: preserve this implementation plan.',
+    },
+    capBytes: maxBytes,
+  }).packet;
+
+  const providerInstruction = `Execute the plan now. ${'instruction '.repeat(250)}`;
+  const claudePrompt = buildClaudePrompt(providerInstruction, context, maxBytes);
+  const codexPrompt = buildCodexPrompt(providerInstruction, { context, maxBytes });
+
+  for (const prompt of [claudePrompt, codexPrompt]) {
+    assert.ok(Buffer.byteLength(prompt, 'utf8') <= maxBytes);
+    assert.match(prompt, /PLAN_HANDOFF_SENTINEL/u);
+    assert.match(prompt, /Question for you:/u);
+  }
 });
 
 test('buildContextPacket redacts secrets from transcript content', () => {

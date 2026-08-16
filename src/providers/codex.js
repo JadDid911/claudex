@@ -168,7 +168,7 @@ export class CodexProvider extends BaseProvider {
     this.model = options.model ?? this.defaultModel;
     this.effort = normalizeProviderEffort(this.name, options.effort, this.effort);
     this.configurationMode = options.configurationMode ?? 'configured';
-    this.ignoreRules = options.ignoreRules ?? true;
+    this.ignoreRules = options.ignoreRules === true;
     this.ignoreUserConfig = options.ignoreUserConfig ?? this.configurationMode === 'lean';
     this.skipGitRepoCheck = options.skipGitRepoCheck ?? true;
     this.contextMaxBytes = options.contextMaxBytes ?? DEFAULT_CONTEXT_BYTES;

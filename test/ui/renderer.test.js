@@ -339,6 +339,7 @@ test('renderer includes observed provider status fields', () => {
       failureStreak: 0,
       observedTurns: 4,
       observedTokens: 120,
+      lastTurnTokens: 48,
       capacitySource: 'observed',
       model: 'gpt-5.6-terra',
       effort: 'high',
@@ -349,8 +350,74 @@ test('renderer includes observed provider status fields', () => {
 
   assert.match(
     output.read(),
-    /turns=4 tokens=120 capacity=observed model=gpt-5.6-terra effort=high profile=configured auth=not-verified/u,
+    /turns=4 tokens=120 capacity=observed model=gpt-5.6-terra effort=high profile=configured modelContext=n\/a usage=4 turns \/ 120 tokens \/ last 48 tokens usageLimit=provider-managed \/ not exposed auth=not-verified/u,
   );
+});
+
+test('renderer surfaces usage status metadata when no usage limit object is present', () => {
+  const output = createOutput(false);
+  const renderer = createTranscriptRenderer({ output, color: false });
+
+  renderer.renderStatus({
+    providers: [{
+      name: 'claude',
+      availability: 'available',
+      weight: 1,
+      cooldown: '0s',
+      failureStreak: 0,
+      observedTurns: 1,
+      observedTokens: 12,
+      lastTurnTokens: 12,
+      capacitySource: 'configured',
+      model: 'sonnet',
+      effort: 'default',
+      profile: 'configured',
+      usageStatus: 'limited',
+      usageScope: 'daily',
+      usageReset: '2026-08-16T18:00:00Z',
+    }],
+  });
+
+  assert.match(output.read(), /usageLimit=limited \/ daily \/ 2026-08-16T18:00:00Z/u);
+});
+
+test('tty status surfaces the shared context cap, observed usage, and usage limits explicitly', () => {
+  const output = createOutput(true);
+  output.columns = 160;
+  const renderer = createTranscriptRenderer({ output, color: false });
+
+  renderer.renderStatus({
+    contextCapBytes: 64 * 1024,
+    providers: [{
+      name: 'codex',
+      availability: 'available',
+      weight: 1,
+      cooldown: '0s',
+      failureStreak: 0,
+      observedTurns: 4,
+      observedTokens: 120,
+      capacitySource: 'observed',
+      model: 'gpt-5.6-terra',
+      effort: 'high',
+      profile: 'configured',
+      authStatus: 'not-verified',
+      modelContextTokens: 1_000_000,
+      contextCapBytes: 64 * 1024,
+      usageLimit: {
+        status: 'allowed',
+        scope: 'monthly',
+        resetsAt: '2026-08-17T00:00:00Z',
+        retryAfterSeconds: 900,
+      },
+      usageLimitSource: 'provider-reported',
+    }],
+  });
+
+  const visible = visibleText(output);
+  assert.match(visible, /model ctx 1M/u);
+  assert.match(visible, /context 64 KiB/u);
+  assert.match(visible, /usage 4 turns \/ 120 tokens/u);
+  assert.match(visible, /usage limit allowed scope=monthly\s+resetsAt=2026-08-17T00:00:00Z retry 900s/u);
 });
 
 test('tty startup uses Claudex branding while showing mode, model, effort, and weight', () => {
@@ -838,4 +905,47 @@ test('tty status compactly surfaces active saved stage profiles', () => {
   assert.match(visible, /plan\u2192CLAUDE\(fable,max\)/iu);
   assert.match(visible, /execute\u2192CODEX\(gpt-5\.6-sol,ultra\)/iu);
   assert.match(visible, /review\u2192CLAUDE\(opus,max\)/iu);
+});
+
+test('tty startup includes provided author and repository identity on the release card', () => {
+  const output = createOutput(true);
+  output.columns = 120;
+  const renderer = createTranscriptRenderer({ output, color: false });
+
+  renderer.renderStartup({
+    workspace: 'C:\\repo',
+    roomId: 'room-1',
+    providers: [{ name: 'codex', status: 'available' }],
+    routingMode: 'plan',
+    safetyMode: 'single-writer lease; helpers read-only',
+    version: '0.2.0',
+    author: 'JadDid911',
+    repository: 'github.com/JadDid911/claudex',
+  });
+
+  const visible = visibleText(output);
+  assert.match(visible, /JadDid911/u);
+  assert.match(visible, /github\.com\/JadDid911\/claudex/u);
+  assert.doesNotMatch(visible, /trist|C:\\\\Users\\\\trist/u);
+});
+
+test('plain startup includes public author and repository metadata when provided', () => {
+  const output = createOutput(false);
+  const renderer = createTranscriptRenderer({ output, color: false });
+
+  renderer.renderStartup({
+    workspace: 'C:\\repo',
+    roomId: 'room-1',
+    providers: [{ name: 'codex', status: 'available' }],
+    routingMode: 'auto',
+    safetyMode: 'single-writer',
+    version: '1.2.3',
+    author: 'JadDid911',
+    repository: 'github.com/JadDid911/claudex',
+  });
+  renderer.finish();
+
+  const visible = visibleText(output);
+  assert.match(visible, /author: JadDid911/u);
+  assert.match(visible, /repository: github\.com\/JadDid911\/claudex/u);
 });

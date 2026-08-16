@@ -632,6 +632,31 @@ test('createSupermodePlan honors independently swapped stage providers, includin
   assert.equal(pipeline.requiresWriteLease, true);
 });
 
+test('createSupermodePlan treats a plan-shaped build request as writable execution', () => {
+  const pipeline = createSupermodePlan(
+    { prompt: 'Plan a mobile MOBA game.' },
+    createCapacityLedger(),
+  );
+
+  assert.equal(pipeline.ok, true);
+  assert.equal(pipeline.classification.writerRequired, true);
+  assert.equal(pipeline.executor.mode, 'workspace-write');
+  assert.equal(pipeline.requiresWriteLease, true);
+});
+
+test('createSupermodePlan preserves explicit plan-only and read-only intent', () => {
+  for (const prompt of [
+    'Plan a migration; keep this read-only.',
+    'Only produce a plan, no edits.',
+    'Plan the rollout without code changes.',
+  ]) {
+    const pipeline = createSupermodePlan({ prompt }, createCapacityLedger());
+    assert.equal(pipeline.ok, true);
+    assert.equal(pipeline.requiresWriteLease, false, prompt);
+    assert.equal(pipeline.executor.mode, 'read-only', prompt);
+  }
+});
+
 test('createSupermodePlan softly falls back from unavailable or cooling stage preferences', () => {
   const now = Date.parse('2026-08-15T12:00:00.000Z');
   const unavailableLedger = createCapacityLedger();
