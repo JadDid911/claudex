@@ -143,7 +143,7 @@ test('resolveCommand ignores non-executable files on POSIX PATH', async (context
   const tempRoot = await makeTempDir();
   context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
   const commandPath = path.join(tempRoot, 'claude');
-  await fs.writeFile(commandPath, '#!/bin/sh\nexit 0\n');
+  await fs.writeFile(commandPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   let executable = false;
   const fsImpl = {
     ...fs,

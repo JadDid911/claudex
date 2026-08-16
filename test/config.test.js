@@ -39,10 +39,18 @@ function createEmptyStageProfiles() {
 }
 
 test('default configuration stays non-secret and uses safe provider profiles', () => {
-  const config = createDefaultConfig({ env: { LOCALAPPDATA: 'C:\\Local' } });
+  const stateRoot = path.join(os.tmpdir(), 'claudex-default-config');
+  const env = process.platform === 'win32'
+    ? { LOCALAPPDATA: stateRoot }
+    : { XDG_STATE_HOME: stateRoot };
+  const storageRoot = path.join(
+    stateRoot,
+    process.platform === 'win32' ? 'codex-claude-room' : 'claudex',
+  );
+  const config = createDefaultConfig({ env });
 
-  assert.equal(config.storageRoot, 'C:\\Local\\codex-claude-room');
-  assert.equal(getConfigPath({ env: { LOCALAPPDATA: 'C:\\Local' } }), 'C:\\Local\\codex-claude-room\\config.json');
+  assert.equal(config.storageRoot, storageRoot);
+  assert.equal(getConfigPath({ env }), path.join(storageRoot, 'config.json'));
   assert.equal(config.codex.ignoreRules, false);
   assert.equal(config.codex.configurationMode, 'configured');
   assert.equal(config.codex.ignoreUserConfig, false);

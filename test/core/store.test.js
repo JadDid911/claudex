@@ -66,9 +66,14 @@ test('an explicitly supplied canonical default root remains application-owned', 
 });
 
 test('workspace normalization and hashing are stable', () => {
-  const normalized = normalizeWorkspacePath('C:\\Work\\Room\\\\');
-  assert.equal(normalized, 'c:\\Work\\Room');
-  assert.equal(hashWorkspacePath('C:\\Work\\Room'), hashWorkspacePath('C:\\Work\\Room\\\\'));
+  const workspacePath = path.join(path.parse(process.cwd()).root, 'Work', 'Room');
+  const workspacePathWithTrailingSeparators = `${workspacePath}${path.sep}${path.sep}`;
+  const expected = process.platform === 'win32'
+    ? `${workspacePath[0].toLowerCase()}${workspacePath.slice(1)}`
+    : workspacePath;
+
+  assert.equal(normalizeWorkspacePath(workspacePathWithTrailingSeparators), expected);
+  assert.equal(hashWorkspacePath(workspacePath), hashWorkspacePath(workspacePathWithTrailingSeparators));
 });
 
 test('room store appends canonical events and resumes state', async (context) => {

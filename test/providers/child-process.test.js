@@ -95,7 +95,10 @@ test('runJsonlChild aborts stalled writers with idle watchdog', async () => {
   });
 
   assert.equal(result.status, 'idle-timeout');
-  assert.equal(result.termination.method, 'taskkill');
+  assert.equal(
+    result.termination.method,
+    process.platform === 'win32' ? 'taskkill' : 'process-group',
+  );
 });
 
 test('runJsonlChild enforces absolute timeout independently of output activity', async () => {
