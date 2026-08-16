@@ -24,7 +24,11 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: node --input-type=module -e "import pkg from './package.json' with { type: 'json' }; if (process.env.RELEASE_TAG !== 'v' + pkg.version) throw new Error('Release tag must equal v' + pkg.version)"
+        run: >-
+          node --input-type=module -e
+          "import pkg from './package.json' with { type: 'json' };
+          if (process.env.RELEASE_TAG !== 'v' + pkg.version)
+          throw new Error('Release tag must equal v' + pkg.version)"
       - run: npm run verify
       - if: ${{ github.event_name == 'workflow_dispatch' }}
         run: npm publish --provenance --access public --dry-run

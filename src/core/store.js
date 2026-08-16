@@ -605,6 +605,8 @@ export async function resumeRoomStore(options) {
   await hardenFile(paths.roomMetadataPath);
   await hardenFile(paths.statePath);
   await hardenFile(paths.eventsPath);
+  await hardenFile(paths.roomMemoryPath);
+  await hardenFile(paths.projectMemoryPath);
 
   const hydratedState = {
     ...normalizePersistedState(state),
