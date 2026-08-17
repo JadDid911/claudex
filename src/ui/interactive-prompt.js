@@ -126,6 +126,7 @@ class InteractivePrompt {
     this.selectedIndex = 0;
     this.renderedFrameLines = [];
     this.renderedInputIndex = -1;
+    this.renderedLoadingIndex = -1;
     this.renderedCursorColumn = 0;
     this.visible = false;
     this.started = false;
@@ -252,8 +253,43 @@ class InteractivePrompt {
     cursorTo(this.output, Math.max(0, cursorColumn));
     this.renderedFrameLines = lines.map((line) => sanitizeVisibleText(line));
     this.renderedInputIndex = inputIndex;
+    this.renderedLoadingIndex = loadingLine ? 0 : -1;
     this.renderedCursorColumn = Math.max(0, cursorColumn);
     this.syncAnimationTimer();
+  }
+
+  repaintLoadingLine() {
+    if (!this.visible || this.renderedLoadingIndex < 0 || this.renderedInputIndex < 0) {
+      this.render();
+      return;
+    }
+
+    const reportedColumns = Number(this.output.columns);
+    const columns = Number.isFinite(reportedColumns) && reportedColumns > 0
+      ? Math.max(8, Math.floor(reportedColumns))
+      : 80;
+    const context = this.getContext?.() ?? {};
+    const loadingLine = formatLoadingLine(
+      this.pendingSubmission || busyLoadingMessage(context),
+      this.busyFrame,
+      columns,
+      this.color,
+    );
+    const rowsAboveInput = this.renderedFrameLines
+      .slice(this.renderedLoadingIndex, this.renderedInputIndex)
+      .reduce((total, line) => (
+        total + Math.max(1, Math.ceil(terminalDisplayWidth(line) / columns))
+      ), 0);
+
+    this.withHiddenCursor(() => {
+      if (rowsAboveInput > 0) moveCursor(this.output, 0, -rowsAboveInput);
+      cursorTo(this.output, 0);
+      clearLine(this.output, 0);
+      this.output.write(loadingLine);
+      if (rowsAboveInput > 0) moveCursor(this.output, 0, rowsAboveInput);
+      cursorTo(this.output, Math.max(0, this.renderedCursorColumn));
+    });
+    this.renderedFrameLines[this.renderedLoadingIndex] = sanitizeVisibleText(loadingLine);
   }
 
   withHiddenCursor(callback) {
@@ -644,7 +680,7 @@ class InteractivePrompt {
         return;
       }
 
-      this.render();
+      this.repaintLoadingLine();
     }, this.animationIntervalMs);
     this.animationTimer?.unref?.();
   }
@@ -696,6 +732,7 @@ class InteractivePrompt {
     cursorTo(this.output, 0);
     this.renderedFrameLines = [];
     this.renderedInputIndex = -1;
+    this.renderedLoadingIndex = -1;
     this.renderedCursorColumn = 0;
   }
 }

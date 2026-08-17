@@ -625,7 +625,7 @@ test('real TTY startup prints the persistent identity card before the static liv
     assert.match(visible.slice(0, inputIndex), /JadDid911.*github\.com\/JadDid911\/claudex/u);
     assert.match(frame, /─{120}\r?\n  › \r?\n─{120}/u);
     assert.equal(animationTimers, 0);
-    assert.equal(animateBusy, false);
+    assert.equal(animateBusy, true);
     assert.doesNotMatch(frame, /one room · two models|◆━|━◆/u);
   } finally {
     stdin.emit('keypress', '/exit', { name: undefined });

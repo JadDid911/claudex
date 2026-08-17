@@ -547,6 +547,9 @@ test('busy repaints keep the terminal caret hidden until it returns to the input
   assert.equal(repaintWrites.at(-1), SHOW_CURSOR);
   assert.equal(visibleMovement, false);
   assert.equal(cursorVisible, true);
+  assert.doesNotMatch(repaintWrites.join(''), /â”€{20}/u);
+  assert.doesNotMatch(repaintWrites.join(''), /room-42|CODEX.*CLAUDE/u);
+  assert.equal(repaintWrites.join('').includes('\r\n'), false);
 
   await prompt.stop();
   assert.equal(output.writes.at(-1), SHOW_CURSOR);
