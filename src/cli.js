@@ -576,6 +576,7 @@ export function installPromptOutputCoordinator({ renderer, prompt }) {
   const originalOutput = output;
   const originalWrite = output.write.bind(output);
   const previousStreamBuffering = Boolean(renderer.interactiveStreamBuffering);
+  const previousActivityAnimation = renderer.setActivityAnimation?.(false);
   renderer.setInteractiveStreamBuffering?.(true);
   let restoreScheduled = false;
   let active = true;
@@ -630,6 +631,9 @@ export function installPromptOutputCoordinator({ renderer, prompt }) {
       activityRowAbovePrompt = false;
     }
     renderer.setInteractiveStreamBuffering?.(previousStreamBuffering);
+    if (previousActivityAnimation !== undefined) {
+      renderer.setActivityAnimation?.(previousActivityAnimation);
+    }
     renderer.output = originalOutput;
   };
 }

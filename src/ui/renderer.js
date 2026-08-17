@@ -39,6 +39,7 @@ class TranscriptRenderer {
     setActivityTimer = setInterval,
     clearActivityTimer = clearInterval,
     activityIntervalMs = 300,
+    animateActivity = true,
   } = {}) {
     this.output = output;
     this.isTTY = Boolean(output.isTTY ?? false);
@@ -52,6 +53,7 @@ class TranscriptRenderer {
     this.setActivityTimer = setActivityTimer;
     this.clearActivityTimer = clearActivityTimer;
     this.activityIntervalMs = activityIntervalMs;
+    this.activityAnimationEnabled = Boolean(animateActivity);
     this.firstBlock = true;
     this.bodyStream = null;
     this.interactiveStreamBuffering = false;
@@ -59,6 +61,17 @@ class TranscriptRenderer {
 
   setInteractiveStreamBuffering(enabled) {
     this.interactiveStreamBuffering = Boolean(enabled);
+  }
+
+  setActivityAnimation(enabled) {
+    const previous = this.activityAnimationEnabled;
+    this.activityAnimationEnabled = Boolean(enabled);
+    if (this.activityAnimationEnabled) {
+      this.ensureActivityTimer();
+    } else {
+      this.stopActivityTimer();
+    }
+    return previous;
   }
 
   renderStartup(snapshot = {}) {
@@ -429,6 +442,9 @@ class TranscriptRenderer {
     const current = this.activityEntries.get(key);
     if (current) {
       current.detail = sanitizeVisibleText(detail);
+      if (!this.activityAnimationEnabled) {
+        this.activityFrame += 1;
+      }
     } else {
       this.activityEntries.set(key, {
         actor,
@@ -450,7 +466,7 @@ class TranscriptRenderer {
   }
 
   ensureActivityTimer() {
-    if (this.activityTimer || this.activityEntries.size === 0) {
+    if (!this.activityAnimationEnabled || this.activityTimer || this.activityEntries.size === 0) {
       return;
     }
 

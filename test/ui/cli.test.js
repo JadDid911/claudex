@@ -56,6 +56,45 @@ test('prompt output coordinator keeps input visible between partial streamed bod
   }
 });
 
+test('prompt output coordinator keeps provider activity event-driven instead of repainting the full composer on a timer', async () => {
+  const output = createOutput(true);
+  const timerHandles = [];
+  const renderer = createTranscriptRenderer({
+    output,
+    color: false,
+    setActivityTimer(fn, intervalMs) {
+      const handle = { fn, intervalMs, unref() {} };
+      timerHandles.push(handle);
+      return handle;
+    },
+  });
+  const calls = [];
+  const restore = installPromptOutputCoordinator({
+    renderer,
+    prompt: {
+      hide() { calls.push('hide'); },
+      show() { calls.push('show'); },
+    },
+  });
+
+  try {
+    renderer.renderEvent({ actor: 'CODEX', label: 'lead', type: 'activity', text: 'Inspecting...' });
+    await new Promise((resolve) => queueMicrotask(resolve));
+
+    assert.equal(timerHandles.length, 0);
+    assert.deepEqual(calls, ['hide', 'show']);
+
+    renderer.renderEvent({ actor: 'CODEX', label: 'lead', type: 'activity', text: 'Checking...' });
+    await new Promise((resolve) => queueMicrotask(resolve));
+
+    assert.equal(timerHandles.length, 0);
+    assert.deepEqual(calls, ['hide', 'show', 'hide', 'show']);
+  } finally {
+    renderer.finish();
+    restore();
+  }
+});
+
 class FakeReadline extends EventEmitter {
   constructor() {
     super();
