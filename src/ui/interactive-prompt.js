@@ -137,6 +137,8 @@ class InteractivePrompt {
     this.pendingSubmission = '';
     this.pasteBuffer = null;
     this.pasteTimer = null;
+    this.pasteChunkActive = false;
+    this.pasteChunkGeneration = 0;
     this.boundInputData = (chunk) => this.handleInputData(chunk);
     this.boundKeypress = (text, key) => {
       Promise.resolve(this.handleKeypress(text, key)).catch((error) => this.onError(error));
@@ -314,6 +316,11 @@ class InteractivePrompt {
       return;
     }
     if (this.pasteBuffer != null) {
+      if (isEnterKey(key) && !this.pasteChunkActive) {
+        this.flushPaste();
+        await this.submitLine();
+        return;
+      }
       const pastedText = pasteKeyText(text, key);
       if (pastedText != null) {
         this.pasteBuffer += pastedText;
@@ -561,11 +568,24 @@ class InteractivePrompt {
   handleInputData(chunk) {
     const text = String(chunk ?? '');
     if (this.pasteBuffer != null) {
+      if (isStandaloneEnter(text) && !this.pasteChunkActive) {
+        this.flushPaste();
+        return;
+      }
       if (!isPasteText(text)) return;
     } else if (!isPasteBurst(text)) {
       return;
     }
     this.beginPaste();
+    this.markPasteChunkActive();
+  }
+
+  markPasteChunkActive() {
+    this.pasteChunkActive = true;
+    const generation = ++this.pasteChunkGeneration;
+    queueMicrotask(() => {
+      if (generation === this.pasteChunkGeneration) this.pasteChunkActive = false;
+    });
   }
 
   beginPaste() {
@@ -582,6 +602,8 @@ class InteractivePrompt {
     if (this.pasteBuffer == null) return false;
     const pastedText = this.pasteBuffer;
     this.pasteBuffer = null;
+    this.pasteChunkActive = false;
+    this.pasteChunkGeneration += 1;
     this.clearPasteTimer();
     this.insertText(pastedText);
     return true;
@@ -589,6 +611,8 @@ class InteractivePrompt {
 
   discardPaste() {
     this.pasteBuffer = null;
+    this.pasteChunkActive = false;
+    this.pasteChunkGeneration += 1;
     this.clearPasteTimer();
   }
 
@@ -812,6 +836,14 @@ function pasteKeyText(text, key = {}) {
   if (key.name === 'tab') return '\t';
   if (typeof text === 'string' && text) return text;
   return null;
+}
+
+function isEnterKey(key = {}) {
+  return key.name === 'return' || key.name === 'enter';
+}
+
+function isStandaloneEnter(text) {
+  return /^(?:\r\n|\r|\n)$/u.test(text);
 }
 
 function buildPromptLines(context, columns) {

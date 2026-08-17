@@ -683,7 +683,7 @@ test('multiline paste collapses into a single editable turn before submission', 
   await prompt.stop();
 });
 
-test('ordinary raw-input paste bursts keep every line in one editable turn without bracketed terminal mode', async () => {
+test('ordinary raw-input paste bursts submit on the first standalone Enter without bracketed terminal mode', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const submitted = [];
@@ -714,14 +714,12 @@ test('ordinary raw-input paste bursts keep every line in one editable turn witho
   await settle();
   assert.equal(pasteTimers.length, 2);
   assert.equal(pasteTimers[0].cleared, true);
-  pasteTimers[1].callback();
-
-  assert.equal(prompt.value, 'first line second line third line');
   assert.deepEqual(submitted, []);
 
-  input.emit('keypress', undefined, { name: 'enter' });
+  input.emit('data', Buffer.from('\r'));
   await settle();
   assert.deepEqual(submitted, ['first line second line third line']);
+  assert.equal(pasteTimers[1].cleared, true);
 
   await prompt.stop();
   assert.doesNotMatch(output.text, /\u001b\[\?2004[hl]/u);
