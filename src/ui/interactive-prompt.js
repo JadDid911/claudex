@@ -15,8 +15,6 @@ const DIM = '\u001B[2m';
 const RESET = '\u001B[0m';
 const HIDE_CURSOR = '\u001B[?25l';
 const SHOW_CURSOR = '\u001B[?25h';
-const ENABLE_BRACKETED_PASTE = '\u001B[?2004h';
-const DISABLE_BRACKETED_PASTE = '\u001B[?2004l';
 const LOADING_FRAMES = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
 const MAX_MENU_ITEMS = 7;
 const DEFAULT_PROMPT_LABEL = 'claudex';
@@ -139,6 +137,7 @@ class InteractivePrompt {
     this.pendingSubmission = '';
     this.pasteBuffer = null;
     this.pasteTimer = null;
+    this.boundInputData = (chunk) => this.handleInputData(chunk);
     this.boundKeypress = (text, key) => {
       Promise.resolve(this.handleKeypress(text, key)).catch((error) => this.onError(error));
     };
@@ -158,6 +157,7 @@ class InteractivePrompt {
     }
 
     this.previousRawMode = Boolean(this.input.isRaw);
+    this.input.prependListener?.('data', this.boundInputData);
     emitKeypressEvents(this.input);
     this.input.on('keypress', this.boundKeypress);
     this.input.on('end', this.boundEnd);
@@ -166,7 +166,6 @@ class InteractivePrompt {
     this.input.setRawMode(true);
     this.input.resume?.();
     this.started = true;
-    this.output.write(ENABLE_BRACKETED_PASTE);
     this.show();
     return true;
   }
@@ -174,8 +173,8 @@ class InteractivePrompt {
   async stop() {
     if (!this.started) return;
     this.stopAnimationTimer();
-    this.output.write(DISABLE_BRACKETED_PASTE);
     this.hide();
+    this.input.off?.('data', this.boundInputData);
     this.input.off?.('keypress', this.boundKeypress);
     this.input.off?.('end', this.boundEnd);
     this.input.off?.('close', this.boundEnd);
@@ -314,19 +313,14 @@ class InteractivePrompt {
       await this.handleEscape();
       return;
     }
-    if (key.name === 'paste-start') {
-      this.beginPaste();
-      return;
-    }
     if (this.pasteBuffer != null) {
-      if (key.name === 'paste-end') {
-        this.flushPaste();
+      const pastedText = pasteKeyText(text, key);
+      if (pastedText != null) {
+        this.pasteBuffer += pastedText;
         return;
       }
-      this.pasteBuffer += text ?? key.sequence ?? '';
-      return;
+      this.flushPaste();
     }
-    if (key.name === 'paste-end') return;
     if (key.ctrl && key.name === 'd' && !this.buffer) {
       await this.requestExit();
       return;
@@ -564,9 +558,19 @@ class InteractivePrompt {
     this.render();
   }
 
+  handleInputData(chunk) {
+    const text = String(chunk ?? '');
+    if (this.pasteBuffer != null) {
+      if (!isPasteText(text)) return;
+    } else if (!isPasteBurst(text)) {
+      return;
+    }
+    this.beginPaste();
+  }
+
   beginPaste() {
-    this.discardPaste();
-    this.pasteBuffer = '';
+    if (this.pasteBuffer == null) this.pasteBuffer = '';
+    this.clearPasteTimer();
     this.pasteTimer = this.setPasteTimeout(() => {
       this.pasteTimer = null;
       this.flushPaste();
@@ -780,6 +784,34 @@ function inputWindow(value, cursor, width) {
 
 function singleLine(value) {
   return sanitizeVisibleText(value).replace(/\s+/gu, ' ').trim();
+}
+
+function isPasteBurst(text) {
+  if (!isPasteText(text)) return false;
+  if (/[\r\n]/u.test(text)) return true;
+
+  let graphemes = 0;
+  for (const _ of GRAPHEME_SEGMENTER.segment(text)) {
+    graphemes += 1;
+    if (graphemes > 1) return true;
+  }
+  return false;
+}
+
+function isPasteText(text) {
+  return Boolean(
+    text &&
+    !text.includes('\u001B') &&
+    !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(text),
+  );
+}
+
+function pasteKeyText(text, key = {}) {
+  if (key.ctrl || key.meta) return null;
+  if (key.name === 'return' || key.name === 'enter') return '\n';
+  if (key.name === 'tab') return '\t';
+  if (typeof text === 'string' && text) return text;
+  return null;
 }
 
 function buildPromptLines(context, columns) {

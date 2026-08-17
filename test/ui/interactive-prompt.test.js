@@ -683,14 +683,23 @@ test('multiline paste collapses into a single editable turn before submission', 
   await prompt.stop();
 });
 
-test('terminal bracketed paste keeps every pasted line in one editable turn', async () => {
+test('ordinary raw-input paste bursts keep every line in one editable turn without bracketed terminal mode', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const submitted = [];
+  const pasteTimers = [];
   const prompt = createInteractivePrompt({
     input,
     output,
     color: false,
+    setPasteTimeout(callback) {
+      const timer = { callback, cleared: false, unref() {} };
+      pasteTimers.push(timer);
+      return timer;
+    },
+    clearPasteTimeout(timer) {
+      timer.cleared = true;
+    },
     onSubmit: async (line) => {
       submitted.push(line);
       return false;
@@ -698,17 +707,14 @@ test('terminal bracketed paste keeps every pasted line in one editable turn', as
   });
 
   await prompt.start();
-  assert.match(output.text, /\u001b\[\?2004h/u);
+  assert.doesNotMatch(output.text, /\u001b\[\?2004[hl]/u);
 
-  input.emit('keypress', undefined, { name: 'paste-start', sequence: '\u001b[200~' });
-  input.emit('keypress', 'first line', { name: undefined });
-  input.emit('keypress', '\r', { name: 'return', sequence: '\r' });
-  input.emit('keypress', '\n', { name: 'enter', sequence: '\n' });
-  input.emit('keypress', 'second line', { name: undefined });
-  input.emit('keypress', '\r', { name: 'return', sequence: '\r' });
-  input.emit('keypress', 'third line', { name: undefined });
-  input.emit('keypress', undefined, { name: 'paste-end', sequence: '\u001b[201~' });
+  input.emit('data', Buffer.from('first line\r\nsecond'));
+  input.emit('data', Buffer.from(' line\rthird line'));
   await settle();
+  assert.equal(pasteTimers.length, 2);
+  assert.equal(pasteTimers[0].cleared, true);
+  pasteTimers[1].callback();
 
   assert.equal(prompt.value, 'first line second line third line');
   assert.deepEqual(submitted, []);
@@ -718,10 +724,10 @@ test('terminal bracketed paste keeps every pasted line in one editable turn', as
   assert.deepEqual(submitted, ['first line second line third line']);
 
   await prompt.stop();
-  assert.match(output.text, /\u001b\[\?2004l/u);
+  assert.doesNotMatch(output.text, /\u001b\[\?2004[hl]/u);
 });
 
-test('an unterminated bracketed paste recovers without freezing input or swallowing Ctrl+C', async () => {
+test('an unfinished raw-input paste burst recovers without freezing input or swallowing Ctrl+C', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const submitted = [];
@@ -751,18 +757,16 @@ test('an unterminated bracketed paste recovers without freezing input or swallow
   });
 
   await prompt.start();
-  input.emit('keypress', undefined, { name: 'paste-start', sequence: '\u001b[200~' });
-  input.emit('keypress', 'first line', { name: undefined });
-  input.emit('keypress', '\r', { name: 'return', sequence: '\r' });
-  input.emit('keypress', 'second line', { name: undefined });
+  input.emit('data', Buffer.from('first line\rsecond line'));
+  await settle();
   assert.equal(pasteTimers.length, 1);
 
   pasteTimers[0].callback();
   assert.equal(prompt.value, 'first line second line');
   assert.deepEqual(submitted, []);
 
-  input.emit('keypress', undefined, { name: 'paste-start', sequence: '\u001b[200~' });
-  input.emit('keypress', 'unfinished', { name: undefined });
+  input.emit('data', Buffer.from('unfinished text'));
+  await settle();
   input.emit('keypress', undefined, { ctrl: true, name: 'c', sequence: '\u0003' });
   await settle();
 

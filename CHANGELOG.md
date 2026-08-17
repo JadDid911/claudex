@@ -3,6 +3,14 @@
 All notable changes to Claudex are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Removed terminal bracketed-paste mode after it caused repeated wmux freezes.
+  Multiline pastes now use ordinary raw-input burst buffering, stay in one
+  editable draft, and never emit terminal paste-mode escape sequences.
+
 ## [0.4.1] - 2026-08-16
 
 ### Added
@@ -93,6 +101,7 @@ All notable changes to Claudex are documented here. This project follows
   provider-owned authentication, bounded shared context, single-writer safety,
   command palette, and public documentation.
 
+[Unreleased]: https://github.com/JadDid911/claudex/compare/v0.4.1...HEAD
 [0.4.1]: https://github.com/JadDid911/claudex/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/JadDid911/claudex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/JadDid911/claudex/releases/tag/v0.3.0
