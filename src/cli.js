@@ -408,13 +408,15 @@ async function runInteractivePromptLoop({
     if (!(stdout.isTTY ?? false)) stderr.write(`${message}\n`);
     renderer.renderMessage('SYSTEM', `Input failed · ${message}`);
   };
+  let prompt = null;
   const submissionQueue = createSubmissionQueue({
     app,
     renderer,
     stdout,
     stderr,
+    onStateChange: () => prompt?.render?.(),
   });
-  const prompt = interactivePromptFactory({
+  prompt = interactivePromptFactory({
     input: stdin,
     output: stdout,
     color,
@@ -460,7 +462,7 @@ function reducedMotionRequested(env = {}) {
   return /^(?:1|true|yes|on)$/iu.test(String(env.CLAUDEX_REDUCED_MOTION ?? '').trim());
 }
 
-function createSubmissionQueue({ app, renderer, stdout, stderr }) {
+function createSubmissionQueue({ app, renderer, stdout, stderr, onStateChange = () => {} }) {
   let queuedLines = [];
   let draining = null;
   let queueVersion = 0;
@@ -511,8 +513,10 @@ function createSubmissionQueue({ app, renderer, stdout, stderr }) {
           const { line, answersClarification } = entry;
           const pending = handleLine({ app, renderer, line, stdout, stderr });
           inFlight.add(pending);
+          onStateChange();
           pending.finally(() => {
             inFlight.delete(pending);
+            onStateChange();
             if (queuedLines.length > 0) drainQueuedLines();
           });
           if (answersClarification) {

@@ -970,6 +970,76 @@ test('runCli queues a second plain TTY reply while the first dispatch is still p
   }
 });
 
+test('runCli repaints the live composer after a queued provider turn actually settles', async () => {
+  const stdin = new FakeTtyInput();
+  const stdout = new FakeTtyOutput();
+  const stderr = createOutput(false);
+  let promptDriver;
+  let releaseDispatch;
+  const renderedBusyStates = [];
+
+  const runPromise = runCli({
+    argv: ['--workspace', 'C:/repo'],
+    cwd: 'C:/repo',
+    stdin,
+    stdout,
+    stderr,
+    env: { NO_COLOR: '1' },
+    packageVersion: '1.2.3',
+    loadModelCatalog: async () => ({ codex: [], claude: [] }),
+    interactivePromptFactory({ onSubmit, onExit, isBusy }) {
+      promptDriver = { submit: onSubmit, exit: onExit };
+      return {
+        async start() { return true; },
+        async stop() {},
+        show() {},
+        hide() {},
+        render() { renderedBusyStates.push(isBusy()); },
+      };
+    },
+    createRoomApplication() {
+      let active = false;
+      return {
+        start() {
+          return {
+            roomId: 'room-tty-settle',
+            providers: [{ name: 'codex', status: 'available' }],
+            routingMode: 'auto',
+            safetyMode: 'single-writer',
+          };
+        },
+        async dispatch() {
+          active = true;
+          await new Promise((resolve) => { releaseDispatch = resolve; });
+          active = false;
+        },
+        isBusy() { return active; },
+        async cancel() { return active; },
+        async close() {},
+      };
+    },
+  });
+
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    await promptDriver.submit('Inspect the workspace.');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(renderedBusyStates.includes(true), true);
+
+    releaseDispatch();
+    const deadline = Date.now() + 500;
+    while (!renderedBusyStates.includes(false) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.equal(renderedBusyStates.at(-1), false);
+  } finally {
+    releaseDispatch?.();
+    await promptDriver?.exit?.();
+    await runPromise;
+  }
+});
+
 test('runCli keeps an earlier follow-up queued when the active turn later requests clarification', async () => {
   const stdin = new FakeTtyInput();
   const stdout = new FakeTtyOutput();
