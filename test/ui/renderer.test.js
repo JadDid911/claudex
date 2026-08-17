@@ -764,6 +764,26 @@ test('tty ROOM messages wrap without dropping long local answers', () => {
   assert.ok(visible.trim().split('\n').every((line) => line.length <= output.columns));
 });
 
+test('tty actor bodies wrap pasted prompts and provider prose within the wmux pane', () => {
+  const output = createOutput(true);
+  output.columns = 42;
+  const renderer = createTranscriptRenderer({ output, color: false });
+  const pastedPrompt = `Audit this pasted context: ${'input '.repeat(18)}PASTE_TAIL`;
+  const providerReply = `Review complete: ${'finding '.repeat(18)}REPLY_TAIL`;
+
+  renderer.renderMessage('YOU', pastedPrompt);
+  renderer.renderMessage('CLAUDE', providerReply, 'review');
+  renderer.finish();
+
+  const visible = visibleText(output);
+  assert.match(visible, /PASTE_TAIL/u);
+  assert.match(visible, /REPLY_TAIL/u);
+  assert.ok(
+    visible.trimEnd().split('\n').every((line) => line.length <= output.columns),
+    visible,
+  );
+});
+
 test('tty actor roles use middot labels and synthesis collapses visually to the lead role', () => {
   const output = createOutput(true);
   output.columns = 120;

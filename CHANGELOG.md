@@ -15,6 +15,8 @@ All notable changes to Claudex are documented here. This project follows
   every pasted character, even when wmux delivers the paste one byte at a time.
 - Restored the wmux activity indicator to a smooth 120 ms cadence. Its isolated
   one-line repaint no longer needs the old 750 ms terminal-wide throttle.
+- Wrapped echoed prompts and provider response bodies to the live TTY width so
+  long pasted text cannot spill beyond a narrow or resized wmux pane.
 
 ## [0.4.1] - 2026-08-16
 

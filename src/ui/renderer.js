@@ -350,7 +350,15 @@ class TranscriptRenderer {
   }
 
   writeBody(text, { markdown = false, final = true } = {}) {
-    const visible = markdown ? this.renderMarkdownBody(text, final) : text;
+    const reportedColumns = Number(this.output.columns);
+    const bodyWidth = Math.max(
+      1,
+      (Number.isFinite(reportedColumns) && reportedColumns > 0 ? Math.floor(reportedColumns) : 100) - 2,
+    );
+    const boundedText = this.isTTY && !String(text).includes('\u001B')
+      ? wrapBodyToWidth(text, bodyWidth)
+      : text;
+    const visible = markdown ? this.renderMarkdownBody(boundedText, final) : boundedText;
     let output = '';
 
     for (const character of visible) {
@@ -1019,6 +1027,36 @@ function wrapToWidth(value, width) {
     remaining = remaining.slice(boundary).trimStart();
   }
   if (remaining) lines.push(remaining);
+  return lines;
+}
+
+function wrapBodyToWidth(value, width) {
+  const targetWidth = Math.max(1, Math.floor(width));
+  return String(value ?? '')
+    .split('\n')
+    .flatMap((line) => wrapBodyLine(line, targetWidth))
+    .join('\n');
+}
+
+function wrapBodyLine(line, width) {
+  if (line.length <= width) return [line];
+
+  const lines = [];
+  let remaining = line;
+  while (remaining.length > width) {
+    let boundary = remaining.lastIndexOf(' ', width);
+    if (boundary <= 0) boundary = width;
+
+    const segment = remaining.slice(0, boundary).trimEnd();
+    if (segment) {
+      lines.push(segment);
+      remaining = remaining.slice(boundary).trimStart();
+    } else {
+      lines.push(remaining.slice(0, width));
+      remaining = remaining.slice(width);
+    }
+  }
+  lines.push(remaining);
   return lines;
 }
 
