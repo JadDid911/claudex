@@ -54,6 +54,11 @@ class TranscriptRenderer {
     this.activityIntervalMs = activityIntervalMs;
     this.firstBlock = true;
     this.bodyStream = null;
+    this.interactiveStreamBuffering = false;
+  }
+
+  setInteractiveStreamBuffering(enabled) {
+    this.interactiveStreamBuffering = Boolean(enabled);
   }
 
   renderStartup(snapshot = {}) {
@@ -298,8 +303,15 @@ class TranscriptRenderer {
   }
 
   appendStream(actor, label, text) {
-    this.suspendEphemeral({ pauseTimer: true });
     this.prepareBodyStream(actor, label, this.shouldStyleMarkdown(actor));
+    if (this.interactiveStreamBuffering) {
+      this.bodyStream.pendingText += text;
+      const boundary = this.bodyStream.pendingText.lastIndexOf('\n');
+      if (boundary < 0) return;
+      text = this.bodyStream.pendingText.slice(0, boundary + 1);
+      this.bodyStream.pendingText = this.bodyStream.pendingText.slice(boundary + 1);
+    }
+    this.suspendEphemeral({ pauseTimer: true });
     this.ensureBlock(actor, label, { stream: true });
     this.writeBody(text, { markdown: this.shouldStyleMarkdown(actor), final: false });
   }
@@ -556,12 +568,18 @@ class TranscriptRenderer {
     this.bodyStream = markdown
       ? {
           key,
+          actor,
+          label,
           markdown,
+          pendingText: '',
           styler: new MarkdownStreamStyler({ enabled: markdown }),
         }
       : {
           key,
+          actor,
+          label,
           markdown,
+          pendingText: '',
           styler: null,
         };
   }
@@ -578,15 +596,35 @@ class TranscriptRenderer {
   }
 
   flushPendingBodyStream() {
-    if (!this.bodyStream?.styler) {
+    if (!this.bodyStream) {
+      return;
+    }
+
+    const stream = this.bodyStream;
+    if (stream.pendingText) {
+      this.ensureBlock(stream.actor, stream.label, { stream: true });
+      this.writeBody(stream.pendingText, { markdown: stream.markdown, final: true });
+      this.bodyStream = null;
+      if (!this.atLineStart) {
+        this.output.write('\n');
+        this.atLineStart = true;
+      }
+      return;
+    }
+
+    if (!stream.styler) {
       this.bodyStream = null;
       return;
     }
 
-    const remaining = this.bodyStream.styler.flush();
+    const remaining = stream.styler.flush();
     this.bodyStream = null;
     if (remaining) {
       this.writeBody(remaining, { markdown: false, final: true });
+    }
+    if (!this.atLineStart) {
+      this.output.write('\n');
+      this.atLineStart = true;
     }
   }
 

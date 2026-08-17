@@ -149,6 +149,9 @@ test('live compatibility workflow is opt-in, self-hosted, and read-only', async 
   assert.match(workflow, /runs-on:\s*\[\s*self-hosted,\s*claudex-live-compat\s*\]/mu);
   assert.match(workflow, /contents:\s+read/mu);
   assert.match(workflow, /access:\s*'read'/mu);
+  assert.match(workflow, /GITHUB_STEP_SUMMARY/mu);
+  assert.match(workflow, /firstTextMs[\s\S]*totalMs/mu);
+  assert.match(workflow, /CLAUDEX_LIVE_CLAUDE_MODEL/mu);
   assert.doesNotMatch(workflow, /npm publish|NPM_TOKEN|NODE_AUTH_TOKEN/mu);
 });
 

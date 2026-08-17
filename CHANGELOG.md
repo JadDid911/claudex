@@ -3,6 +3,22 @@
 All notable changes to Claudex are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-08-16
+
+### Added
+
+- Live provider compatibility reports now measure CLI detection, first-text,
+  and total response latency through the packed read-only adapters, with optional
+  model and effort profiles and an actionable GitHub job summary.
+
+### Fixed
+
+- Replaced cursor-save overlays during partial provider streams with safe
+  complete-line buffering, keeping the composer visible without corrupting
+  spacing, wrapping, colors, or wmux scrollback.
+- Made the live checker package and install steps work consistently through
+  Windows command shims while retaining shell-free provider prompt handling.
+
 ## [0.4.0] - 2026-08-16
 
 ### Added
@@ -77,5 +93,6 @@ All notable changes to Claudex are documented here. This project follows
   provider-owned authentication, bounded shared context, single-writer safety,
   command palette, and public documentation.
 
+[0.4.1]: https://github.com/JadDid911/claudex/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/JadDid911/claudex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/JadDid911/claudex/releases/tag/v0.3.0

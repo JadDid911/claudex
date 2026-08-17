@@ -324,6 +324,7 @@ npm run pack:dry-run
 - `npm run demo` exercises the offline mock-provider orchestrator.
 - `npm run pack:dry-run` verifies the public package allowlist. Version tags publish a GitHub release; npm trusted publishing runs only when the repository variable `CLAUDEX_PUBLISH_NPM` is explicitly set to `true`. Manual release workflow runs remain dry-run only.
 - In PowerShell, `$env:ROOM_LIVE_PROVIDER_SMOKE='1'; npm test` enables opt-in read-only calls to the installed provider CLIs. Those calls use the signed-in accounts and their normal usage limits.
+- The opt-in `Live compatibility` workflow runs the packed adapters on a private `claudex-live-compat` runner and records detection, first-text, and total latency for each provider. Set the `CLAUDEX_ENABLE_LIVE_COMPAT` repository variable to `true`; optional provider model/effort variables let maintainers reproduce a configured profile without storing credentials in GitHub.
 
 ## Limitations
 

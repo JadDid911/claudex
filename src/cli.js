@@ -574,17 +574,12 @@ export function installPromptOutputCoordinator({ renderer, prompt }) {
 
   const originalOutput = output;
   const originalWrite = output.write.bind(output);
+  const previousStreamBuffering = Boolean(renderer.interactiveStreamBuffering);
+  renderer.setInteractiveStreamBuffering?.(true);
   let restoreScheduled = false;
   let active = true;
   let batchOpen = false;
   let activityRowAbovePrompt = false;
-  let promptBelowPartialStream = false;
-
-  const restorePartialStreamCursor = () => {
-    if (!promptBelowPartialStream) return;
-    originalWrite('\u001B[u');
-    promptBelowPartialStream = false;
-  };
 
   const scheduleRestore = () => {
     if (restoreScheduled) return;
@@ -597,12 +592,7 @@ export function installPromptOutputCoordinator({ renderer, prompt }) {
         originalWrite('\n');
         activityRowAbovePrompt = true;
       } else if (!renderer.atLineStart) {
-        // Keep the composer usable while a provider streams a long line. Save
-        // the response cursor, draw the prompt below it, then restore that
-        // cursor before the next provider chunk is written.
-        originalWrite('\u001B[s');
-        originalWrite('\n');
-        promptBelowPartialStream = true;
+        return;
       }
       prompt.show?.();
     });
@@ -615,7 +605,6 @@ export function installPromptOutputCoordinator({ renderer, prompt }) {
           if (!batchOpen) {
             batchOpen = true;
             prompt.hide?.();
-            restorePartialStreamCursor();
             if (activityRowAbovePrompt) {
               moveCursor(originalOutput, 0, -1);
               activityRowAbovePrompt = false;
@@ -635,11 +624,11 @@ export function installPromptOutputCoordinator({ renderer, prompt }) {
   return () => {
     active = false;
     prompt.hide?.();
-    restorePartialStreamCursor();
     if (activityRowAbovePrompt) {
       moveCursor(originalOutput, 0, -1);
       activityRowAbovePrompt = false;
     }
+    renderer.setInteractiveStreamBuffering?.(previousStreamBuffering);
     renderer.output = originalOutput;
   };
 }

@@ -37,12 +37,20 @@ test('prompt output coordinator keeps input visible between partial streamed bod
   try {
     renderer.renderEvent({ actor: 'CLAUDE', label: 'lead', type: 'delta', text: 'Hello ' });
     await new Promise((resolve) => queueMicrotask(resolve));
-    assert.deepEqual(calls, ['hide', 'show']);
+    assert.deepEqual(calls, []);
 
     renderer.renderEvent({ actor: 'CLAUDE', label: 'lead', type: 'delta', text: 'world\n' });
     await new Promise((resolve) => queueMicrotask(resolve));
+    assert.deepEqual(calls, ['hide', 'show']);
+    assert.match(sanitizeVisibleText(output.read()), /Hello world/u);
+
+    renderer.renderEvent({ actor: 'CLAUDE', label: 'lead', type: 'delta', text: 'Trailing line' });
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.deepEqual(calls, ['hide', 'show']);
+    renderer.finish();
+    await new Promise((resolve) => queueMicrotask(resolve));
     assert.deepEqual(calls, ['hide', 'show', 'hide', 'show']);
-    assert.match(sanitizeVisibleText(output.read()), /Hello\s+world/u);
+    assert.match(sanitizeVisibleText(output.read()), /Trailing line\n/u);
   } finally {
     restore();
   }
