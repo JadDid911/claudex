@@ -21,6 +21,7 @@ const DEFAULT_PROMPT_LABEL = 'claudex';
 const INPUT_PREFIX = '  \u203a ';
 const MENU_MARKER = '\u203a';
 const ELLIPSIS = '\u2026';
+const DEFAULT_PASTE_BURST_THRESHOLD_MS = 8;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const COMBINING_MARK = /\p{Mark}/u;
 const EMOJI = /\p{Extended_Pictographic}|\p{Regional_Indicator}/u;
@@ -96,6 +97,8 @@ class InteractivePrompt {
     setPasteTimeout = setTimeout,
     clearPasteTimeout = clearTimeout,
     pasteTimeoutMs = 250,
+    pasteBurstThresholdMs = DEFAULT_PASTE_BURST_THRESHOLD_MS,
+    now = Date.now,
     animateBusy = true,
     reducedMotion = reducedMotionRequested(process.env),
   } = {}) {
@@ -114,6 +117,8 @@ class InteractivePrompt {
     this.setPasteTimeout = setPasteTimeout;
     this.clearPasteTimeout = clearPasteTimeout;
     this.pasteTimeoutMs = pasteTimeoutMs;
+    this.pasteBurstThresholdMs = pasteBurstThresholdMs;
+    this.now = now;
     this.animateBusy = Boolean(animateBusy);
     this.reducedMotion = Boolean(reducedMotion);
     this.buffer = '';
@@ -137,11 +142,14 @@ class InteractivePrompt {
     this.pendingSubmission = '';
     this.pasteBuffer = null;
     this.pasteTimer = null;
-    this.pasteChunkActive = false;
-    this.pasteChunkGeneration = 0;
+    this.lastPlainInputAt = Number.NEGATIVE_INFINITY;
+    this.suppressedPasteKeypresses = 0;
     this.boundInputData = (chunk) => this.handleInputData(chunk);
     this.boundKeypress = (text, key) => {
-      if (this.pasteChunkActive) return;
+      if (this.suppressedPasteKeypresses > 0) {
+        this.suppressedPasteKeypresses -= 1;
+        return;
+      }
       Promise.resolve(this.handleKeypress(text, key)).catch((error) => this.onError(error));
     };
     this.boundResize = () => this.render();
@@ -317,14 +325,14 @@ class InteractivePrompt {
       return;
     }
     if (this.pasteBuffer != null) {
-      if (isEnterKey(key) && !this.pasteChunkActive) {
+      if (isEnterKey(key)) {
         this.flushPaste();
         await this.submitLine();
         return;
       }
       const pastedText = pasteKeyText(text, key);
       if (pastedText != null) {
-        this.pasteBuffer += pastedText;
+        this.pasteBuffer.push(pastedText);
         return;
       }
       this.flushPaste();
@@ -568,31 +576,37 @@ class InteractivePrompt {
 
   handleInputData(chunk) {
     const text = String(chunk ?? '');
+    const observedAt = Number(this.now());
+    const plainText = isPasteText(text);
+    const rapidPlainInput = plainText &&
+      observedAt - this.lastPlainInputAt <= this.pasteBurstThresholdMs;
+
     if (this.pasteBuffer != null) {
-      if (isStandaloneEnter(text) && !this.pasteChunkActive) {
+      if (isStandaloneEnter(text) && !rapidPlainInput) {
         this.flushPaste();
+        this.lastPlainInputAt = Number.NEGATIVE_INFINITY;
         return;
       }
-      if (!isPasteText(text)) return;
-    } else if (!isPasteBurst(text)) {
+      if (!plainText) {
+        this.lastPlainInputAt = Number.NEGATIVE_INFINITY;
+        return;
+      }
+    } else if (!isPasteBurst(text) && !(rapidPlainInput && isSinglePasteCharacter(text))) {
+      this.lastPlainInputAt = isSinglePasteCharacter(text)
+        ? observedAt
+        : Number.NEGATIVE_INFINITY;
       return;
     }
-    this.beginPaste();
-    this.pasteBuffer += text;
-    this.markPasteChunkActive();
-  }
 
-  markPasteChunkActive() {
-    this.pasteChunkActive = true;
-    const generation = ++this.pasteChunkGeneration;
-    queueMicrotask(() => {
-      if (generation === this.pasteChunkGeneration) this.pasteChunkActive = false;
-    });
+    this.lastPlainInputAt = observedAt;
+    this.beginPaste();
+    this.pasteBuffer.push(text);
+    this.suppressedPasteKeypresses += Array.from(text).length;
   }
 
   beginPaste() {
-    if (this.pasteBuffer == null) this.pasteBuffer = '';
-    this.clearPasteTimer();
+    if (this.pasteBuffer == null) this.pasteBuffer = [];
+    if (this.pasteTimer) return;
     this.pasteTimer = this.setPasteTimeout(() => {
       this.pasteTimer = null;
       this.flushPaste();
@@ -602,10 +616,8 @@ class InteractivePrompt {
 
   flushPaste() {
     if (this.pasteBuffer == null) return false;
-    const pastedText = this.pasteBuffer;
+    const pastedText = this.pasteBuffer.join('');
     this.pasteBuffer = null;
-    this.pasteChunkActive = false;
-    this.pasteChunkGeneration += 1;
     this.clearPasteTimer();
     this.insertText(pastedText);
     return true;
@@ -613,8 +625,8 @@ class InteractivePrompt {
 
   discardPaste() {
     this.pasteBuffer = null;
-    this.pasteChunkActive = false;
-    this.pasteChunkGeneration += 1;
+    this.suppressedPasteKeypresses = 0;
+    this.lastPlainInputAt = Number.NEGATIVE_INFINITY;
     this.clearPasteTimer();
   }
 
@@ -831,6 +843,11 @@ function isPasteText(text) {
     !text.includes('\u001B') &&
     !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(text),
   );
+}
+
+function isSinglePasteCharacter(text) {
+  if (!isPasteText(text) || isStandaloneEnter(text) || text === '\t') return false;
+  return Array.from(text).length === 1;
 }
 
 function pasteKeyText(text, key = {}) {

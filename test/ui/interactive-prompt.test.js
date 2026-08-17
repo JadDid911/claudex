@@ -689,6 +689,7 @@ test('ordinary raw-input paste bursts submit on the first standalone Enter witho
   const output = new FakeOutput();
   const submitted = [];
   const pasteTimers = [];
+  let now = 0;
   const prompt = createInteractivePrompt({
     input,
     output,
@@ -701,6 +702,7 @@ test('ordinary raw-input paste bursts submit on the first standalone Enter witho
     clearPasteTimeout(timer) {
       timer.cleared = true;
     },
+    now: () => now,
     onSubmit: async (line) => {
       submitted.push(line);
       return false;
@@ -713,14 +715,14 @@ test('ordinary raw-input paste bursts submit on the first standalone Enter witho
   input.emit('data', Buffer.from('first line\r\nsecond'));
   input.emit('data', Buffer.from(' line\rthird line'));
   await settle();
-  assert.equal(pasteTimers.length, 2);
-  assert.equal(pasteTimers[0].cleared, true);
+  assert.equal(pasteTimers.length, 1);
   assert.deepEqual(submitted, []);
 
+  now = 20;
   input.emit('data', Buffer.from('\r'));
   await settle();
   assert.deepEqual(submitted, ['first line second line third line']);
-  assert.equal(pasteTimers[1].cleared, true);
+  assert.equal(pasteTimers[0].cleared, true);
 
   await prompt.stop();
   assert.doesNotMatch(output.text, /\u001b\[\?2004[hl]/u);
@@ -730,6 +732,7 @@ test('large raw-input paste bursts avoid per-character promise amplification', a
   const input = new FakeInput();
   const output = new FakeOutput();
   const pasteTimers = [];
+  let now = 0;
   const prompt = createInteractivePrompt({
     input,
     output,
@@ -742,9 +745,11 @@ test('large raw-input paste bursts avoid per-character promise amplification', a
     clearPasteTimeout(timer) {
       timer.cleared = true;
     },
+    now: () => now,
   });
 
   await prompt.start();
+  const writesBeforePaste = output.writes.length;
   const pastedText = `first line\r\n${'x'.repeat(20_000)}`;
   let trackingPromises = false;
   let promiseCount = 0;
@@ -756,7 +761,10 @@ test('large raw-input paste bursts avoid per-character promise amplification', a
   hook.enable();
   try {
     trackingPromises = true;
-    input.emit('data', Buffer.from(pastedText));
+    for (const character of pastedText) {
+      now += 1;
+      input.emit('data', Buffer.from(character));
+    }
     trackingPromises = false;
   } finally {
     hook.disable();
@@ -764,6 +772,8 @@ test('large raw-input paste bursts avoid per-character promise amplification', a
 
   assert.ok(promiseCount <= 4, `paste created ${promiseCount} promises`);
   assert.equal(pasteTimers.length, 1);
+  const pasteWrites = output.writes.length - writesBeforePaste;
+  assert.ok(pasteWrites <= 20, `paste triggered ${pasteWrites} terminal writes`);
   pasteTimers[0].callback();
   assert.equal(prompt.value, `first line ${'x'.repeat(20_000)}`);
   await prompt.stop();
