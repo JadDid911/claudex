@@ -22,7 +22,7 @@ function createOutput(isTTY = false) {
   };
 }
 
-test('prompt output coordinator waits for a streamed body line boundary before restoring input', async () => {
+test('prompt output coordinator keeps input visible between partial streamed body updates', async () => {
   const output = createOutput(true);
   const renderer = createTranscriptRenderer({ output, color: false });
   const calls = [];
@@ -37,12 +37,12 @@ test('prompt output coordinator waits for a streamed body line boundary before r
   try {
     renderer.renderEvent({ actor: 'CLAUDE', label: 'lead', type: 'delta', text: 'Hello ' });
     await new Promise((resolve) => queueMicrotask(resolve));
-    assert.deepEqual(calls, ['hide']);
+    assert.deepEqual(calls, ['hide', 'show']);
 
     renderer.renderEvent({ actor: 'CLAUDE', label: 'lead', type: 'delta', text: 'world\n' });
     await new Promise((resolve) => queueMicrotask(resolve));
-    assert.deepEqual(calls, ['hide', 'hide', 'show']);
-    assert.match(sanitizeVisibleText(output.read()), /Hello world/u);
+    assert.deepEqual(calls, ['hide', 'show', 'hide', 'show']);
+    assert.match(sanitizeVisibleText(output.read()), /Hello\s+world/u);
   } finally {
     restore();
   }
