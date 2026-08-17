@@ -141,6 +141,7 @@ test('ci workflow verifies, packs, and smoke-installs the published tarball acro
 
 test('live compatibility workflow is opt-in, self-hosted, and read-only', async () => {
   const workflow = await readWorkflow('live-compat.yml');
+  const runner = await readFile(new URL('../scripts/live-compat.js', import.meta.url), 'utf8');
 
   assert.match(workflow, /^name:\s+Live compatibility/mu);
   assert.match(workflow, /^on:\s*[\r\n]+  schedule:/mu);
@@ -148,11 +149,13 @@ test('live compatibility workflow is opt-in, self-hosted, and read-only', async 
   assert.match(workflow, /if:\s+\$\{\{\s*vars\.CLAUDEX_ENABLE_LIVE_COMPAT\s*==\s*'true'\s*\}\}/mu);
   assert.match(workflow, /runs-on:\s*\[\s*self-hosted,\s*claudex-live-compat\s*\]/mu);
   assert.match(workflow, /contents:\s+read/mu);
-  assert.match(workflow, /access:\s*'read'/mu);
-  assert.match(workflow, /GITHUB_STEP_SUMMARY/mu);
-  assert.match(workflow, /firstTextMs[\s\S]*totalMs/mu);
+  assert.match(workflow, /node \.\/scripts\/live-compat\.js/mu);
   assert.match(workflow, /CLAUDEX_LIVE_CLAUDE_MODEL/mu);
   assert.doesNotMatch(workflow, /npm publish|NPM_TOKEN|NODE_AUTH_TOKEN/mu);
+  assert.match(runner, /access:\s*'read'/mu);
+  assert.match(runner, /GITHUB_STEP_SUMMARY/mu);
+  assert.match(runner, /firstTextMs[\s\S]*totalMs/mu);
+  assert.doesNotMatch(runner, /npm publish|NPM_TOKEN|NODE_AUTH_TOKEN/mu);
 });
 
 test('release workflow publishes only from tags and uses GitHub OIDC provenance', async () => {
