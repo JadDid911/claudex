@@ -281,14 +281,12 @@ class InteractivePrompt {
         total + Math.max(1, Math.ceil(terminalDisplayWidth(line) / columns))
       ), 0);
 
-    this.withHiddenCursor(() => {
-      if (rowsAboveInput > 0) moveCursor(this.output, 0, -rowsAboveInput);
-      cursorTo(this.output, 0);
-      clearLine(this.output, 0);
-      this.output.write(loadingLine);
-      if (rowsAboveInput > 0) moveCursor(this.output, 0, rowsAboveInput);
-      cursorTo(this.output, Math.max(0, this.renderedCursorColumn));
-    });
+    const moveUp = rowsAboveInput > 0 ? `\u001B[${rowsAboveInput}A` : '';
+    const moveDown = rowsAboveInput > 0 ? `\u001B[${rowsAboveInput}B` : '';
+    const restoreColumn = `\u001B[${Math.max(0, this.renderedCursorColumn) + 1}G`;
+    this.output.write(
+      `${HIDE_CURSOR}${moveUp}\r\u001B[2K${loadingLine}${moveDown}\r${restoreColumn}${SHOW_CURSOR}`,
+    );
     this.renderedFrameLines[this.renderedLoadingIndex] = sanitizeVisibleText(loadingLine);
   }
 

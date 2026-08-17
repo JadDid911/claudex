@@ -547,6 +547,7 @@ test('real TTY startup prints the persistent identity card before the static liv
   const stderr = createOutput(false);
   let animationTimers = 0;
   let animateBusy;
+  let animationIntervalMs;
 
   const runPromise = runCli({
     argv: ['--workspace', 'C:/repo'],
@@ -554,11 +555,12 @@ test('real TTY startup prints the persistent identity card before the static liv
     stdin,
     stdout,
     stderr,
-    env: { NO_COLOR: '1' },
+    env: { NO_COLOR: '1', WMUX_SHELL_INTEGRATION: '1' },
     packageVersion: '1.2.3',
     loadModelCatalog: async () => ({ codex: [], claude: [] }),
     interactivePromptFactory(options) {
       animateBusy = options.animateBusy;
+      animationIntervalMs = options.animationIntervalMs;
       return createInteractivePrompt({
         ...options,
         setAnimationTimer() {
@@ -626,6 +628,7 @@ test('real TTY startup prints the persistent identity card before the static liv
     assert.match(frame, /─{120}\r?\n  › \r?\n─{120}/u);
     assert.equal(animationTimers, 0);
     assert.equal(animateBusy, true);
+    assert.equal(animationIntervalMs, 750);
     assert.doesNotMatch(frame, /one room · two models|◆━|━◆/u);
   } finally {
     stdin.emit('keypress', '/exit', { name: undefined });

@@ -543,8 +543,9 @@ test('busy repaints keep the terminal caret hidden until it returns to the input
     if (chunk.includes(SHOW_CURSOR)) cursorVisible = true;
   }
 
-  assert.equal(repaintWrites[0], HIDE_CURSOR);
-  assert.equal(repaintWrites.at(-1), SHOW_CURSOR);
+  assert.equal(repaintWrites.length, 1);
+  assert.equal(repaintWrites[0].startsWith(HIDE_CURSOR), true);
+  assert.equal(repaintWrites[0].endsWith(SHOW_CURSOR), true);
   assert.equal(visibleMovement, false);
   assert.equal(cursorVisible, true);
   assert.doesNotMatch(repaintWrites.join(''), /â”€{20}/u);

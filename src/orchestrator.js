@@ -107,6 +107,15 @@ function normalizeProviderObjective(objective, classification) {
     .replace(/\baudit\b(?!\s+(?:log|logs|trail|trails|event|events|record|records)\b)/giu, 'engineering review');
 }
 
+function isContextOnlyDirectObjective(objective) {
+  const text = String(objective ?? '').trim();
+  if (text.length < 160 || /\?/u.test(text)) return false;
+  return !(
+    /^(?:please\s+)?(?:explain|summarize|rewrite|draft|analyze|review|check|fix|build|create|implement|change|edit|plan|compare|list|tell|show|help)\b/iu.test(text) ||
+    /\b(?:can|could|would|will) you\b|\bi (?:want|need|would like) you to\b|\bplease\b/iu.test(text)
+  );
+}
+
 function readOnlyAssignmentPrompt(assignment, objective) {
   const scope = assignment.reviewFocus;
   const header = `Act as ${assignment.role}. Do not modify the workspace.`;
@@ -172,6 +181,15 @@ function readOnlyAssignmentPrompt(assignment, objective) {
       `${header} Conduct the requested UI/UX review.`,
       objectiveLine,
       'Return concise, evidence-backed findings for the lead, ordered by severity.',
+    ].join('\n\n');
+  }
+
+  if (assignment.role === 'direct-turn' && isContextOnlyDirectObjective(objective)) {
+    return [
+      `${header} The user supplied context without a clear requested outcome.`,
+      objectiveLine,
+      'Do not repeat or paraphrase the supplied context as the answer.',
+      `Ask exactly one concise blocking question about the intended outcome, prefixed with "${ROOM_CLARIFICATION_PREFIX}". Offer useful choices such as analyze, rewrite, plan next steps, or retain as context.`,
     ].join('\n\n');
   }
 

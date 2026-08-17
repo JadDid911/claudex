@@ -155,6 +155,7 @@ export async function runCli(options = {}) {
         interactivePromptFactory,
         color: !Object.hasOwn(env, 'NO_COLOR'),
         reducedMotion: reducedMotionRequested(env),
+        animationIntervalMs: promptAnimationInterval(env),
       });
     } else {
       await runReadlineLoop({ app, renderer, stdin, stdout, stderr, readlineFactory });
@@ -398,6 +399,7 @@ async function runInteractivePromptLoop({
   interactivePromptFactory,
   color,
   reducedMotion,
+  animationIntervalMs,
 }) {
   let resolveExit;
   const exited = new Promise((resolve) => {
@@ -422,6 +424,7 @@ async function runInteractivePromptLoop({
     color,
     reducedMotion,
     animateBusy: true,
+    animationIntervalMs,
     isBusy: () => Boolean(app.isBusy?.()),
     getContext: () => {
       let status = {};
@@ -460,6 +463,10 @@ async function runInteractivePromptLoop({
 
 function reducedMotionRequested(env = {}) {
   return /^(?:1|true|yes|on)$/iu.test(String(env.CLAUDEX_REDUCED_MOTION ?? '').trim());
+}
+
+function promptAnimationInterval(env = {}) {
+  return String(env.WMUX_SHELL_INTEGRATION ?? '').trim() ? 750 : 120;
 }
 
 function createSubmissionQueue({ app, renderer, stdout, stderr, onStateChange = () => {} }) {

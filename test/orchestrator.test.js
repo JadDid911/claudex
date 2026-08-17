@@ -640,6 +640,21 @@ test('read-only assignment prompts keep the user objective in the provider-visib
   assert.match(harness.codex.calls[0].prompt, /Describe the scheduler boundary in plain language\./u);
 });
 
+test('a long context-only direct turn asks for an outcome instead of requesting a paraphrase', async (context) => {
+  const harness = await createHarness(context, { claude: { available: false } });
+  const pastedContext = [
+    'Hey I have been testing the watcher on the Haymarket VM with orders, invoices, and quotes.',
+    'It detects that NexusDB files changed, but cannot identify the records inside the proprietary database.',
+    'The POS also does not appear to support scheduled exports of customers, orders, or quotes.',
+  ].join(' ');
+
+  await harness.app.dispatch({ kind: 'turn', route: 'codex', prompt: pastedContext });
+
+  assert.match(harness.codex.calls[0].prompt, /context without a clear requested outcome/iu);
+  assert.match(harness.codex.calls[0].prompt, /do not (?:repeat|paraphrase)/iu);
+  assert.match(harness.codex.calls[0].prompt, /Question for you:/u);
+});
+
 test('a plan-stage clarification pauses supermode before execute', async (context) => {
   const question = 'Question for you: Which parser file should I change?';
   const harness = await createHarness(context, {
