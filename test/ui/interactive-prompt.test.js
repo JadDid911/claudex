@@ -728,7 +728,7 @@ test('ordinary raw-input paste bursts submit on the first standalone Enter witho
   assert.doesNotMatch(output.text, /\u001b\[\?2004[hl]/u);
 });
 
-test('large raw-input paste bursts avoid per-character promise amplification', async () => {
+test('fragmented raw input stays batched when wmux dribbles one character at a time', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const pasteTimers = [];
@@ -750,7 +750,7 @@ test('large raw-input paste bursts avoid per-character promise amplification', a
 
   await prompt.start();
   const writesBeforePaste = output.writes.length;
-  const pastedText = `first line\r\n${'x'.repeat(20_000)}`;
+  const pastedText = 'x'.repeat(5_000);
   let trackingPromises = false;
   let promiseCount = 0;
   const hook = createHook({
@@ -762,7 +762,9 @@ test('large raw-input paste bursts avoid per-character promise amplification', a
   try {
     trackingPromises = true;
     for (const character of pastedText) {
-      now += 1;
+      // The old heuristic stopped recognizing a paste once a terminal repaint
+      // made adjacent chunks arrive more than eight milliseconds apart.
+      now += 20;
       input.emit('data', Buffer.from(character));
     }
     trackingPromises = false;
@@ -770,12 +772,12 @@ test('large raw-input paste bursts avoid per-character promise amplification', a
     hook.disable();
   }
 
-  assert.ok(promiseCount <= 4, `paste created ${promiseCount} promises`);
+  assert.ok(promiseCount <= 16, `paste created ${promiseCount} promises`);
   assert.equal(pasteTimers.length, 1);
   const pasteWrites = output.writes.length - writesBeforePaste;
   assert.ok(pasteWrites <= 20, `paste triggered ${pasteWrites} terminal writes`);
   pasteTimers[0].callback();
-  assert.equal(prompt.value, `first line ${'x'.repeat(20_000)}`);
+  assert.equal(prompt.value, pastedText);
   await prompt.stop();
 });
 

@@ -10,9 +10,11 @@ All notable changes to Claudex are documented here. This project follows
 - Removed terminal bracketed-paste mode after it caused repeated wmux freezes.
   Multiline pastes now use ordinary raw-input burst buffering, stay in one
   editable draft, submit on the first standalone Enter, and never emit terminal
-  paste-mode escape sequences. Large chunks are consumed once instead of
-  scheduling asynchronous work for every pasted character, while rapid
-  single-character chunks are coalesced to prevent wmux repaint floods.
+  paste-mode escape sequences. Raw text is painted at most once per 16 ms input
+  batch instead of scheduling asynchronous work and redrawing the composer for
+  every pasted character, even when wmux delivers the paste one byte at a time.
+- Restored the wmux activity indicator to a smooth 120 ms cadence. Its isolated
+  one-line repaint no longer needs the old 750 ms terminal-wide throttle.
 
 ## [0.4.1] - 2026-08-16
 

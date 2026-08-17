@@ -22,6 +22,7 @@ const INPUT_PREFIX = '  \u203a ';
 const MENU_MARKER = '\u203a';
 const ELLIPSIS = '\u2026';
 const DEFAULT_PASTE_BURST_THRESHOLD_MS = 8;
+const DEFAULT_INPUT_BATCH_MS = 16;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const COMBINING_MARK = /\p{Mark}/u;
 const EMOJI = /\p{Extended_Pictographic}|\p{Regional_Indicator}/u;
@@ -96,7 +97,7 @@ class InteractivePrompt {
     animationIntervalMs = 90,
     setPasteTimeout = setTimeout,
     clearPasteTimeout = clearTimeout,
-    pasteTimeoutMs = 250,
+    pasteTimeoutMs = DEFAULT_INPUT_BATCH_MS,
     pasteBurstThresholdMs = DEFAULT_PASTE_BURST_THRESHOLD_MS,
     now = Date.now,
     animateBusy = true,
@@ -581,20 +582,14 @@ class InteractivePrompt {
     const rapidPlainInput = plainText &&
       observedAt - this.lastPlainInputAt <= this.pasteBurstThresholdMs;
 
-    if (this.pasteBuffer != null) {
-      if (isStandaloneEnter(text) && !rapidPlainInput) {
-        this.flushPaste();
-        this.lastPlainInputAt = Number.NEGATIVE_INFINITY;
-        return;
-      }
-      if (!plainText) {
-        this.lastPlainInputAt = Number.NEGATIVE_INFINITY;
-        return;
-      }
-    } else if (!isPasteBurst(text) && !(rapidPlainInput && isSinglePasteCharacter(text))) {
-      this.lastPlainInputAt = isSinglePasteCharacter(text)
-        ? observedAt
-        : Number.NEGATIVE_INFINITY;
+    if (!plainText) {
+      this.lastPlainInputAt = Number.NEGATIVE_INFINITY;
+      return;
+    }
+    if (this.pasteBuffer == null && text === '\t') return;
+    if (isStandaloneEnter(text) && !rapidPlainInput) {
+      if (this.pasteBuffer != null) this.flushPaste();
+      this.lastPlainInputAt = Number.NEGATIVE_INFINITY;
       return;
     }
 
@@ -824,30 +819,12 @@ function singleLine(value) {
   return sanitizeVisibleText(value).replace(/\s+/gu, ' ').trim();
 }
 
-function isPasteBurst(text) {
-  if (!isPasteText(text)) return false;
-  if (isStandaloneEnter(text)) return false;
-  if (/[\r\n]/u.test(text)) return true;
-
-  let graphemes = 0;
-  for (const _ of GRAPHEME_SEGMENTER.segment(text)) {
-    graphemes += 1;
-    if (graphemes > 1) return true;
-  }
-  return false;
-}
-
 function isPasteText(text) {
   return Boolean(
     text &&
     !text.includes('\u001B') &&
     !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(text),
   );
-}
-
-function isSinglePasteCharacter(text) {
-  if (!isPasteText(text) || isStandaloneEnter(text) || text === '\t') return false;
-  return Array.from(text).length === 1;
 }
 
 function pasteKeyText(text, key = {}) {

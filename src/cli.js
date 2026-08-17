@@ -465,8 +465,8 @@ function reducedMotionRequested(env = {}) {
   return /^(?:1|true|yes|on)$/iu.test(String(env.CLAUDEX_REDUCED_MOTION ?? '').trim());
 }
 
-function promptAnimationInterval(env = {}) {
-  return String(env.WMUX_SHELL_INTEGRATION ?? '').trim() ? 750 : 120;
+function promptAnimationInterval() {
+  return 120;
 }
 
 function createSubmissionQueue({ app, renderer, stdout, stderr, onStateChange = () => {} }) {
