@@ -162,5 +162,6 @@ test('release workflow publishes only from tags and uses GitHub OIDC provenance'
   assert.match(workflow, /github\.ref_name.*package\.json.*version|tag.*package version/isu);
   assert.match(workflow, /name: Verify tag matches package version[\s\S]*?run: >-/u);
   assert.match(workflow, /npm publish --provenance --access public/mu);
+  assert.match(workflow, /vars\.CLAUDEX_PUBLISH_NPM\s*==\s*'true'/mu);
   assert.doesNotMatch(workflow, /NPM_TOKEN|NODE_AUTH_TOKEN|npm token/mu);
 });

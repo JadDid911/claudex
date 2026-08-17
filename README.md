@@ -322,7 +322,7 @@ npm run pack:dry-run
 - `npm run check` validates JavaScript syntax and repository safety rules.
 - `npm test` runs the Node test suite.
 - `npm run demo` exercises the offline mock-provider orchestrator.
-- `npm run pack:dry-run` verifies the public package allowlist; tagged releases use npm trusted publishing, while manual release workflow runs remain dry-run only.
+- `npm run pack:dry-run` verifies the public package allowlist. Version tags publish a GitHub release; npm trusted publishing runs only when the repository variable `CLAUDEX_PUBLISH_NPM` is explicitly set to `true`. Manual release workflow runs remain dry-run only.
 - In PowerShell, `$env:ROOM_LIVE_PROVIDER_SMOKE='1'; npm test` enables opt-in read-only calls to the installed provider CLIs. Those calls use the signed-in accounts and their normal usage limits.
 
 ## Limitations

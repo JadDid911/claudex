@@ -32,5 +32,9 @@ jobs:
       - run: npm run verify
       - if: ${{ github.event_name == 'workflow_dispatch' }}
         run: npm publish --provenance --access public --dry-run
-      - if: ${{ github.event_name == 'push' }}
+      - name: Publish to npm through trusted publishing
+        if: ${{ github.event_name == 'push' && vars.CLAUDEX_PUBLISH_NPM == 'true' }}
         run: npm publish --provenance --access public
+      - name: Report GitHub-only release
+        if: ${{ github.event_name == 'push' && vars.CLAUDEX_PUBLISH_NPM != 'true' }}
+        run: echo "GitHub release verified; npm publication is disabled until CLAUDEX_PUBLISH_NPM=true."
