@@ -479,6 +479,34 @@ test('busy animation follows provider activity through completion and clears its
   assert.equal(clearCount, 1);
 });
 
+test('integrated prompt can keep a static busy row without starting a second animation loop', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  let timerStarts = 0;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    animateBusy: false,
+    isBusy: () => true,
+    getContext: () => ({
+      ...context,
+      activeProvider: 'codex',
+      activeStage: 'execute',
+    }),
+    setAnimationTimer() {
+      timerStarts += 1;
+      return { unref() {} };
+    },
+    clearAnimationTimer() {},
+  });
+
+  await prompt.start();
+  assert.equal(timerStarts, 0);
+  assert.match(visibleText(output), /waiting for CODEX execute output/u);
+  await prompt.stop();
+});
+
 test('busy repaints keep the terminal caret hidden until it returns to the input row', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();

@@ -98,6 +98,7 @@ class InteractivePrompt {
     setPasteTimeout = setTimeout,
     clearPasteTimeout = clearTimeout,
     pasteTimeoutMs = 250,
+    animateBusy = true,
     reducedMotion = reducedMotionRequested(process.env),
   } = {}) {
     this.input = input;
@@ -115,6 +116,7 @@ class InteractivePrompt {
     this.setPasteTimeout = setPasteTimeout;
     this.clearPasteTimeout = clearPasteTimeout;
     this.pasteTimeoutMs = pasteTimeoutMs;
+    this.animateBusy = Boolean(animateBusy);
     this.reducedMotion = Boolean(reducedMotion);
     this.buffer = '';
     this.cursor = 0;
@@ -629,7 +631,7 @@ class InteractivePrompt {
   }
 
   startAnimationTimer() {
-    if (this.reducedMotion || this.animationTimer || !this.isActiveState()) {
+    if (!this.animateBusy || this.reducedMotion || this.animationTimer || !this.isActiveState()) {
       return;
     }
 
@@ -648,7 +650,7 @@ class InteractivePrompt {
   }
 
   syncAnimationTimer() {
-    if (this.reducedMotion) {
+    if (!this.animateBusy || this.reducedMotion) {
       this.stopAnimationTimer();
       return;
     }

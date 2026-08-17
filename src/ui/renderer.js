@@ -38,7 +38,7 @@ class TranscriptRenderer {
     color = output.isTTY ?? false,
     setActivityTimer = setInterval,
     clearActivityTimer = clearInterval,
-    activityIntervalMs = 120,
+    activityIntervalMs = 300,
   } = {}) {
     this.output = output;
     this.isTTY = Boolean(output.isTTY ?? false);

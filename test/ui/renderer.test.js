@@ -174,6 +174,22 @@ test('renderer coalesces tty activity, tool, and status events into one replace-
   );
 });
 
+test('tty activity uses a wmux-safe repaint cadence by default', () => {
+  const output = createOutput(true);
+  const timers = createTimerHarness();
+  const renderer = createTranscriptRenderer({
+    output,
+    color: false,
+    setActivityTimer: timers.setActivityTimer,
+    clearActivityTimer: timers.clearActivityTimer,
+  });
+
+  renderer.renderEvent({ actor: 'CODEX', label: 'lead', type: 'activity', text: 'Inspecting...' });
+  assert.equal(timers.handles.length, 1);
+  assert.equal(timers.handles[0].intervalMs, 300);
+  renderer.finish();
+});
+
 test('tty activity keeps repainting after durable lead commentary until terminal completion', () => {
   const output = createOutput(true);
   const timers = createTimerHarness();

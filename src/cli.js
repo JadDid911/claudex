@@ -419,6 +419,7 @@ async function runInteractivePromptLoop({
     output: stdout,
     color,
     reducedMotion,
+    animateBusy: false,
     isBusy: () => Boolean(app.isBusy?.()),
     getContext: () => {
       let status = {};
