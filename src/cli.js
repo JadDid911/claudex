@@ -437,6 +437,7 @@ async function runInteractivePromptLoop({
         ...status,
         roomId: status.roomId ?? startup.roomId ?? null,
         modelCatalog,
+        activeActivities: renderer.activitySnapshot?.() ?? [],
       };
     },
     onSubmit: (line) => submissionQueue.submit(line),

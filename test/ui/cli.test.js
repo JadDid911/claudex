@@ -56,7 +56,7 @@ test('prompt output coordinator keeps input visible between partial streamed bod
   }
 });
 
-test('prompt output coordinator keeps provider activity event-driven instead of repainting the full composer on a timer', async () => {
+test('prompt output coordinator leaves provider activity to the live prompt instead of printing a frozen row', async () => {
   const output = createOutput(true);
   const timerHandles = [];
   const renderer = createTranscriptRenderer({
@@ -82,13 +82,19 @@ test('prompt output coordinator keeps provider activity event-driven instead of 
     await new Promise((resolve) => queueMicrotask(resolve));
 
     assert.equal(timerHandles.length, 0);
-    assert.deepEqual(calls, ['hide', 'show']);
+    assert.deepEqual(calls, []);
+    assert.doesNotMatch(sanitizeVisibleText(output.read()), /Gallivanting/u);
+    assert.deepEqual(renderer.activitySnapshot(), [{
+      actor: 'CODEX',
+      label: 'lead',
+      detail: 'Inspecting...',
+    }]);
 
     renderer.renderEvent({ actor: 'CODEX', label: 'lead', type: 'activity', text: 'Checking...' });
     await new Promise((resolve) => queueMicrotask(resolve));
 
     assert.equal(timerHandles.length, 0);
-    assert.deepEqual(calls, ['hide', 'show', 'hide', 'show']);
+    assert.deepEqual(calls, []);
   } finally {
     renderer.finish();
     restore();
@@ -797,7 +803,7 @@ test('real TTY keypresses remain editable and queue a follow-up while a provider
   }
 });
 
-test('interactive prompt keeps rotating activity above the live input line', async () => {
+test('interactive coordinator does not leave a frozen renderer activity row above the live input line', async () => {
   const stdin = new FakeTtyInput();
   const stdout = new FakeTtyOutput();
   const stderr = createOutput(false);
@@ -866,13 +872,14 @@ test('interactive prompt keeps rotating activity above the live input line', asy
   await new Promise((resolve) => setImmediate(resolve));
 
   const rendered = stdout.read();
-  assert.match(rendered, /Gallivanting…[^\n]*\nroom › /u);
-  assert.match(rendered, /\u001B\[1A\r\u001B\[2KCODEX · lead/u);
+  assert.doesNotMatch(rendered, /Gallivanting…/u);
+  assert.doesNotMatch(rendered, /CODEX · lead/u);
+  assert.match(rendered, /room › /u);
 
   await exit();
   assert.equal(await runPromise, 0);
   assert.equal(stderr.read(), '');
-  assert.match(stdout.read(), /\r\u001B\[2K\u001B\[1A\r\u001B\[2K$/u);
+  assert.match(stdout.read(), /\r\u001B\[2K$/u);
 });
 
 test('runCli queues a second plain TTY reply while the first dispatch is still pending', async () => {

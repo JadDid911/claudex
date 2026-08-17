@@ -6,7 +6,7 @@ const CONTROL_PATTERN = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
 
 const ACTOR_NAMES = new Set(['YOU', 'SYSTEM', 'CODEX', 'CLAUDE']);
 const ACTIVITY_SPINNER_FRAMES = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
-const ACTIVITY_VERBS = [
+export const ACTIVITY_VERBS = [
   'Gallivanting\u2026',
   'Puttering\u2026',
   'Tinkering\u2026',
@@ -61,6 +61,14 @@ class TranscriptRenderer {
 
   setInteractiveStreamBuffering(enabled) {
     this.interactiveStreamBuffering = Boolean(enabled);
+  }
+
+  activitySnapshot() {
+    return [...this.activityEntries.values()].map((entry) => ({
+      actor: normalizeActor(entry.actor),
+      label: sanitizeVisibleText(entry.label ?? ''),
+      detail: sanitizeVisibleText(entry.detail ?? ''),
+    }));
   }
 
   setActivityAnimation(enabled) {
@@ -495,7 +503,7 @@ class TranscriptRenderer {
   }
 
   paintActivityLine() {
-    if (this.activityEntries.size === 0) {
+    if (this.interactiveStreamBuffering || this.activityEntries.size === 0) {
       return;
     }
 

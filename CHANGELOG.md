@@ -17,6 +17,9 @@ All notable changes to Claudex are documented here. This project follows
   one-line repaint no longer needs the old 750 ms terminal-wide throttle.
 - Wrapped echoed prompts and provider response bodies to the live TTY width so
   long pasted text cannot spill beyond a narrow or resized wmux pane.
+- Moved provider identity, role, and activity detail into the composer-owned
+  120 ms activity row. Interactive mode no longer leaves a frozen first-frame
+  `CODEX · lead · Gallivanting…` renderer line above the live prompt.
 
 ## [0.4.1] - 2026-08-16
 

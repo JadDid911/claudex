@@ -8,7 +8,7 @@ import process from 'node:process';
 
 import { buildCommandPalette } from './command-palette.js';
 import { parseInputLine } from './commands.js';
-import { sanitizeVisibleText } from './renderer.js';
+import { ACTIVITY_VERBS, sanitizeVisibleText } from './renderer.js';
 
 const CYAN = '\u001B[36m';
 const DIM = '\u001B[2m';
@@ -232,7 +232,7 @@ class InteractivePrompt {
 
     const loadingLine = active
       ? formatLoadingLine(
-          this.pendingSubmission || busyLoadingMessage(context),
+          this.pendingSubmission || busyLoadingMessage(context, this.busyFrame),
           this.busyFrame,
           columns,
           this.color,
@@ -281,7 +281,7 @@ class InteractivePrompt {
       : 80;
     const context = this.getContext?.() ?? {};
     const loadingLine = formatLoadingLine(
-      this.pendingSubmission || busyLoadingMessage(context),
+      this.pendingSubmission || busyLoadingMessage(context, this.busyFrame),
       this.busyFrame,
       columns,
       this.color,
@@ -1022,9 +1022,26 @@ function reducedMotionRequested(env = {}) {
   return /^(?:1|true|yes|on)$/iu.test(String(env.CLAUDEX_REDUCED_MOTION ?? '').trim());
 }
 
-function busyLoadingMessage(context) {
-  const identity = activeActivityIdentity(context);
-  return `waiting for ${identity || 'provider'} output`;
+function busyLoadingMessage(context, frame = 0) {
+  const activity = activePromptActivity(context);
+  const identity = activity?.identity || activeActivityIdentity(context);
+  const verbIndex = Math.floor(frame / LOADING_FRAMES.length) % ACTIVITY_VERBS.length;
+  return `${identity || 'PROVIDER'} \u00b7 ${ACTIVITY_VERBS[verbIndex]}${
+    activity?.detail ? ` \u2014 ${activity.detail}` : ''
+  }`;
+}
+
+function activePromptActivity(context) {
+  const activity = Array.isArray(context.activeActivities)
+    ? context.activeActivities[0]
+    : null;
+  if (!activity) return null;
+
+  const provider = singleLine(activity.actor ?? activity.provider).toUpperCase();
+  const label = singleLine(activity.label);
+  const identity = [provider, label].filter(Boolean).join(' ');
+  if (!identity) return null;
+  return { identity, detail: singleLine(activity.detail) };
 }
 
 function busySubmissionLabel(submitted, context) {

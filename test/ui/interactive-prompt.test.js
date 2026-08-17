@@ -427,7 +427,7 @@ test('busy provider turns keep the live editor usable for queued submissions', a
   input.emit('keypress', 't', { name: undefined });
 
   assert.equal(prompt.value, 'queued draft');
-  assert.match(visibleText(output), /waiting for CLAUDE review output/u);
+  assert.match(visibleText(output), /CLAUDE review.*Gallivanting/u);
 
   input.emit('keypress', undefined, { name: 'enter' });
   await settle();
@@ -453,6 +453,7 @@ test('busy animation follows provider activity through completion and clears its
       ...context,
       activeProcess: 'claude execute (turn-8)',
       activeStage: 'execute',
+      activeActivities: [{ actor: 'CODEX', label: 'lead', detail: 'Inspecting files...' }],
     }),
     setAnimationTimer(callback) {
       timerCallback = callback;
@@ -467,14 +468,14 @@ test('busy animation follows provider activity through completion and clears its
   await prompt.start();
   output.text = '';
   timerCallback();
-  assert.match(visibleText(output), /waiting for CLAUDE execute output/u);
+  assert.match(visibleText(output), /\u2819 CODEX lead.*Gallivanting.*Inspecting files/u);
   assert.equal(clearCount, 0);
 
   active = false;
   output.text = '';
   timerCallback();
   assert.equal(clearCount, 1);
-  assert.doesNotMatch(visibleText(output), /waiting for .* output/u);
+  assert.doesNotMatch(visibleText(output), /Gallivanting/u);
 
   await prompt.stop();
   assert.equal(clearCount, 1);
@@ -504,7 +505,7 @@ test('integrated prompt can keep a static busy row without starting a second ani
 
   await prompt.start();
   assert.equal(timerStarts, 0);
-  assert.match(visibleText(output), /waiting for CODEX execute output/u);
+  assert.match(visibleText(output), /CODEX execute.*Gallivanting/u);
   await prompt.stop();
 });
 
