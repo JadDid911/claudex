@@ -35,7 +35,12 @@ jobs:
           const result = spawnSync(npmCommand, ['pack', '--json', '--ignore-scripts'], {
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'pipe'],
+            shell: process.platform === 'win32',
           });
+
+          if (result.error) {
+            throw result.error;
+          }
 
           if (result.status !== 0) {
             process.stderr.write(result.stderr || result.stdout);
