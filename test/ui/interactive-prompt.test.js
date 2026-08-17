@@ -651,6 +651,94 @@ test('multiline paste collapses into a single editable turn before submission', 
   await prompt.stop();
 });
 
+test('terminal bracketed paste keeps every pasted line in one editable turn', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const submitted = [];
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    onSubmit: async (line) => {
+      submitted.push(line);
+      return false;
+    },
+  });
+
+  await prompt.start();
+  assert.match(output.text, /\u001b\[\?2004h/u);
+
+  input.emit('keypress', undefined, { name: 'paste-start', sequence: '\u001b[200~' });
+  input.emit('keypress', 'first line', { name: undefined });
+  input.emit('keypress', '\r', { name: 'return', sequence: '\r' });
+  input.emit('keypress', '\n', { name: 'enter', sequence: '\n' });
+  input.emit('keypress', 'second line', { name: undefined });
+  input.emit('keypress', '\r', { name: 'return', sequence: '\r' });
+  input.emit('keypress', 'third line', { name: undefined });
+  input.emit('keypress', undefined, { name: 'paste-end', sequence: '\u001b[201~' });
+  await settle();
+
+  assert.equal(prompt.value, 'first line second line third line');
+  assert.deepEqual(submitted, []);
+
+  input.emit('keypress', undefined, { name: 'enter' });
+  await settle();
+  assert.deepEqual(submitted, ['first line second line third line']);
+
+  await prompt.stop();
+  assert.match(output.text, /\u001b\[\?2004l/u);
+});
+
+test('an unterminated bracketed paste recovers without freezing input or swallowing Ctrl+C', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const submitted = [];
+  const pasteTimers = [];
+  let cancels = 0;
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    isBusy: () => true,
+    setPasteTimeout(callback) {
+      const timer = { callback, cleared: false };
+      pasteTimers.push(timer);
+      return timer;
+    },
+    clearPasteTimeout(timer) {
+      timer.cleared = true;
+    },
+    onSubmit: async (line) => {
+      submitted.push(line);
+      return false;
+    },
+    onCancel: async () => {
+      cancels += 1;
+      return false;
+    },
+  });
+
+  await prompt.start();
+  input.emit('keypress', undefined, { name: 'paste-start', sequence: '\u001b[200~' });
+  input.emit('keypress', 'first line', { name: undefined });
+  input.emit('keypress', '\r', { name: 'return', sequence: '\r' });
+  input.emit('keypress', 'second line', { name: undefined });
+  assert.equal(pasteTimers.length, 1);
+
+  pasteTimers[0].callback();
+  assert.equal(prompt.value, 'first line second line');
+  assert.deepEqual(submitted, []);
+
+  input.emit('keypress', undefined, { name: 'paste-start', sequence: '\u001b[200~' });
+  input.emit('keypress', 'unfinished', { name: undefined });
+  input.emit('keypress', undefined, { ctrl: true, name: 'c', sequence: '\u0003' });
+  await settle();
+
+  assert.equal(cancels, 1);
+  assert.equal(prompt.value, '');
+  await prompt.stop();
+});
+
 test('plain prompt history moves backward and forward without losing its index', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();

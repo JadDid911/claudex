@@ -15,6 +15,8 @@ const DIM = '\u001B[2m';
 const RESET = '\u001B[0m';
 const HIDE_CURSOR = '\u001B[?25l';
 const SHOW_CURSOR = '\u001B[?25h';
+const ENABLE_BRACKETED_PASTE = '\u001B[?2004h';
+const DISABLE_BRACKETED_PASTE = '\u001B[?2004l';
 const LOADING_FRAMES = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
 const MAX_MENU_ITEMS = 7;
 const DEFAULT_PROMPT_LABEL = 'claudex';
@@ -93,6 +95,9 @@ class InteractivePrompt {
     setAnimationTimer = setInterval,
     clearAnimationTimer = clearInterval,
     animationIntervalMs = 90,
+    setPasteTimeout = setTimeout,
+    clearPasteTimeout = clearTimeout,
+    pasteTimeoutMs = 250,
     reducedMotion = reducedMotionRequested(process.env),
   } = {}) {
     this.input = input;
@@ -107,6 +112,9 @@ class InteractivePrompt {
     this.setAnimationTimer = setAnimationTimer;
     this.clearAnimationTimer = clearAnimationTimer;
     this.animationIntervalMs = animationIntervalMs;
+    this.setPasteTimeout = setPasteTimeout;
+    this.clearPasteTimeout = clearPasteTimeout;
+    this.pasteTimeoutMs = pasteTimeoutMs;
     this.reducedMotion = Boolean(reducedMotion);
     this.buffer = '';
     this.cursor = 0;
@@ -126,6 +134,8 @@ class InteractivePrompt {
     this.animationTimer = null;
     this.busyFrame = 0;
     this.pendingSubmission = '';
+    this.pasteBuffer = null;
+    this.pasteTimer = null;
     this.boundKeypress = (text, key) => {
       Promise.resolve(this.handleKeypress(text, key)).catch((error) => this.onError(error));
     };
@@ -153,6 +163,7 @@ class InteractivePrompt {
     this.input.setRawMode(true);
     this.input.resume?.();
     this.started = true;
+    this.output.write(ENABLE_BRACKETED_PASTE);
     this.show();
     return true;
   }
@@ -160,11 +171,13 @@ class InteractivePrompt {
   async stop() {
     if (!this.started) return;
     this.stopAnimationTimer();
+    this.output.write(DISABLE_BRACKETED_PASTE);
     this.hide();
     this.input.off?.('keypress', this.boundKeypress);
     this.input.off?.('end', this.boundEnd);
     this.input.off?.('close', this.boundEnd);
     this.output.off?.('resize', this.boundResize);
+    this.discardPaste();
     this.input.setRawMode(this.previousRawMode);
     this.started = false;
   }
@@ -256,13 +269,28 @@ class InteractivePrompt {
     if (this.exiting) return;
 
     if (key.ctrl && key.name === 'c') {
+      this.discardPaste();
       await this.handleCancel();
       return;
     }
     if (key.name === 'escape') {
+      this.discardPaste();
       await this.handleEscape();
       return;
     }
+    if (key.name === 'paste-start') {
+      this.beginPaste();
+      return;
+    }
+    if (this.pasteBuffer != null) {
+      if (key.name === 'paste-end') {
+        this.flushPaste();
+        return;
+      }
+      this.pasteBuffer += text ?? key.sequence ?? '';
+      return;
+    }
+    if (key.name === 'paste-end') return;
     if (key.ctrl && key.name === 'd' && !this.buffer) {
       await this.requestExit();
       return;
@@ -498,6 +526,36 @@ class InteractivePrompt {
     this.cursor += insertion.length;
     this.resetNavigation();
     this.render();
+  }
+
+  beginPaste() {
+    this.discardPaste();
+    this.pasteBuffer = '';
+    this.pasteTimer = this.setPasteTimeout(() => {
+      this.pasteTimer = null;
+      this.flushPaste();
+    }, this.pasteTimeoutMs);
+    this.pasteTimer?.unref?.();
+  }
+
+  flushPaste() {
+    if (this.pasteBuffer == null) return false;
+    const pastedText = this.pasteBuffer;
+    this.pasteBuffer = null;
+    this.clearPasteTimer();
+    this.insertText(pastedText);
+    return true;
+  }
+
+  discardPaste() {
+    this.pasteBuffer = null;
+    this.clearPasteTimer();
+  }
+
+  clearPasteTimer() {
+    if (!this.pasteTimer) return;
+    this.clearPasteTimeout(this.pasteTimer);
+    this.pasteTimer = null;
   }
 
   deleteBackward() {
