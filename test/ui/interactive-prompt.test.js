@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHook } from 'node:async_hooks';
 import { EventEmitter } from 'node:events';
 
 import {
@@ -723,6 +724,72 @@ test('ordinary raw-input paste bursts submit on the first standalone Enter witho
 
   await prompt.stop();
   assert.doesNotMatch(output.text, /\u001b\[\?2004[hl]/u);
+});
+
+test('large raw-input paste bursts avoid per-character promise amplification', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const pasteTimers = [];
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    setPasteTimeout(callback) {
+      const timer = { callback, cleared: false, unref() {} };
+      pasteTimers.push(timer);
+      return timer;
+    },
+    clearPasteTimeout(timer) {
+      timer.cleared = true;
+    },
+  });
+
+  await prompt.start();
+  const pastedText = `first line\r\n${'x'.repeat(20_000)}`;
+  let trackingPromises = false;
+  let promiseCount = 0;
+  const hook = createHook({
+    init(_asyncId, type) {
+      if (trackingPromises && type === 'PROMISE') promiseCount += 1;
+    },
+  });
+  hook.enable();
+  try {
+    trackingPromises = true;
+    input.emit('data', Buffer.from(pastedText));
+    trackingPromises = false;
+  } finally {
+    hook.disable();
+  }
+
+  assert.ok(promiseCount <= 4, `paste created ${promiseCount} promises`);
+  assert.equal(pasteTimers.length, 1);
+  pasteTimers[0].callback();
+  assert.equal(prompt.value, `first line ${'x'.repeat(20_000)}`);
+  await prompt.stop();
+});
+
+test('standalone raw Enter submits ordinary input instead of opening a paste buffer', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const submitted = [];
+  const prompt = createInteractivePrompt({
+    input,
+    output,
+    color: false,
+    onSubmit: async (line) => {
+      submitted.push(line);
+      return false;
+    },
+  });
+
+  await prompt.start();
+  input.emit('keypress', 'ordinary input', { name: undefined });
+  input.emit('data', Buffer.from('\r'));
+  await settle();
+
+  assert.deepEqual(submitted, ['ordinary input']);
+  await prompt.stop();
 });
 
 test('an unfinished raw-input paste burst recovers without freezing input or swallowing Ctrl+C', async () => {

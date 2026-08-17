@@ -141,6 +141,7 @@ class InteractivePrompt {
     this.pasteChunkGeneration = 0;
     this.boundInputData = (chunk) => this.handleInputData(chunk);
     this.boundKeypress = (text, key) => {
+      if (this.pasteChunkActive) return;
       Promise.resolve(this.handleKeypress(text, key)).catch((error) => this.onError(error));
     };
     this.boundResize = () => this.render();
@@ -577,6 +578,7 @@ class InteractivePrompt {
       return;
     }
     this.beginPaste();
+    this.pasteBuffer += text;
     this.markPasteChunkActive();
   }
 
@@ -812,6 +814,7 @@ function singleLine(value) {
 
 function isPasteBurst(text) {
   if (!isPasteText(text)) return false;
+  if (isStandaloneEnter(text)) return false;
   if (/[\r\n]/u.test(text)) return true;
 
   let graphemes = 0;
